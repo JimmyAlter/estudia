@@ -1,0 +1,275 @@
+# Arma el instalador de Windows, lo prueba instalado y lo publica en el release del tag.
+# - Push de un tag vX.Y.Z: arma, prueba y publica.
+# - A mano (workflow_dispatch): arma y prueba con la versión del input `tag`; publica
+#   solo si `publish` está marcado (si el tag no existe, se crea sobre el commit corrido).
+name: release-windows
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Versión a armar, con la forma vX.Y.Z"
+        required: true
+        type: string
+      publish:
+        description: "Publicar el instalador en el release del tag"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-windows-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Instalador de Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      # node.exe que va adentro del instalador (ver la cabecera de packaging/windows/estudia.spec).
+      NODE_URL: https://nodejs.org/dist/v24.22.0/win-x64/node.exe
+      NODE_SHA256: ba93f9a70bd86fce3ebbb39ec758501458453467aa92a34a0a3602d1e3fc2b9c
+      PYINSTALLER_VERSION: "6.22.3"
+      MAX_INSTALLER_MB: "250"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versión desde el tag
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Write-Host "Tag: $env:TAG"
+          python scripts/version_from_tag.py "$env:TAG"
+          "VERSION=$($env:TAG.Substring(1))" >> $env:GITHUB_ENV
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Dependencias de Python
+        # --frozen y no --locked: version_from_tag cambió la versión de pyproject y uv.lock sigue en la vieja.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          uv sync --frozen
+
+      - name: Pruebas
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          uv run --frozen pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Interfaz web
+        working-directory: web
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm run build
+
+      - name: Runtime de JavaScript (node.exe)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = 'packaging\windows\runtime\node.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+          Write-Host "Bajando $env:NODE_URL"
+          Invoke-WebRequest -Uri $env:NODE_URL -OutFile $dest
+          $hash = (Get-FileHash -Path $dest -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:NODE_SHA256) {
+            throw "El SHA256 de node.exe no coincide: esperado $env:NODE_SHA256, bajado $hash"
+          }
+          Write-Host "node.exe verificado ($hash)"
+
+      - name: PyInstaller
+        # Se espera el aviso "Hidden import 'win32timezone' not found": pywin32 no es dependencia.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          uv pip install --python .venv\Scripts\python.exe "pyinstaller==$env:PYINSTALLER_VERSION"
+          .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean packaging\windows\estudia.spec
+          foreach ($exe in 'Estudia.exe', 'EstudiaHandler.exe') {
+            if (-not (Test-Path "dist\Estudia\$exe")) { throw "PyInstaller no dejó dist\Estudia\$exe" }
+          }
+          Write-Host "dist\Estudia listo"
+
+      - name: Inno Setup
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Find-Iscc {
+            $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            foreach ($dir in ${env:ProgramFiles(x86)}, $env:ProgramFiles) {
+              $candidate = Join-Path $dir 'Inno Setup 6\ISCC.exe'
+              if (Test-Path $candidate) { return $candidate }
+            }
+            return $null
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            Write-Host "Inno Setup no está preinstalado: se instala con choco"
+            choco install innosetup -y --no-progress
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "No se encontró ISCC.exe" }
+          Write-Host "ISCC: $iscc"
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Instalador
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & $env:ISCC packaging\windows\estudia.iss
+          $setup = "dist\EstudiaSetup-$env:VERSION.exe"
+          if (-not (Test-Path $setup)) { throw "iscc no dejó $setup" }
+          $mb = (Get-Item $setup).Length / 1MB
+          Write-Host ("Tamaño de {0}: {1:N1} MB (máximo {2} MB)" -f $setup, $mb, $env:MAX_INSTALLER_MB)
+          if ($mb -gt [double]$env:MAX_INSTALLER_MB) {
+            throw ("El instalador pesa {0:N1} MB y el máximo es {1} MB" -f $mb, $env:MAX_INSTALLER_MB)
+          }
+          "SETUP=$((Resolve-Path $setup).Path)" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EstudiaSetup-${{ env.VERSION }}
+          path: dist/EstudiaSetup-${{ env.VERSION }}.exe
+          if-no-files-found: error
+
+      - name: "Prueba: instalar"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'install.log'
+          Write-Host "Instalando $env:SETUP en silencio"
+          $p = Start-Process -FilePath $env:SETUP -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/LOG=$log")
+          if ($p.ExitCode -ne 0) { throw "El instalador terminó con código $($p.ExitCode) (ver install.log)" }
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\Estudia'
+          foreach ($exe in 'Estudia.exe', 'EstudiaHandler.exe', 'unins000.exe') {
+            if (-not (Test-Path (Join-Path $app $exe))) { throw "Falta $exe en $app" }
+          }
+          Write-Host "Instalado en $app"
+          $key = 'HKCU:\Software\Classes\estudia\shell\open\command'
+          if (-not (Test-Path $key)) { throw "No se registró estudia:// ($key)" }
+          $command = (Get-Item $key).GetValue('')
+          Write-Host "estudia:// abre: $command"
+          if ($command -notlike '*EstudiaHandler.exe*') { throw "estudia:// no apunta a EstudiaHandler.exe" }
+          "ESTUDIA_APP=$app" >> $env:GITHUB_ENV
+
+      - name: "Prueba: abrir Estudia"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:ESTUDIA_HEADLESS = '1'
+          $portFile = Join-Path $env:LOCALAPPDATA 'estudia\estudia\port'
+          Remove-Item $portFile -ErrorAction SilentlyContinue
+          $exe = Join-Path $env:ESTUDIA_APP 'Estudia.exe'
+          Write-Host "Abriendo $exe sin navegador ni bandeja"
+          $proc = Start-Process -FilePath $exe -PassThru
+          $deadline = (Get-Date).AddSeconds(60)
+          $state = $null
+          while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) { throw "Estudia.exe se cerró solo con código $($proc.ExitCode)" }
+            if (Test-Path $portFile) {
+              $port = (Get-Content $portFile -Raw).Trim()
+              try {
+                # El puerto se escribe antes de que el servidor escuche: se reintenta.
+                $state = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/state" -TimeoutSec 5
+                break
+              } catch {
+                Write-Host "Todavía no contesta en el puerto ${port}: $($_.Exception.Message)"
+              }
+            }
+            Start-Sleep -Seconds 1
+          }
+          try {
+            if ($null -eq $state) { throw "Estudia no contestó /api/state en 60 s (archivo de puerto: $portFile)" }
+            Write-Host "Puerto $port; /api/state: $($state | ConvertTo-Json -Compress -Depth 5)"
+            if ($state.step -ne 'facultad') { throw "Se esperaba step 'facultad' y llegó '$($state.step)'" }
+            Write-Host "Estudia arrancó bien"
+          } finally {
+            Write-Host "Cerrando Estudia"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            # Los procesos de trabajo (SymPy) también son Estudia.exe.
+            Get-Process -Name Estudia -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: "Prueba: desinstalar"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'uninstall.log'
+          $uninstaller = Join-Path $env:ESTUDIA_APP 'unins000.exe'
+          Write-Host "Desinstalando con $uninstaller"
+          Start-Process -FilePath $uninstaller -Wait -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$log")
+          # unins000.exe se copia a una carpeta temporal y sigue desde ahí: se espera a que borre {app}.
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path $env:ESTUDIA_APP) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Seconds 1 }
+          if (Test-Path $env:ESTUDIA_APP) {
+            Get-ChildItem -Recurse $env:ESTUDIA_APP | ForEach-Object { Write-Host "Quedó: $($_.FullName)" }
+            throw "La desinstalación no borró $env:ESTUDIA_APP en 60 s"
+          }
+          Write-Host "Se borró $env:ESTUDIA_APP"
+          if (Test-Path 'HKCU:\Software\Classes\estudia') {
+            throw "La desinstalación dejó HKCU\Software\Classes\estudia"
+          }
+          Write-Host "estudia:// ya no está registrado"
+
+      - name: Juntar registros de la falla
+        if: failure()
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $files = @(
+            (Join-Path $env:GITHUB_WORKSPACE 'install.log'),
+            (Join-Path $env:GITHUB_WORKSPACE 'uninstall.log'),
+            (Join-Path $env:LOCALAPPDATA 'estudia\estudia\estudia.log')
+          )
+          foreach ($f in $files) {
+            if (Test-Path $f) { Copy-Item $f logs\; Write-Host "Guardado $f" }
+          }
+          if (Test-Path build\estudia) {
+            Get-ChildItem build\estudia -Filter 'warn-*.txt' | Copy-Item -Destination logs\
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: registros-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+
+      - name: Publicar en el release
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release view "$env:TAG" --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "El release $env:TAG ya existe: se reemplaza el instalador"
+            gh release upload "$env:TAG" "$env:SETUP" --clobber
+          } else {
+            Write-Host "Creando el release $env:TAG"
+            gh release create "$env:TAG" "$env:SETUP" --target "$env:GITHUB_SHA" `
+              --title "Estudia $env:VERSION" --notes-file packaging\windows\release-notes.md
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh terminó con código $LASTEXITCODE" }
+          Write-Host "Publicado: https://github.com/$env:GH_REPO/releases/tag/$env:TAG"

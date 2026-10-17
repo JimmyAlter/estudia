@@ -1,6 +1,7 @@
 import json
 
 import httpx
+import pytest
 import respx
 
 from estudia import updates
@@ -8,6 +9,13 @@ from estudia.updates import RELEASE_API, latest_release
 
 HTML_URL = "https://github.com/JimmyAlter/estudia/releases/tag/v0.2.0"
 NOW = 1_790_000_000
+
+
+@pytest.fixture(autouse=True)
+def installed_version(monkeypatch):
+    # El workflow de release reescribe version.py antes de correr las pruebas:
+    # sin fijarla, con v0.2.0 o más nueva "0.2.0" dejaría de ser una versión nueva.
+    monkeypatch.setattr(updates, "__version__", "0.1.0")
 
 
 class Kv:
