@@ -10,11 +10,11 @@ import json
 
 ESTUDIA_KEY = r"Software\Classes\estudia"
 MOODLE_KEY = r"Software\Classes\moodlemobile"
-BACKUP_KEY = r"Software\Estudia\PrevMoodleMobile"
+PREFS_KEY = r"Software\Estudia"
+BACKUP_KEY = PREFS_KEY + r"\PrevMoodleMobile"
 _LABELS = {ESTUDIA_KEY: "URL:Estudia", MOODLE_KEY: "URL:moodlemobile"}
 
 
-PREFS_KEY = r"Software\Estudia"
 def _cmd_path(key: str) -> str:
     return key + r"\shell\open\command"
 
