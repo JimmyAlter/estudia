@@ -61,13 +61,25 @@ def test_network_error_returns_cache_or_none():
     kv = Kv()
     assert check(kv) is None
     route.mock(return_value=httpx.Response(500))
-    assert check(kv) is None
+    assert check(kv, NOW + 3600) is None
     route.mock(return_value=httpx.Response(200, content=b"no es json"))
-    assert check(kv) is None
+    assert check(kv, NOW + 7200) is None
     route.mock(return_value=release())
-    assert check(kv)["version"] == "0.2.0"
+    assert check(kv, NOW + 10800)["version"] == "0.2.0"
     route.mock(side_effect=httpx.ReadTimeout("lento"))
-    assert check(kv, NOW + 90000)["version"] == "0.2.0"  # devuelve lo cacheado
+    assert check(kv, NOW + 10800 + 90000)["version"] == "0.2.0"  # devuelve lo cacheado
+
+
+@respx.mock
+def test_failure_is_throttled_for_an_hour():
+    route = respx.get(RELEASE_API).mock(side_effect=httpx.ConnectError("sin internet"))
+    kv = Kv()
+    assert check(kv) is None
+    assert check(kv, NOW + 3599) is None
+    assert route.call_count == 1
+    route.mock(return_value=release())
+    assert check(kv, NOW + 3600)["version"] == "0.2.0"
+    assert route.call_count == 2
 
 
 @respx.mock

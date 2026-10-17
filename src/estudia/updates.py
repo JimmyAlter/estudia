@@ -16,6 +16,8 @@ log = logging.getLogger(__name__)
 RELEASE_API = "https://api.github.com/repos/JimmyAlter/estudia/releases/latest"
 RELEASE_URL_PREFIX = "https://github.com/JimmyAlter/estudia/"
 CHECK_EVERY_S = 86400
+RETRY_AFTER_FAILURE_S = 3600
+FAILED_KEY = "update_failed_at"
 TIMEOUT_S = 5.0
 CHECKED_KEY = "update_checked_at"
 LATEST_KEY = "update_latest"
@@ -72,16 +74,20 @@ def latest_release(
     haya en caché (o None) y nunca lanza.
     """
     try:
-        try:
-            checked = int(kv_get(CHECKED_KEY) or 0)
-        except ValueError:
-            checked = 0
-        if checked and 0 <= now - checked < CHECK_EVERY_S:
+        def recent(key: str, window: int) -> bool:
+            try:
+                at = int(kv_get(key) or 0)
+            except ValueError:
+                return False
+            return bool(at) and 0 <= now - at < window
+
+        if recent(CHECKED_KEY, CHECK_EVERY_S) or recent(FAILED_KEY, RETRY_AFTER_FAILURE_S):
             return _newer(_cached(kv_get))
         try:
             release = _fetch(http)
         except (httpx.HTTPError, ValueError, KeyError, TypeError, InvalidVersion) as exc:
             log.info("no se pudo consultar la versión nueva: %s", type(exc).__name__)
+            kv_set(FAILED_KEY, str(now))
             return _newer(_cached(kv_get))
         kv_set(LATEST_KEY, json.dumps(release))
         kv_set(CHECKED_KEY, str(now))
