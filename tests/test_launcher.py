@@ -63,7 +63,10 @@ def test_second_lock_fails(tmp_path):
     finally:
         holder.kill()
         holder.wait()
-    lock = acquire_lock(path)  # al morir el dueño queda libre
+    # Al morir el dueño queda libre. En Windows el sistema lo suelta un poco después.
+    deadline = time.monotonic() + 10
+    while (lock := acquire_lock(path)) is None and time.monotonic() < deadline:
+        time.sleep(0.1)
     assert lock is not None
     lock.close()
 
