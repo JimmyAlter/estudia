@@ -26,7 +26,7 @@ ROOT = Path(SPECPATH).resolve().parents[1]  # noqa: F821 - SPECPATH lo define Py
 SRC = ROOT / "src"
 HERE = ROOT / "packaging" / "windows"
 ICON = str(SRC / "estudia" / "assets" / "icono.ico")
-VERSION_INFO = str(HERE / "version_info.txt")  # lo escribe scripts/version_from_tag.py
+VERSION_INFO = str(HERE / "version_info.txt")  # lo actualiza scripts/version_from_tag.py --bump
 JS_RUNTIME = HERE / "runtime" / "node.exe"
 WEB_DIST = ROOT / "web" / "dist"
 

@@ -114,16 +114,19 @@ Mirá los issues con la etiqueta [`para-empezar`](https://github.com/JimmyAlter/
 
 ### Publicar una versión
 
-Lo hace quien mantiene el repo. Desde `main` actualizado, poné un tag `vX.Y.Z` y subilo:
+Lo hace quien mantiene el repo. La versión vive en el repo: `src/estudia/version.py` y `pyproject.toml`. Desde `main` actualizado, subí la versión en version.py y pyproject, hacé el commit, poné el tag `vX.Y.Z` y subí las dos cosas:
 
 ```bash
+python scripts/version_from_tag.py --bump v0.2.0   # version.py, pyproject y version_info de Windows
+uv lock
+git commit -am "Estudia 0.2.0"
 git tag v0.2.0
-git push origin v0.2.0
+git push origin main v0.2.0
 ```
 
-El resto lo hace CI (`.github/workflows/release-windows.yml`): pone la versión del tag en el código, corre las pruebas, arma `EstudiaSetup-X.Y.Z.exe`, lo instala y lo abre en Windows para probarlo, lo desinstala y lo sube al release del tag con las notas de `packaging/windows/release-notes.md`. Si algo falla, no se publica nada. No hace falta tocar la versión a mano en ningún archivo, y los tags son solo `vX.Y.Z`, sin `-rc` ni otros sufijos.
+El resto lo hace CI (`.github/workflows/release-windows.yml`): verifica que el tag sea `v` + la versión del repo (si no coincide, falla sin publicar nada), corre las pruebas, arma `EstudiaSetup-X.Y.Z.exe`, lo instala y lo abre en Windows para probarlo, lo desinstala y lo sube al release del tag con las notas de `packaging/windows/release-notes.md`. Si algo falla, no se publica nada. Los tags son solo `vX.Y.Z`, sin `-rc` ni otros sufijos.
 
-Para probar el armado sin publicar, corré el workflow a mano desde la pestaña Actions con la versión en `tag` y `publish` sin marcar: el instalador queda como artefacto de la corrida. A mano solo se publica si `publish` está marcado y lo corrés sobre `main`.
+Para probar el armado sin publicar, corré el workflow a mano desde la pestaña Actions con `v` + la versión del repo en `tag` y `publish` sin marcar: el instalador queda como artefacto de la corrida. A mano solo se publica si `publish` está marcado y lo corrés sobre `main`.
 
 ---
 

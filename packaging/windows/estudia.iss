@@ -1,8 +1,8 @@
 ﻿; Instalador de Estudia para Windows (Inno Setup 6.3 o más nuevo).
 ; Antes: `pyinstaller packaging/windows/estudia.spec` (deja dist\Estudia\).
 ; Compilar: `iscc packaging\windows\estudia.iss` -> dist\EstudiaSetup-<versión>.exe
-; La versión sale del Estudia.exe compilado (su version_info la escribe
-; scripts/version_from_tag.py); se puede forzar con `iscc /DAppVersion=X.Y.Z`.
+; La versión sale del Estudia.exe compilado (su version_info está en el repo y la
+; actualiza `scripts/version_from_tag.py --bump`); se puede forzar con `iscc /DAppVersion=X.Y.Z`.
 ; Prueba sin ventanas: EstudiaSetup-X.Y.Z.exe /VERYSILENT /SUPPRESSMSGBOXES /CURRENTUSER
 ; Este archivo va en UTF-8 con BOM para que Inno lea bien los acentos.
 

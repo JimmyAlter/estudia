@@ -1,11 +1,15 @@
-"""Pone la versión de un tag `vX.Y.Z` en todos los lugares que la usan.
+"""Versión de Estudia. La fuente de verdad es el repo: `src/estudia/version.py` y `pyproject.toml`.
 
-Uso: `python scripts/version_from_tag.py vX.Y.Z [--root CARPETA]`
+Uso: `python scripts/version_from_tag.py [--check vX.Y.Z] [--write-env] [--bump vX.Y.Z] [--root CARPETA]`
 
-Reescribe la versión de `[project]` en `pyproject.toml`, `src/estudia/version.py`,
-`web/.env.production` (`VITE_APP_VERSION`) y el `version_info` de PyInstaller
-(`packaging/windows/version_info.txt`, que da la versión de los .exe y del instalador).
-Solo usa la biblioteca estándar: el workflow lo corre antes de instalar dependencias.
+- `--check vX.Y.Z`: sale con error si el tag no es `v` + la versión del repo (el workflow de
+  release lo corre en los builds de tags y no reescribe nada).
+- `--write-env`: escribe `web/.env.production` (`VITE_APP_VERSION`) con la versión del repo.
+- `--bump vX.Y.Z`: ayuda para subir la versión: reescribe `version.py`, la de `[project]` en
+  `pyproject.toml` y el `version_info` de PyInstaller (`packaging/windows/version_info.txt`).
+
+Siempre verifica que esos tres archivos digan la misma versión e imprime la versión en stdout
+(los errores van a stderr). Solo usa la biblioteca estándar.
 """
 import argparse
 import re
@@ -26,7 +30,7 @@ def parse_tag(tag: str) -> str:
 def version_info(version: str) -> str:
     """Archivo `version_info` de PyInstaller para los dos ejecutables."""
     numbers = ", ".join(version.split(".") + ["0"])
-    return f"""# Generado por scripts/version_from_tag.py: no editar a mano.
+    return f"""# Generado por scripts/version_from_tag.py --bump: no editar a mano.
 VSVersionInfo(
   ffi=FixedFileInfo(
     filevers=({numbers}),
@@ -64,17 +68,59 @@ def _replace_once(text: str, pattern: str, repl: str, where: str) -> str:
     return new
 
 
-def _project_version(pyproject: str, version: str) -> str:
-    """Cambia solo el `version` de la tabla `[project]`."""
+def _project_table(pyproject: str) -> tuple[int, int]:
     start = pyproject.index("[project]\n")
     end = pyproject.find("\n[", start + 1)
-    end = len(pyproject) if end == -1 else end
+    return start, len(pyproject) if end == -1 else end
+
+
+def _project_version(pyproject: str, version: str) -> str:
+    """Cambia solo el `version` de la tabla `[project]`."""
+    start, end = _project_table(pyproject)
     table = _replace_once(pyproject[start:end], r'^version = "[^"]*"$',
                           f'version = "{version}"', "pyproject.toml")
     return pyproject[:start] + table + pyproject[end:]
 
 
-def apply(version: str, root: Path) -> None:
+def _find(text: str, pattern: str, where: str) -> str:
+    match = re.search(pattern, text, flags=re.MULTILINE)
+    if not match:
+        raise ValueError(f"no se encontró la versión en {where}")
+    return match.group(1)
+
+
+def repo_version(root: Path) -> str:
+    """La versión del repo. Error si version.py, pyproject.toml y version_info no coinciden."""
+    pyproject = (root / "pyproject.toml").read_text("utf-8")
+    start, end = _project_table(pyproject)
+    from_pyproject = _find(pyproject[start:end], r'^version = "([^"]*)"$', "pyproject.toml")
+    from_module = _find((root / "src" / "estudia" / "version.py").read_text("utf-8"),
+                        r'^__version__ = "([^"]*)"$', "version.py")
+    if from_pyproject != from_module:
+        raise ValueError(f"pyproject.toml dice {from_pyproject} y version.py dice {from_module}")
+    parse_tag(f"v{from_module}")
+    if (root / VERSION_INFO).read_text("utf-8") != version_info(from_module):
+        raise ValueError(f"{VERSION_INFO.as_posix()} no corresponde a {from_module}: "
+                         "corré este script con --bump")
+    return from_module
+
+
+def check(tag: str, root: Path) -> str:
+    version = parse_tag(tag)
+    current = repo_version(root)
+    if version != current:
+        raise ValueError(f"el tag {tag} no coincide con la versión del repo ({current}): "
+                         "subí la versión con --bump antes de poner el tag")
+    return current
+
+
+def write_env(root: Path) -> str:
+    version = repo_version(root)
+    (root / "web" / ".env.production").write_text(f"VITE_APP_VERSION={version}\n", "utf-8")
+    return version
+
+
+def bump(version: str, root: Path) -> None:
     pyproject = root / "pyproject.toml"
     version_py = root / "src" / "estudia" / "version.py"
     # Todo se calcula antes de escribir: si algo falla, no queda nada a medias.
@@ -83,22 +129,26 @@ def apply(version: str, root: Path) -> None:
                                    f'__version__ = "{version}"', "version.py")
     pyproject.write_text(new_pyproject, "utf-8")
     version_py.write_text(new_version_py, "utf-8")
-    (root / "web" / ".env.production").write_text(f"VITE_APP_VERSION={version}\n", "utf-8")
     (root / VERSION_INFO).write_text(version_info(version), "utf-8")
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("tag")
+    parser.add_argument("--check", metavar="vX.Y.Z")
+    parser.add_argument("--write-env", action="store_true")
+    parser.add_argument("--bump", metavar="vX.Y.Z")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args(argv)
     try:
-        version = parse_tag(args.tag)
-        apply(version, args.root)
+        if args.bump is not None:
+            bump(parse_tag(args.bump), args.root)
+        if args.check is not None:
+            check(args.check, args.root)
+        version = write_env(args.root) if args.write_env else repo_version(args.root)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print(f"Versión {version}")
+    print(version)
     return 0
 
 

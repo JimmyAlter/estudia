@@ -1,10 +1,12 @@
 # Arma el instalador de Windows, lo prueba instalado y lo publica en el release del tag.
+# La versión sale del repo (src/estudia/version.py y pyproject.toml): en los builds de tags
+# y a mano, el tag tiene que ser exactamente v<versión> o el build falla.
 # - Push de un tag vX.Y.Z: arma, prueba y publica.
 # - A mano (workflow_dispatch): arma y prueba con la versión del input `tag`. Publica solo
 #   si `publish` está marcado y se corrió sobre la rama principal; si el tag no existe,
 #   se crea sobre ese commit, y si existe tiene que apuntar al mismo commit.
-# - Pull request que toca el empaquetado o este workflow: arma y prueba con la versión
-#   0.0.0, nunca publica.
+# - Pull request que toca el empaquetado o este workflow: arma y prueba con la versión del
+#   repo sin mirar el tag (queda en v0.0.0), nunca publica.
 # Dos jobs: `build` no puede escribir en el repo; solo `publish` tiene contents: write.
 name: release-windows
 
@@ -58,14 +60,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Versión desde el tag
+      - name: Versión del repo
         id: version
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           Write-Host "Tag: $env:TAG"
-          python scripts/version_from_tag.py "$env:TAG"
-          $version = $env:TAG.Substring(1)
+          # No reescribe nada: falla si el tag no es v<versión del repo>. Los PR no lo miran.
+          $opts = @('--write-env')
+          if ($env:GITHUB_EVENT_NAME -ne 'pull_request') { $opts += @('--check', $env:TAG) }
+          $version = (python scripts/version_from_tag.py @opts | Select-Object -Last 1).Trim()
+          Write-Host "Versión: $version"
           "VERSION=$version" >> $env:GITHUB_ENV
           "version=$version" >> $env:GITHUB_OUTPUT
 
@@ -75,17 +80,16 @@ jobs:
           enable-cache: true
 
       - name: Dependencias de Python
-        # --frozen y no --locked: version_from_tag cambió la versión de pyproject y uv.lock sigue en la vieja.
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          uv sync --frozen
+          uv sync --locked
 
       - name: Pruebas
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          uv run --frozen pytest -q
+          uv run --locked pytest -q
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

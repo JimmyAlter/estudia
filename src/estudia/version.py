@@ -1,3 +1,6 @@
-"""Versión de Estudia. El workflow de release reescribe este valor."""
+"""Versión de Estudia: junto con pyproject.toml es la fuente de verdad.
 
-__version__ = "0.1.0"
+Se sube con `python scripts/version_from_tag.py --bump vX.Y.Z`.
+"""
+
+__version__ = "0.1.1"
