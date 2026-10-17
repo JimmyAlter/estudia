@@ -107,9 +107,9 @@ def test_ensure_installed_fails_quietly(fake_home, monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_ensure_installed_only_on_linux(fake_home, monkeypatch):
+def test_ensure_installed_ignores_other_platforms(fake_home, monkeypatch):
     home, runs = fake_home
-    monkeypatch.setattr(handler.sys, "platform", "win32")
+    monkeypatch.setattr(handler.sys, "platform", "darwin")
     handler.ensure_installed()
     assert runs == []
 
@@ -141,3 +141,60 @@ def test_ensure_installed_keeps_a_current_file(fake_home):
     path.write_text(handler.desktop_entry(handler.sys.executable), "utf-8")
     handler.ensure_installed()
     assert runs == []
+
+
+def test_handler_command_frozen(monkeypatch):
+    monkeypatch.setattr(handler.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(handler.sys, "executable", "/app/Estudia.exe")
+    assert handler.handler_command() == '"/app/EstudiaHandler.exe" "%1"'
+
+
+def test_handler_command_not_frozen(monkeypatch):
+    monkeypatch.delattr(handler.sys, "frozen", raising=False)
+    monkeypatch.setattr(handler.sys, "executable", "/py/python.exe")
+    assert handler.handler_command() == '"/py/pythonw.exe" -m estudia.server.handler "%1"'
+
+
+class _Spy:
+    def __init__(self):
+        self.calls = []
+
+    def register(self, reg, cmd):
+        self.calls.append(("register", cmd))
+
+    def unregister(self, reg, cmd):
+        self.calls.append(("unregister", cmd))
+
+    def is_registered(self, reg, cmd):
+        self.calls.append(("is_registered", cmd))
+        return False
+
+    RealReg = staticmethod(lambda: "reg")
+
+
+@pytest.fixture
+def win(monkeypatch):
+    spy = _Spy()
+    monkeypatch.setattr(handler, "winreg_schemes", spy)
+    monkeypatch.setattr(handler.sys, "platform", "win32")
+    monkeypatch.setattr(handler, "handler_command", lambda: "CMD")
+    return spy
+
+
+def test_install_and_uninstall_on_windows(win):
+    assert handler.main(["--install"]) == 0
+    assert handler.main(["--uninstall"]) == 0
+    assert win.calls == [("register", "CMD"), ("unregister", "CMD")]
+
+
+def test_ensure_installed_on_windows_registers_when_stale(win):
+    handler.ensure_installed()
+    assert win.calls == [("is_registered", "CMD"), ("register", "CMD")]
+
+
+def test_data_dir_flag_prints_without_creating(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "nueva"
+    monkeypatch.setattr(handler, "data_path", lambda: target)
+    assert handler.main(["--data-dir"]) == 0
+    assert capsys.readouterr().out.strip() == str(target)
+    assert not target.exists()

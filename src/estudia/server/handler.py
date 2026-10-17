@@ -2,7 +2,8 @@
 
 Uso: `python -m estudia.server.handler <url>` (lo invoca el sistema al volver
 del login en el navegador) o `python -m estudia.server.handler --install` para
-registrar los esquemas en Linux. Moodle suele forzar `moodlemobile://`
+registrar los esquemas (en Windows, `--install` / `--uninstall` escriben o borran
+las claves de HKCU; `--data-dir` imprime la carpeta de datos sin crearla). Moodle suele forzar `moodlemobile://`
 (`tool_mobile/forcedurlscheme`), por eso se registran los dos.
 """
 import shutil
@@ -12,7 +13,8 @@ from pathlib import Path
 
 import httpx
 
-from estudia.config import data_dir
+from estudia import winreg_schemes
+from estudia.config import data_dir, data_path
 from estudia.server.app import HOST
 
 DESKTOP_FILE = "estudia-handler.desktop"
@@ -55,10 +57,32 @@ def _register() -> Path:
     return path
 
 
+def handler_command() -> str:
+    """Comando que Windows ejecuta al volver del login (`%1` es la URL)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).with_name("EstudiaHandler.exe")
+        return f'"{exe}" "%1"'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return f'"{pythonw}" -m estudia.server.handler "%1"'
+
+
 def install() -> int:
-    """Registra el handler de `estudia://` y `moodlemobile://` para el usuario actual (Linux)."""
+    """Registra el handler de `estudia://` y `moodlemobile://` para el usuario actual."""
+    if sys.platform == "win32":
+        winreg_schemes.register(winreg_schemes.RealReg(), handler_command())
+        print("Listo: estudia:// y moodlemobile:// quedan a cargo de Estudia")
+        return 0
     path = _register()
     print(f"Listo: {', '.join(SCHEME_MIMES)} quedan a cargo de {path}")
+    return 0
+
+
+def uninstall() -> int:
+    """Deshace `install()`; en Windows devuelve `moodlemobile://` a la app que lo tenía."""
+    if sys.platform == "win32":
+        winreg_schemes.unregister(winreg_schemes.RealReg(), handler_command())
+    else:
+        _desktop_path().unlink(missing_ok=True)
     return 0
 
 
@@ -76,7 +100,15 @@ def _is_current(path: Path) -> bool:
 
 
 def ensure_installed() -> None:
-    """Al arrancar, en Linux: registra el handler si falta o quedó viejo. Sin xdg-mime no hace nada."""
+    """Al arrancar: registra el handler si falta o quedó viejo. En Linux, sin xdg-mime no hace nada."""
+    if sys.platform == "win32":
+        reg, cmd = winreg_schemes.RealReg(), handler_command()
+        try:
+            if not winreg_schemes.is_registered(reg, cmd):
+                winreg_schemes.register(reg, cmd)
+        except OSError:
+            pass  # se puede pegar el enlace a mano en la pantalla de inicio de sesión
+        return
     if not sys.platform.startswith("linux") or _is_current(_desktop_path()):
         return
     if shutil.which("xdg-mime") is None:
@@ -124,8 +156,14 @@ def forward(url: str) -> int:
 def main(argv: list[str]) -> int:
     if argv == ["--install"]:
         return install()
+    if argv == ["--uninstall"]:
+        return uninstall()
+    if argv == ["--data-dir"]:
+        print(data_path())
+        return 0
     if len(argv) != 1:
-        print("uso: python -m estudia.server.handler <url> | --install", file=sys.stderr)
+        print("uso: python -m estudia.server.handler <url> | --install | --uninstall | --data-dir",
+              file=sys.stderr)
         return 2
     return forward(argv[0])
 

@@ -30,8 +30,13 @@ SYNC_EVERY_S = 21600
 SECRETS_SERVICE = "estudia"
 
 
+def data_path() -> Path:
+    """Dónde van los datos del usuario, sin crear nada."""
+    return Path(platformdirs.user_data_dir("estudia"))
+
+
 def data_dir() -> Path:
     """Carpeta de datos del usuario; se crea si no existe."""
-    path = Path(platformdirs.user_data_dir("estudia"))
+    path = data_path()
     path.mkdir(parents=True, exist_ok=True)
     return path
