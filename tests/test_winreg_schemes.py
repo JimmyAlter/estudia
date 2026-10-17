@@ -6,15 +6,40 @@ MOODLE_CMD = ws._cmd_path(ws.MOODLE_KEY)
 ESTUDIA_CMD = ws._cmd_path(ws.ESTUDIA_KEY)
 
 
+REG_SZ, REG_EXPAND_SZ, REG_BINARY, REG_DWORD = 1, 2, 3, 4
+
+
 class FakeReg:
     def __init__(self):
-        self.d = {}
+        self.d = {}  # (path, name) -> (dato, tipo)
 
     def get(self, path, name):
-        return self.d.get((path, name))
+        item = self.d.get((path, name))
+        return None if item is None else item[0]
 
     def set(self, path, name, value):
-        self.d[(path, name)] = value
+        self.d[(path, name)] = (value, REG_SZ)
+
+    def set_typed(self, path, name, value, kind):
+        self.d[(path, name)] = (value, kind)
+
+    def type_of(self, path, name):
+        return self.d[(path, name)][1]
+
+    def export_tree(self, path):
+        node = {"values": [], "keys": {}}
+        for (p, name), (data, kind) in self.d.items():
+            if p == path:
+                node["values"].append((name, data, kind))
+        subs = {p[len(path) + 1:].split("\\")[0] for p, _ in self.d if p.startswith(path + "\\")}
+        node["keys"] = {sub: self.export_tree(path + "\\" + sub) for sub in sorted(subs)}
+        return node
+
+    def import_tree(self, path, tree):
+        for name, data, kind in tree["values"]:
+            self.d[(path, name)] = (data, kind)
+        for sub, node in tree["keys"].items():
+            self.import_tree(path + "\\" + sub, node)
 
     def exists(self, path):
         return any(p == path or p.startswith(path + "\\") for p, _ in self.d)
@@ -43,11 +68,15 @@ def test_register_backs_up_existing_moodlemobile():
     reg = FakeReg()
     reg.set(MOODLE_CMD, "", OTHER)
     ws.register(reg, OURS)
-    assert reg.get(ws.BACKUP_KEY + r"\shell\open\command", "") == OTHER
+    assert _backup_cmd(reg) == OTHER
     assert reg.get(MOODLE_CMD, "") == OURS
 
 
-BACKUP_CMD = ws.BACKUP_KEY + r"\shell\open\command"
+def _backup_cmd(reg):
+    node = ws._load(reg.get(ws.BACKUP_KEY, "tree"))
+    for part in ("shell", "open", "command"):
+        node = node["keys"][part]
+    return dict((n, d) for n, d, _ in node["values"])[""]
 
 
 def _foreign_moodle(reg, cmd=OTHER):
@@ -62,11 +91,11 @@ def test_register_twice_keeps_original_backup():
     _foreign_moodle(reg)
     ws.register(reg, OURS)
     ws.register(reg, OURS)
-    assert reg.get(BACKUP_CMD, "") == OTHER
+    assert _backup_cmd(reg) == OTHER
     # Otra app lo pisa y volvemos a registrar: el respaldo original no se toca.
     reg.set(MOODLE_CMD, "", r'"C:\Tercera\x.exe" "%1"')
     ws.register(reg, OURS)
-    assert reg.get(BACKUP_CMD, "") == OTHER
+    assert _backup_cmd(reg) == OTHER
 
 
 def test_unregister_restores_whole_previous_key():
@@ -118,7 +147,7 @@ def test_reinstall_in_other_form_never_backs_up_our_own_command():
     reg2.set(MOODLE_CMD, "", OTHER)
     ws.register(reg2, dev)
     ws.register(reg2, frozen)
-    assert reg2.get(BACKUP_CMD, "") == OTHER
+    assert _backup_cmd(reg2) == OTHER
     ws.unregister(reg2, frozen)
     assert reg2.get(MOODLE_CMD, "") == OTHER
 
@@ -154,3 +183,26 @@ def test_path_with_spaces_and_accents():
     assert reg.get(ws.ESTUDIA_KEY + r"\DefaultIcon", "") == f'"{exe}",0'
     assert ws.is_registered(reg, cmd)
     assert ws.is_ours(cmd)
+
+
+def test_restore_keeps_types_extra_values_and_nested_keys():
+    reg = FakeReg()
+    reg.set(ws.MOODLE_KEY, "", "URL:Otra")
+    reg.set(ws.MOODLE_KEY, "URL Protocol", "")
+    reg.set_typed(ws.MOODLE_KEY, "EditFlags", 2, REG_DWORD)
+    reg.set_typed(ws.MOODLE_KEY, "Blob", b"\x00\xffab", REG_BINARY)
+    reg.set_typed(ws.MOODLE_KEY + r"\DefaultIcon", "", r"%ProgramFiles%\Otra\a.exe,0", REG_EXPAND_SZ)
+    reg.set_typed(MOODLE_CMD, "", r'"%ProgramFiles%\Otra\a.exe" "%1"', REG_EXPAND_SZ)
+    reg.set(ws.MOODLE_KEY + r"\shell\open\ddeexec", "", "[open(\"%1\")]")
+    reg.set(ws.MOODLE_KEY + r"\shell\edit\command", "", r'"C:\Otra\ed.exe" "%1"')
+    before = reg.export_tree(ws.MOODLE_KEY)
+    ws.register(reg, OURS)
+    assert reg.get(MOODLE_CMD, "") == OURS
+    ws.unregister(reg, OURS)
+    assert reg.export_tree(ws.MOODLE_KEY) == before
+    assert reg.type_of(MOODLE_CMD, "") == REG_EXPAND_SZ
+    assert reg.type_of(ws.MOODLE_KEY + r"\DefaultIcon", "") == REG_EXPAND_SZ
+    assert reg.type_of(ws.MOODLE_KEY, "EditFlags") == REG_DWORD
+    assert reg.get(ws.MOODLE_KEY + r"\shell\open\ddeexec", "") == '[open("%1")]'
+    assert reg.get(ws.MOODLE_KEY + r"\shell\edit\command", "") == r'"C:\Otra\ed.exe" "%1"'
+    assert reg.get(ws.MOODLE_KEY, "Blob") == b"\x00\xffab"

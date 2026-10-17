@@ -5,6 +5,9 @@ Toda la lógica trabaja contra un objeto `reg` inyectable (`get`, `set`, `delete
 que se importa recién al usarla para que el módulo se pueda importar en Linux.
 """
 
+import base64
+import json
+
 ESTUDIA_KEY = r"Software\Classes\estudia"
 MOODLE_KEY = r"Software\Classes\moodlemobile"
 BACKUP_KEY = r"Software\Estudia\PrevMoodleMobile"
@@ -12,11 +15,6 @@ _LABELS = {ESTUDIA_KEY: "URL:Estudia", MOODLE_KEY: "URL:moodlemobile"}
 
 
 PREFS_KEY = r"Software\Estudia"
-# Valores de la clave moodlemobile que se respaldan y restauran enteros: (subclave, nombre).
-_MOODLE_VALUES = (("", ""), ("", "URL Protocol"), (r"\DefaultIcon", ""),
-                  (r"\shell\open\command", ""))
-
-
 def _cmd_path(key: str) -> str:
     return key + r"\shell\open\command"
 
@@ -30,6 +28,23 @@ def _exe_of(command: str) -> str:
     if command.startswith('"'):
         return command[1:].split('"', 1)[0]
     return command.split(" ", 1)[0]
+
+
+def _dump(tree: dict) -> str:
+    """El arbol exportado como JSON (los REG_BINARY van en base64)."""
+    def enc(node):
+        values = [[n, {"b64": base64.b64encode(d).decode()} if isinstance(d, bytes) else d, t]
+                  for n, d, t in node["values"]]
+        return {"values": values, "keys": {k: enc(v) for k, v in node["keys"].items()}}
+    return json.dumps(enc(tree))
+
+
+def _load(text: str) -> dict:
+    def dec(node):
+        values = [(n, base64.b64decode(d["b64"]) if isinstance(d, dict) else d, t)
+                  for n, d, t in node["values"]]
+        return {"values": values, "keys": {k: dec(v) for k, v in node["keys"].items()}}
+    return dec(json.loads(text))
 
 
 def is_ours(command: str | None) -> bool:
@@ -52,13 +67,11 @@ def register(reg, command: str, takeover_moodle: bool = True) -> None:
     `takeover_moodle` (la instalacion explicita), respaldando la clave entera una vez.
     """
     keys = [ESTUDIA_KEY]
-    if takeover_moodle or not _foreign(reg):
+    foreign = _foreign(reg)
+    if takeover_moodle or not foreign:
         keys.append(MOODLE_KEY)
-        if _foreign(reg) and not reg.exists(BACKUP_KEY):
-            for sub, name in _MOODLE_VALUES:
-                value = reg.get(MOODLE_KEY + sub, name)
-                if value is not None:
-                    reg.set(BACKUP_KEY + sub, name, value)
+        if foreign and not reg.exists(BACKUP_KEY):
+            reg.set(BACKUP_KEY, "tree", _dump(reg.export_tree(MOODLE_KEY)))
     for key in keys:
         reg.set(key, "", _LABELS[key])
         reg.set(key, "URL Protocol", "")
@@ -74,13 +87,10 @@ def unregister(reg, command: str) -> None:
     reg.delete_tree(ESTUDIA_KEY)
     current = reg.get(_cmd_path(MOODLE_KEY), "")
     if current is not None and is_ours(current):
-        had_backup = reg.exists(BACKUP_KEY)
+        backup = reg.get(BACKUP_KEY, "tree")
         reg.delete_tree(MOODLE_KEY)
-        if had_backup:
-            for sub, name in _MOODLE_VALUES:
-                value = reg.get(BACKUP_KEY + sub, name)
-                if value is not None:
-                    reg.set(MOODLE_KEY + sub, name, value)
+        if backup is not None:
+            reg.import_tree(MOODLE_KEY, _load(backup))
     # Software\Estudia solo guarda el respaldo: se va entero al consumirlo.
     reg.delete_tree(PREFS_KEY)
 
@@ -117,6 +127,30 @@ class RealReg:
         except FileNotFoundError:
             return False
         return True
+
+    def export_tree(self, path: str) -> dict:
+        """Todos los valores (nombre, dato, tipo) y subclaves, sin perder tipos."""
+        values, keys = [], []
+        with self._w.OpenKey(self._w.HKEY_CURRENT_USER, path) as key:
+            while True:
+                try:
+                    values.append(self._w.EnumValue(key, len(values)))
+                except OSError:
+                    break
+            while True:
+                try:
+                    keys.append(self._w.EnumKey(key, len(keys)))
+                except OSError:
+                    break
+        return {"values": values,
+                "keys": {name: self.export_tree(path + "\\" + name) for name in keys}}
+
+    def import_tree(self, path: str, tree: dict) -> None:
+        with self._w.CreateKey(self._w.HKEY_CURRENT_USER, path) as key:
+            for name, data, kind in tree["values"]:
+                self._w.SetValueEx(key, name, 0, kind, data)
+        for name, sub in tree["keys"].items():
+            self.import_tree(path + "\\" + name, sub)
 
     def delete_tree(self, path: str) -> None:
         try:
