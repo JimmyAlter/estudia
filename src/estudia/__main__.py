@@ -18,6 +18,7 @@ from estudia.config import data_dir
 from estudia.server.app import HOST, create_app, periodic_sync
 from estudia.launcher import acquire_lock, headless, running_instance
 from estudia.server.handler import ensure_installed, is_estudia
+from estudia.streams import redirect_missing_streams
 from estudia.tray import run_tray, shutdown, tray_available
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,8 @@ def free_port() -> int:
 
 
 def uvicorn_config(app, port: int) -> uvicorn.Config:
-    return uvicorn.Config(app, host=HOST, port=port, log_level="warning")
+    # Sin colores: sin consola no hay terminal que los entienda (ver estudia.streams).
+    return uvicorn.Config(app, host=HOST, port=port, log_level="warning", use_colors=False)
 
 
 def _open_when_ready(server: uvicorn.Server, url: str) -> None:
@@ -142,4 +144,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    # Estudia.exe no tiene consola: lo que se imprima (uvicorn, errores) va al log.
+    redirect_missing_streams(data_dir() / "estudia.log")
     main()

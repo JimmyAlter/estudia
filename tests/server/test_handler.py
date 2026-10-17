@@ -205,3 +205,21 @@ def test_data_dir_flag_prints_without_creating(tmp_path, monkeypatch, capsys):
     assert handler.main(["--data-dir"]) == 0
     assert capsys.readouterr().out.strip() == str(target)
     assert not target.exists()
+
+
+def test_forget_secrets_deletes_every_estudia_secret(memory_keyring):
+    from estudia.catalog import load_catalog
+    from estudia.secrets import get_secret, set_secret
+    from estudia.server.app import GEMINI_KEY, moodle_private_name, moodle_token_name
+
+    sites = [s.id for s in load_catalog()]
+    names = [GEMINI_KEY] + [f(s) for s in sites for f in (moodle_token_name, moodle_private_name)]
+    for name in names:
+        set_secret(name, "secreto")
+    memory_keyring.set_password("otra-app", GEMINI_KEY, "ajeno")
+
+    assert handler.main(["--forget-secrets"]) == 0
+    assert all(get_secret(name) is None for name in names)
+    assert memory_keyring.get_password("otra-app", GEMINI_KEY) == "ajeno"
+    # Repetirlo sin nada guardado no falla.
+    assert handler.main(["--forget-secrets"]) == 0

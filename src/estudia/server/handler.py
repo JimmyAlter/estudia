@@ -3,7 +3,8 @@
 Uso: `python -m estudia.server.handler <url>` (lo invoca el sistema al volver
 del login en el navegador) o `python -m estudia.server.handler --install` para
 registrar los esquemas (en Windows, `--install` / `--uninstall` escriben o borran
-las claves de HKCU; `--data-dir` imprime la carpeta de datos sin crearla). Moodle suele forzar `moodlemobile://`
+las claves de HKCU; `--data-dir` imprime la carpeta de datos sin crearla;
+`--forget-secrets` borra del keyring la clave de IA y los tokens del campus). Moodle suele forzar `moodlemobile://`
 (`tool_mobile/forcedurlscheme`), por eso se registran los dos.
 """
 import shutil
@@ -14,8 +15,11 @@ from pathlib import Path
 import httpx
 
 from estudia import winreg_schemes
+from estudia.catalog import load_catalog
 from estudia.config import data_dir, data_path
-from estudia.server.app import HOST
+from estudia.secrets import delete_secret
+from estudia.server.app import GEMINI_KEY, HOST, moodle_private_name, moodle_token_name
+from estudia.streams import redirect_missing_streams
 
 DESKTOP_FILE = "estudia-handler.desktop"
 SCHEME_MIMES = ("x-scheme-handler/estudia", "x-scheme-handler/moodlemobile")
@@ -156,20 +160,38 @@ def forward(url: str) -> int:
     return 0
 
 
+def forget_secrets() -> int:
+    """Borra todo lo que Estudia guardó en el keyring (lo usa el desinstalador).
+
+    El keyring no se puede listar: se borran los nombres posibles, de todas las facultades.
+    """
+    names = [GEMINI_KEY]
+    for site in load_catalog():
+        names += [moodle_token_name(site.id), moodle_private_name(site.id)]
+    for name in names:
+        delete_secret(name)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--install"]:
         return install()
     if argv == ["--uninstall"]:
         return uninstall()
+    if argv == ["--forget-secrets"]:
+        return forget_secrets()
     if argv == ["--data-dir"]:
         print(data_path())
         return 0
     if len(argv) != 1:
-        print("uso: python -m estudia.server.handler <url> | --install | --uninstall | --data-dir",
+        print("uso: python -m estudia.server.handler <url> | --install | --uninstall | --data-dir"
+              " | --forget-secrets",
               file=sys.stderr)
         return 2
     return forward(argv[0])
 
 
 if __name__ == "__main__":
+    # EstudiaHandler.exe no tiene consola. Sin log: `--data-dir` no debe crear nada.
+    redirect_missing_streams(None)
     sys.exit(main(sys.argv[1:]))

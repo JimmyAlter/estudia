@@ -93,24 +93,21 @@ begin
     Sleep(1000); { que Windows suelte los archivos del proceso cerrado }
 end;
 
-{ Carpeta de datos: la imprime `EstudiaHandler.exe --data-dir` (platformdirs).
-  Si no se pudo leer, la ruta que usa platformdirs en Windows. }
+{ Carpeta de datos de Estudia. Es lo mismo que platformdirs.user_data_dir("estudia")
+  en Windows (estudia.config.data_path()); `EstudiaHandler.exe --data-dir` la imprime
+  para usarla desde scripts. Si data_path() cambia, hay que cambiar esto también. }
 function StudyDataDir(): String;
+begin
+  Result := ExpandConstant('{localappdata}\estudia\estudia');
+end;
+
+{ Borra la clave de IA y los tokens del campus del Administrador de credenciales. }
+procedure ForgetSecrets();
 var
-  TmpFile: String;
-  Output: AnsiString;
   ResultCode: Integer;
 begin
-  Result := '';
-  TmpFile := GenerateUniqueName(GetTempDir(), '.txt');
-  if Exec(ExpandConstant('{cmd}'),
-      '/S /C ""' + ExpandConstant('{app}\{#HandlerExe}') + '" --data-dir > "' + TmpFile + '""',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    if (ResultCode = 0) and LoadStringFromFile(TmpFile, Output) then
-      Result := Trim(String(Output));
-  DeleteFile(TmpFile);
-  if Result = '' then
-    Result := ExpandConstant('{localappdata}\estudia\estudia');
+  Exec(ExpandConstant('{app}\{#HandlerExe}'), '--forget-secrets', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -124,15 +121,16 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
-    { Antes de [UninstallRun] y de borrar archivos: EstudiaHandler.exe todavía está. }
+    { Antes de [UninstallRun] y de borrar los archivos. }
     CloseRunningApp();
     DataDir := StudyDataDir();
     DeleteData := False;
     { En silencio no se pregunta: los datos se quedan. }
-    { Por las dudas, solo una carpeta llamada estudia (la de platformdirs). }
-    if (not UninstallSilent()) and DirExists(DataDir)
-        and (CompareText(ExtractFileName(DataDir), 'estudia') = 0) then
+    if (not UninstallSilent()) and DirExists(DataDir) then
       DeleteData := MsgBox(DataQuestion, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+    { Mientras EstudiaHandler.exe todavía está instalado. }
+    if DeleteData then
+      ForgetSecrets();
   end
   else if CurUninstallStep = usPostUninstall then
   begin
