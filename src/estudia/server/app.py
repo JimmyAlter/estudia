@@ -62,6 +62,13 @@ SITE_KEY = "site_id"
 SYNC_ERROR_KEY = "last_sync_error"
 # Las escrituras esperan a que termine la sincronización en curso en vez de fallar.
 BUSY_TIMEOUT_MS = 30000
+# Gemini saturado: se reintenta solo el procesamiento a los 5, 10, 20 y después
+# cada 30 minutos, hasta que un material sale bien.
+RETRY_FIRST_S = 300
+RETRY_MAX_S = 1800
+# El ciclo periódico se fija cada tanto si una corrida pedida desde la interfaz
+# dejó programado un reintento.
+POLL_S = 60
 
 log = logging.getLogger(__name__)
 
@@ -122,13 +129,17 @@ class Jobs:
     """Sincronización + procesamiento en segundo plano; nunca dos a la vez."""
 
     def __init__(self, db_path: Path, moodle_client_factory: MoodleFactory,
-                 ai_provider_factory: ProviderFactory):
+                 ai_provider_factory: ProviderFactory, clock: Callable[[], float] = time.time):
         self.db_path = db_path
         self.moodle_client_factory = moodle_client_factory
         self.ai_provider_factory = ai_provider_factory
+        self.clock = clock
         self._guard = threading.Lock()
         self._running = False
         self._again = False
+        # Cuándo reintentar el procesamiento (sin sincronizar), o None.
+        self.retry_at: float | None = None
+        self._retries = 0  # reintentos seguidos con Gemini saturado
 
     def connect(self) -> sqlite3.Connection:
         conn = connect(self.db_path, check_same_thread=False)
@@ -158,11 +169,13 @@ class Jobs:
             self._running = False
             return False
 
-    def run_reserved(self) -> None:
-        """Corre lo reservado con `try_start` (y las repeticiones pedidas)."""
+    def run_reserved(self, *, sync: bool = True) -> None:
+        """Corre lo reservado con `try_start` (y las repeticiones pedidas, que siempre
+        sincronizan). Con `sync=False` la primera vuelta solo procesa."""
         try:
             while True:
-                self._run_once()
+                self._run_once(sync=sync)
+                sync = True
                 if not self.finish():
                     return
         except BaseException:
@@ -181,6 +194,13 @@ class Jobs:
         self.run_reserved()
         return True
 
+    def run_process_now(self) -> bool:
+        """Reintenta solo el procesamiento, en este hilo; False si había otra corrida."""
+        if not self.try_start():
+            return False
+        self.run_reserved(sync=False)
+        return True
+
     def seconds_until_due(self) -> float:
         """Segundos hasta la próxima sincronización automática (0 si ya toca)."""
         conn = self.connect()
@@ -190,12 +210,13 @@ class Jobs:
             conn.close()
         if last is None:
             return 0
-        return max(0.0, int(last) + SYNC_EVERY_S - time.time())
+        return max(0.0, int(last) + SYNC_EVERY_S - self.clock())
 
-    def _run_once(self) -> None:
+    def _run_once(self, *, sync: bool = True) -> None:
         conn = self.connect()
         try:
-            self._sync(conn)
+            if sync:
+                self._sync(conn)
             self._process(conn)
         finally:
             conn.close()
@@ -226,14 +247,45 @@ class Jobs:
             _kv_set(conn, SYNC_ERROR_KEY, error)
 
     def _process(self, conn: sqlite3.Connection) -> None:
+        self.retry_at = None
         key = get_secret(GEMINI_KEY)
         # Con la clave rechazada se espera a que el usuario cargue otra.
         if not key or _kv_get(conn, STOP_KEY) == "auth":
             return
         try:
-            process_pending(conn, self.ai_provider_factory(key))
+            finished = process_pending(conn, self.ai_provider_factory(key))
         except Exception as exc:  # noqa: BLE001
             log.warning("Falló el procesamiento (%s)", type(exc).__name__)
+            return
+        self._plan_retry(conn, finished)
+
+    def _plan_retry(self, conn: sqlite3.Connection, finished: int) -> None:
+        """Programa el próximo reintento según por qué se cortó el procesamiento.
+
+        - Gemini saturado: espera creciente (5, 10, 20 min, tope 30), que vuelve a
+          empezar cuando sale bien un material.
+        - Cuota del día: cuando vuelve el primer modelo (kv "ai_quota_resets_at").
+        - Cuota por minuto (sin hora de vuelta) o cualquier otro caso: nada; se espera
+          a la próxima sincronización, como siempre.
+        """
+        if finished:
+            self._retries = 0
+        reason = _kv_get(conn, STOP_KEY)
+        now = self.clock()
+        if reason == "unavailable":
+            wait = min(RETRY_FIRST_S * 2 ** self._retries, RETRY_MAX_S)
+            if wait < RETRY_MAX_S:
+                self._retries += 1
+            self.retry_at = now + wait
+            return
+        self._retries = 0
+        resets_at = _kv_get(conn, QUOTA_RESET_KEY) if reason == "quota" else None
+        if resets_at is not None:
+            try:
+                # Con un piso: una hora de vuelta ya pasada no reintenta sin parar.
+                self.retry_at = max(float(resets_at), now + POLL_S)
+            except ValueError:
+                pass
 
 
 def forget_moodle_session(site_id: str) -> None:
@@ -241,20 +293,38 @@ def forget_moodle_session(site_id: str) -> None:
     delete_secret(moodle_private_name(site_id))
 
 
-def periodic_sync(jobs: Jobs, stop: threading.Event) -> None:
-    """Sincroniza cada SYNC_EVERY_S mientras la app está abierta (la primera, cuando toca)."""
-    delay: float | None = None
-    while True:
+def periodic_sync(jobs: Jobs, stop: threading.Event, *,
+                  sleep: Callable[[float], bool] | None = None) -> None:
+    """Sincroniza cada SYNC_EVERY_S mientras la app está abierta (la primera, cuando toca).
+
+    Entre sincronizaciones, si quedó programado un reintento del procesamiento
+    (`jobs.retry_at`), lo corre a su hora sin sincronizar. `sleep(segundos)` espera
+    y devuelve True si hay que terminar (por defecto, `stop.wait`). La hora es `jobs.clock`.
+    """
+    sleep = sleep or stop.wait
+    next_sync: float | None = None
+    while not stop.is_set():
         try:
-            if delay is None:
-                delay = jobs.seconds_until_due()
-            if stop.wait(delay):
+            now = jobs.clock()
+            if next_sync is None:
+                next_sync = now + jobs.seconds_until_due()
+            if now >= next_sync:
+                next_sync = now + SYNC_EVERY_S
+                jobs.run_now()
+                continue
+            retry_at = jobs.retry_at
+            if retry_at is not None and now >= retry_at:
+                if jobs.run_process_now():
+                    continue
+                retry_at = None  # hay otra corrida: al terminar, ella reprograma
+            wake = next_sync if retry_at is None else min(next_sync, retry_at)
+            if sleep(min(wake - now, POLL_S)):
                 return
-            delay = SYNC_EVERY_S
-            jobs.run_now()
         except Exception as exc:  # noqa: BLE001 - el hilo no debe morir
             log.warning("Falló la sincronización periódica (%s)", type(exc).__name__)
-            delay = SYNC_EVERY_S
+            next_sync = jobs.clock() + SYNC_EVERY_S
+            if sleep(POLL_S):
+                return
 
 
 LOCAL_HOSTS = ["127.0.0.1", "localhost"]
