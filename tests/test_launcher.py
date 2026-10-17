@@ -334,3 +334,14 @@ def test_quit_does_not_hang_on_endless_background_task(tmp_path, monkeypatch):
     assert exits == [0]
     assert lock.closed
     assert not (tmp_path / "port").exists()
+
+
+def test_main_takes_the_lock_when_the_other_instance_dies(serving, monkeypatch):
+    locks = iter([None, None, serving.lock])
+    monkeypatch.setattr(entry, "acquire_lock", lambda path: next(locks))
+    monkeypatch.setattr(entry.time, "sleep", lambda s: None)
+    monkeypatch.setenv("ESTUDIA_HEADLESS", "1")
+    threading.Timer(0.3, lambda: setattr(serving.server, "should_exit", True)).start()
+    entry.main()
+    assert serving.server.started  # arrancó como instancia principal
+    assert serving.lock.closed

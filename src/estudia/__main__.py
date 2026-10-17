@@ -57,12 +57,17 @@ def _reuse(url: str) -> None:
         webbrowser.open(url + "/")
 
 
-def _wait_for_instance(port_file) -> str | None:
+def _wait_for_instance(port_file, lock_path) -> tuple[str | None, object | None]:
+    """Espera a la instancia que tiene el lock: (su URL, None), o (None, el lock) si murió."""
     deadline = time.monotonic() + INSTANCE_WAIT_S
     while True:
         url = running_instance(port_file, is_estudia)
-        if url or time.monotonic() >= deadline:
-            return url
+        if url:
+            return url, None
+        # La otra pudo cerrarse o caerse antes de escribir el puerto.
+        lock = acquire_lock(lock_path)
+        if lock is not None or time.monotonic() >= deadline:
+            return None, lock
         time.sleep(0.2)
 
 
@@ -104,13 +109,15 @@ def main() -> None:
         _reuse(url)
         return
     # Un doble clic rápido: la primera instancia tiene el lock pero aún no escribió el puerto.
-    lock = acquire_lock(data_dir() / "instance.lock")
+    lock_path = data_dir() / "instance.lock"
+    lock = acquire_lock(lock_path)
     if lock is None:
-        url = _wait_for_instance(port_file)
+        url, lock = _wait_for_instance(port_file, lock_path)
         if url:
             _reuse(url)
             return
-        _report_busy()
+        if lock is None:
+            _report_busy()
     port = free_port()
     port_file.write_text(str(port), "utf-8")
     app = create_app(port=port)
