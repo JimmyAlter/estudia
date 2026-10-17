@@ -55,6 +55,10 @@ WelcomeLabel2=Se va a instalar [name/ver] en tu computadora.%n%nEstudia va a rec
 [Tasks]
 Name: "desktopicon"; Description: "Crear un acceso directo en el escritorio"; GroupDescription: "Accesos directos:"; Flags: unchecked
 
+[InstallDelete]
+; Al actualizar, que no queden módulos de la versión anterior mezclados con los nuevos.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
