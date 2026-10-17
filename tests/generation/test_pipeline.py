@@ -836,3 +836,72 @@ def test_gemini_rotation_marks_kv_and_the_next_run_respects_it(conn):
     assert float(kv(conn, f"model_exhausted:{key_id}:b")) > 0
     assert process_pending(conn, provider(), budget=1) == 1
     assert client.calls == ["m", "b", "c", "m", "c"]  # "b" agotado: ni se prueba
+
+
+def test_stored_text_uses_student_notation(conn):
+    add_material(conn, 1, "v1")
+    question = GenQuestion(
+        stem="¿Cuál es el vértice de `y = (x - 3)**2`?",
+        options=["(3, 0)", "(-3, 0)", "(0, 9)", "(3, 9)"],
+        correct_index=0,
+        explanation="Con a*x0 ...: y = x**2 corrida 3",
+        common_error="Tomar -3 en vez de 3",
+        topic="Función Cuadrática",
+        source_seconds=5,
+        check_expr=None,
+    )
+    a = VideoAnalysis(summary_md="**Vértice**: `y = a*(x - h)**2 + k`",
+                      topics=["Gráfica de la Función Cuadrática", "Función Cuadrática"],
+                      questions=[question])
+    prov = FakeProvider({"v1": a}, lambda s, o: 0)
+    assert process_material(conn, prov, 1).kept == 1
+    # La pasada a ciegas vio el texto original.
+    assert prov.blind_batches[0][0] == [(question.stem, question.options)]
+    row = conn.execute("SELECT * FROM question").fetchone()
+    assert row["stem"] == "¿Cuál es el vértice de y = (x − 3)²?"
+    assert json.loads(row["options_json"]) == ["(3, 0)", "(−3, 0)", "(0, 9)", "(3, 9)"]
+    assert row["explanation"] == "Con a·x0 ...: y = x² corrida 3"
+    assert row["common_error"] == "Tomar −3 en vez de 3"
+    summary = conn.execute("SELECT summary_md FROM material").fetchone()[0]
+    assert summary == "**Vértice**: y = a·(x − h)² + k"
+    names = [r[0] for r in conn.execute("SELECT name FROM topic ORDER BY id")]
+    assert names == ["Gráfica de la función cuadrática", "Función cuadrática"]
+
+
+def test_check_expr_keeps_sympy_syntax(conn):
+    add_material(conn, 1, "v1")
+    question = GenQuestion(stem="¿Cuánto vale 2**3?", options=["6", "8", "9", "5"],
+                           correct_index=1, explanation="2**3 = 8", common_error="2*3",
+                           topic="Potencias", source_seconds=1, check_expr="2**3")
+    prov = FakeProvider({"v1": analysis([question], topics=("Potencias",))}, lambda s, o: 1)
+    assert process_material(conn, prov, 1).kept == 1
+    row = conn.execute("SELECT stem, check_expr FROM question").fetchone()
+    assert (row["stem"], row["check_expr"]) == ("¿Cuánto vale 2³?", "2**3")
+
+
+def test_question_discarded_when_notation_merges_options(conn):
+    add_material(conn, 1, "v1")
+    clash = GenQuestion(stem="¿Cuál?", options=["x**2", "x^2", "2x", "x"], correct_index=2,
+                        explanation="e", common_error="c", topic="Funciones lineales",
+                        source_seconds=1)
+    prov = FakeProvider({"v1": analysis([clash, q("ok")])}, lambda s, o: 2 if s == "¿Cuál?" else 1)
+    res = process_material(conn, prov, 1)
+    assert (res.kept, res.discarded) == (1, 1)
+    assert [r[0] for r in conn.execute("SELECT stem FROM question")] == ["ok"]
+
+
+def test_topic_dedup_across_title_and_sentence_case(conn):
+    add_material(conn, 1, "v1")
+    add_material(conn, 2, "v2")
+    prov = FakeProvider(
+        {
+            "v1": analysis([q("a", topic="Función Lineal")], topics=["Función Lineal"]),
+            "v2": analysis([q("b", topic="Función lineal")], topics=["Función lineal"]),
+        },
+        lambda stem, options: 1,
+    )
+    process_material(conn, prov, 1)
+    process_material(conn, prov, 2)
+    assert [tuple(r) for r in conn.execute("SELECT slug, name FROM topic")] == [
+        ("funcion-lineal", "Función lineal")
+    ]

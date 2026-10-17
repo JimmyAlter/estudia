@@ -30,6 +30,7 @@ from estudia.ai.base import (
     option_key,
 )
 from estudia.config import LEGACY_ANALYSIS_MODEL, MAX_EXHAUSTED_S
+from estudia.generation.notation import sentence_case, student_math
 from estudia.generation.verify import check_math_tristate
 
 STOP_REASONS = ((AIQuotaError, "quota"), (AIUnavailableError, "unavailable"), (AIAuthError, "auth"))
@@ -71,8 +72,34 @@ def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
-def _dedupe_key(material_id: int, stem: str) -> str:
+def dedupe_key(material_id: int, stem: str) -> str:
     return hashlib.sha1(f"{material_id}:{_collapse(stem).lower()}".encode()).hexdigest()
+
+
+def options_distinct(options: list[str]) -> bool:
+    keys = [option_key(o) for o in options]
+    return len(set(keys)) == len(keys)
+
+
+@dataclass
+class StudentText:
+    """Lo que ve el estudiante de una pregunta, ya en notación de clase."""
+
+    stem: str
+    options: list[str]
+    explanation: str
+    common_error: str
+
+
+def student_question(stem: str, options: list[str], explanation: str,
+                     common_error: str) -> StudentText | None:
+    """Pasa a notación de clase el texto de una pregunta (no `check_expr`).
+
+    None si dos opciones quedan iguales: la pregunta tendría dos respuestas iguales.
+    """
+    text = StudentText(student_math(stem), [student_math(o) for o in options],
+                       student_math(explanation), student_math(common_error))
+    return text if options_distinct(text.options) else None
 
 
 def _passes_local_checks(question) -> bool:
@@ -81,8 +108,7 @@ def _passes_local_checks(question) -> bool:
     options = question.options
     if not 0 <= question.correct_index < len(options):
         return False
-    keys = [option_key(o) for o in options]
-    if len(set(keys)) != len(keys):
+    if not options_distinct(options):
         return False
     expr = question.check_expr
     if expr is not None and expr.strip():
@@ -164,9 +190,10 @@ def _topic_id(conn, course_id: int, name: str) -> int | None:
     slug = slugify(name)
     if not slug:
         return None
+    # El slug no distingue mayúsculas: "Función Lineal" y "Función lineal" son el mismo tema.
     conn.execute(
         "INSERT OR IGNORE INTO topic(course_id, slug, name) VALUES (?, ?, ?)",
-        (course_id, slug, _collapse(name)),
+        (course_id, slug, sentence_case(name)),
     )
     return conn.execute(
         "SELECT id FROM topic WHERE course_id=? AND slug=?", (course_id, slug)
@@ -220,19 +247,23 @@ def process_material(conn: sqlite3.Connection, provider: AIProvider, material_id
                 tid = analysis_tids[0]
             else:
                 continue  # sin tema nunca aparecería en un cuestionario
+            # Se verificó con el texto original; se guarda en notación de clase.
+            text = student_question(q.stem, q.options, q.explanation, q.common_error)
+            if text is None:
+                continue
             check_expr = q.check_expr.strip() if q.check_expr and q.check_expr.strip() else None
             cur = conn.execute(
                 "INSERT OR IGNORE INTO question(material_id, topic_id, stem, options_json,"
                 " correct_index, explanation, common_error, source_seconds, check_expr,"
                 " verified, retired, dedupe_key) VALUES (?,?,?,?,?,?,?,?,?,1,0,?)",
                 (
-                    material_id, tid, q.stem, json.dumps(q.options, ensure_ascii=False),
-                    q.correct_index, q.explanation, q.common_error, q.source_seconds,
-                    check_expr, _dedupe_key(material_id, q.stem),
+                    material_id, tid, text.stem, json.dumps(text.options, ensure_ascii=False),
+                    q.correct_index, text.explanation, text.common_error, q.source_seconds,
+                    check_expr, dedupe_key(material_id, text.stem),
                 ),
             )
             stored += cur.rowcount  # 0 si ya estaba (mismo enunciado)
-        _set_status(conn, material_id, "done", summary_md=analysis.summary_md)
+        _set_status(conn, material_id, "done", summary_md=student_math(analysis.summary_md))
         conn.commit()
     except BaseException:
         conn.rollback()
