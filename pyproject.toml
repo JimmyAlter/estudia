@@ -14,6 +14,8 @@ dependencies = [
     "pydantic",
     "tzdata",
     "yt-dlp[default,deno]>=2026.8.19",
+    "pystray>=0.19.5",
+    "pillow>=13.0.0",
 ]
 
 [project.optional-dependencies]
