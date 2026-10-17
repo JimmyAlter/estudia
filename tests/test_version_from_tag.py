@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,8 +22,10 @@ def _fake_repo(root: Path) -> None:
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:
+    # Sin PYTHONIOENCODING, en Windows el script escribe en cp1252 al no tener consola.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run([sys.executable, str(SCRIPT), *args],
-                          capture_output=True, text=True, encoding="utf-8")
+                          capture_output=True, text=True, encoding="utf-8", env=env)
 
 
 def test_version_from_tag_rewrites_files(tmp_path):
