@@ -63,6 +63,8 @@ def handler_command() -> str:
         exe = Path(sys.executable).with_name("EstudiaHandler.exe")
         return f'"{exe}" "%1"'
     pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.exists():
+        pythonw = Path(sys.executable)
     return f'"{pythonw}" -m estudia.server.handler "%1"'
 
 
@@ -104,8 +106,9 @@ def ensure_installed() -> None:
     if sys.platform == "win32":
         reg, cmd = winreg_schemes.RealReg(), handler_command()
         try:
-            if not winreg_schemes.is_registered(reg, cmd):
-                winreg_schemes.register(reg, cmd)
+            # Al arrancar no se le saca moodlemobile:// a otra app; eso lo hace --install.
+            if not winreg_schemes.is_registered(reg, cmd, takeover_moodle=False):
+                winreg_schemes.register(reg, cmd, takeover_moodle=False)
         except OSError:
             pass  # se puede pegar el enlace a mano en la pantalla de inicio de sesión
         return

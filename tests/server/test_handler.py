@@ -149,24 +149,31 @@ def test_handler_command_frozen(monkeypatch):
     assert handler.handler_command() == '"/app/EstudiaHandler.exe" "%1"'
 
 
-def test_handler_command_not_frozen(monkeypatch):
+def test_handler_command_not_frozen(tmp_path, monkeypatch):
     monkeypatch.delattr(handler.sys, "frozen", raising=False)
-    monkeypatch.setattr(handler.sys, "executable", "/py/python.exe")
-    assert handler.handler_command() == '"/py/pythonw.exe" -m estudia.server.handler "%1"'
+    monkeypatch.setattr(handler.sys, "executable", str(tmp_path / "python.exe"))
+    (tmp_path / "pythonw.exe").touch()
+    assert handler.handler_command() == f'"{tmp_path / "pythonw.exe"}" -m estudia.server.handler "%1"'
+
+
+def test_handler_command_falls_back_to_python_without_pythonw(tmp_path, monkeypatch):
+    monkeypatch.delattr(handler.sys, "frozen", raising=False)
+    monkeypatch.setattr(handler.sys, "executable", str(tmp_path / "python.exe"))
+    assert handler.handler_command() == f'"{tmp_path / "python.exe"}" -m estudia.server.handler "%1"'
 
 
 class _Spy:
     def __init__(self):
         self.calls = []
 
-    def register(self, reg, cmd):
-        self.calls.append(("register", cmd))
+    def register(self, reg, cmd, takeover_moodle=True):
+        self.calls.append(("register", cmd, takeover_moodle))
 
     def unregister(self, reg, cmd):
         self.calls.append(("unregister", cmd))
 
-    def is_registered(self, reg, cmd):
-        self.calls.append(("is_registered", cmd))
+    def is_registered(self, reg, cmd, takeover_moodle=True):
+        self.calls.append(("is_registered", cmd, takeover_moodle))
         return False
 
     RealReg = staticmethod(lambda: "reg")
@@ -184,12 +191,12 @@ def win(monkeypatch):
 def test_install_and_uninstall_on_windows(win):
     assert handler.main(["--install"]) == 0
     assert handler.main(["--uninstall"]) == 0
-    assert win.calls == [("register", "CMD"), ("unregister", "CMD")]
+    assert win.calls == [("register", "CMD", True), ("unregister", "CMD")]
 
 
 def test_ensure_installed_on_windows_registers_when_stale(win):
     handler.ensure_installed()
-    assert win.calls == [("is_registered", "CMD"), ("register", "CMD")]
+    assert win.calls == [("is_registered", "CMD", False), ("register", "CMD", False)]
 
 
 def test_data_dir_flag_prints_without_creating(tmp_path, monkeypatch, capsys):
