@@ -65,6 +65,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          # Que los acentos de los mensajes de Python se lean bien en el log.
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+          $env:PYTHONIOENCODING = 'utf-8'
           Write-Host "Tag: $env:TAG"
           # No reescribe nada: falla si el tag no es v<versión del repo>. Los PR no lo miran.
           $opts = @('--write-env')
