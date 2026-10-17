@@ -17,6 +17,7 @@ import httpx
 from estudia import winreg_schemes
 from estudia.catalog import load_catalog
 from estudia.config import data_dir, data_path
+from estudia.launcher import headless
 from estudia.secrets import delete_secret
 from estudia.server.app import GEMINI_KEY, HOST, moodle_private_name, moodle_token_name
 from estudia.streams import redirect_missing_streams
@@ -138,22 +139,38 @@ def is_estudia(base: str) -> bool:
 _is_estudia = is_estudia
 
 
+CLOSED_TEXT = "Abrí Estudia y volvé a iniciar sesión en el campus."
+
+
+def _message_box(text: str) -> None:
+    import ctypes
+
+    ctypes.windll.user32.MessageBoxW(None, text, "Estudia", 0x30)
+
+
+def _not_running(message: str) -> int:
+    """Estudia no está abierta: el login vuelve y no hay a quién dárselo."""
+    print(message, file=sys.stderr)
+    # EstudiaHandler.exe no tiene consola: sin el cuadro, el login se perdería en silencio.
+    # Solo en el .exe de Windows, así nunca aparece en otra plataforma ni en las pruebas.
+    if sys.platform == "win32" and getattr(sys, "frozen", False) and not headless():
+        _message_box(CLOSED_TEXT)
+    return 1
+
+
 def forward(url: str) -> int:
     try:
         port = int((data_dir() / "port").read_text("utf-8").strip())
     except (OSError, ValueError):
-        print("No se encontró Estudia. ¿Está abierta?", file=sys.stderr)
-        return 1
+        return _not_running("No se encontró Estudia. ¿Está abierta?")
     base = f"http://{HOST}:{port}"
     if not is_estudia(base):
-        print("No se pudo avisar a Estudia. ¿Está abierta?", file=sys.stderr)
-        return 1
+        return _not_running("No se pudo avisar a Estudia. ¿Está abierta?")
     try:
         respuesta = httpx.post(f"{base}/api/login/callback", json={"url": url}, timeout=15)
     except httpx.HTTPError:
         # Sin la URL en el mensaje: lleva el token.
-        print("No se pudo avisar a Estudia. ¿Está abierta?", file=sys.stderr)
-        return 1
+        return _not_running("No se pudo avisar a Estudia. ¿Está abierta?")
     if respuesta.status_code != 200:
         print(f"Estudia rechazó el inicio de sesión (HTTP {respuesta.status_code}).", file=sys.stderr)
         return 1

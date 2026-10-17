@@ -27,6 +27,39 @@ def test_handler_without_running_app(tmp_path, monkeypatch, capsys):
     assert "secreto" not in capsys.readouterr().err
 
 
+@pytest.fixture
+def boxes(monkeypatch):
+    shown = []
+    monkeypatch.setattr(handler, "_message_box", shown.append)
+    monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
+    return shown
+
+
+def test_handler_closed_app_shows_message_box_in_windows_exe(tmp_path, monkeypatch, boxes):
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(handler.sys, "platform", "win32")
+    monkeypatch.setattr(handler.sys, "frozen", True, raising=False)
+    assert handler.main(["estudia://token=secreto"]) == 1
+    assert boxes == [handler.CLOSED_TEXT]
+    assert "secreto" not in boxes[0]
+
+
+@pytest.mark.parametrize("platform, frozen, headless", [
+    ("linux", True, False),   # otra plataforma
+    ("win32", False, False),  # pruebas y modo dev
+    ("win32", True, True),    # sin escritorio
+])
+def test_handler_closed_app_no_message_box(tmp_path, monkeypatch, boxes, platform, frozen,
+                                           headless):
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(handler.sys, "platform", platform)
+    monkeypatch.setattr(handler.sys, "frozen", frozen, raising=False)
+    if headless:
+        monkeypatch.setenv("ESTUDIA_HEADLESS", "1")
+    assert handler.main(["estudia://token=abc"]) == 1
+    assert boxes == []
+
+
 def test_desktop_entry_registers_scheme():
     entry = handler.desktop_entry("/usr/bin/python3")
     assert "MimeType=x-scheme-handler/estudia;x-scheme-handler/moodlemobile;" in entry
