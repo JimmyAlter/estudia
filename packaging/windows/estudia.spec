@@ -12,11 +12,10 @@
 #     (41,5 MB comprimido con gzip).
 #   - node.exe v24.22.0 LTS win-x64:                                 93.882.184 bytes
 #     (35,1 MB comprimido con gzip).
-# Fuente (la Tarea 6 lo baja en CI, verifica el checksum y lo deja en
-# packaging/windows/runtime/node.exe; el binario no se commitea):
-#   URL:    https://nodejs.org/dist/v24.22.0/win-x64/node.exe
-#   SHA256: ba93f9a70bd86fce3ebbb39ec758501458453467aa92a34a0a3602d1e3fc2b9c
-#   (de https://nodejs.org/dist/v24.22.0/SHASUMS256.txt, línea "win-x64/node.exe")
+# Fuente: la URL y el SHA256 están en packaging/windows/runtime.json (el SHA256 sale de
+# https://nodejs.org/dist/v24.22.0/SHASUMS256.txt, línea "win-x64/node.exe"). El
+# workflow release-windows lo baja, verifica el checksum y lo deja en
+# packaging/windows/runtime/node.exe; el binario no se commitea.
 # En el ejecutable queda en `runtime/node.exe`; `estudia.config.bundled_js_runtime()`
 # lo encuentra ahí y `estudia.material.video` lo usa en lugar de deno.
 from pathlib import Path

@@ -123,7 +123,7 @@ git push origin v0.2.0
 
 El resto lo hace CI (`.github/workflows/release-windows.yml`): pone la versión del tag en el código, corre las pruebas, arma `EstudiaSetup-X.Y.Z.exe`, lo instala y lo abre en Windows para probarlo, lo desinstala y lo sube al release del tag con las notas de `packaging/windows/release-notes.md`. Si algo falla, no se publica nada. No hace falta tocar la versión a mano en ningún archivo, y los tags son solo `vX.Y.Z`, sin `-rc` ni otros sufijos.
 
-Para probar el armado sin publicar, corré el workflow a mano desde la pestaña Actions con la versión en `tag` y `publish` sin marcar: el instalador queda como artefacto de la corrida.
+Para probar el armado sin publicar, corré el workflow a mano desde la pestaña Actions con la versión en `tag` y `publish` sin marcar: el instalador queda como artefacto de la corrida. A mano solo se publica si `publish` está marcado y lo corrés sobre `main`.
 
 ---
 
