@@ -15,9 +15,11 @@ import uvicorn
 
 from estudia.config import data_dir
 from estudia.server.app import HOST, create_app, periodic_sync
-from estudia.server.handler import ensure_installed
+from estudia.launcher import acquire_lock, headless, running_instance
+from estudia.server.handler import ensure_installed, is_estudia
 
 STARTUP_WAIT_S = 15
+INSTANCE_WAIT_S = 10  # espera a que la otra instancia, que ya tiene el lock, termine de arrancar
 
 
 def free_port() -> int:
@@ -38,11 +40,36 @@ def _open_when_ready(server: uvicorn.Server, url: str) -> None:
         webbrowser.open(url)
 
 
+def _reuse(url: str) -> None:
+    if not headless():
+        webbrowser.open(url + "/")
+
+
+def _wait_for_instance(port_file) -> str | None:
+    deadline = time.monotonic() + INSTANCE_WAIT_S
+    while True:
+        url = running_instance(port_file, is_estudia)
+        if url or time.monotonic() >= deadline:
+            return url
+        time.sleep(0.2)
+
+
 def main() -> None:
     # El login vuelve por `estudia://` o `moodlemobile://`: en Linux se registra solo.
     ensure_installed()
-    port = free_port()
     port_file = data_dir() / "port"
+    url = running_instance(port_file, is_estudia)
+    if url:
+        _reuse(url)
+        return
+    # Un doble clic rápido: la primera instancia tiene el lock pero aún no escribió el puerto.
+    lock = acquire_lock(data_dir() / "instance.lock")
+    if lock is None:
+        url = _wait_for_instance(port_file)
+        if url:
+            _reuse(url)
+        return
+    port = free_port()
     port_file.write_text(str(port), "utf-8")
     app = create_app(port=port)
     server = uvicorn.Server(uvicorn_config(app, port))
@@ -52,15 +79,17 @@ def main() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     stop = threading.Event()
     threading.Thread(target=periodic_sync, args=(app.state.jobs, stop), daemon=True).start()
-    threading.Thread(
-        target=_open_when_ready, args=(server, f"http://{HOST}:{port}/"), daemon=True
-    ).start()
+    if not headless():
+        threading.Thread(
+            target=_open_when_ready, args=(server, f"http://{HOST}:{port}/"), daemon=True
+        ).start()
     try:
         server.run()
     finally:
         stop.set()
         # Un archivo viejo haría que el handler mande el token a otro proceso.
         port_file.unlink(missing_ok=True)
+        lock.close()
 
 
 if __name__ == "__main__":

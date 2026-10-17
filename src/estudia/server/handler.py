@@ -87,13 +87,16 @@ def ensure_installed() -> None:
         pass  # se puede pegar el enlace a mano en la pantalla de inicio de sesión
 
 
-def _is_estudia(base: str) -> bool:
+def is_estudia(base: str) -> bool:
     """El puerto puede haber quedado de una corrida anterior: se confirma antes de mandar el token."""
     try:
         datos = httpx.get(f"{base}/api/state", timeout=5).json()
     except (httpx.HTTPError, ValueError):
         return False
     return isinstance(datos, dict) and "step" in datos
+
+
+_is_estudia = is_estudia
 
 
 def forward(url: str) -> int:
@@ -103,7 +106,7 @@ def forward(url: str) -> int:
         print("No se encontró Estudia. ¿Está abierta?", file=sys.stderr)
         return 1
     base = f"http://{HOST}:{port}"
-    if not _is_estudia(base):
+    if not is_estudia(base):
         print("No se pudo avisar a Estudia. ¿Está abierta?", file=sys.stderr)
         return 1
     try:
