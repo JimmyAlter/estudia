@@ -1,4 +1,5 @@
 """Rutas y constantes de la aplicación."""
+import sys
 from pathlib import Path
 
 import platformdirs
@@ -40,3 +41,17 @@ def data_dir() -> Path:
     path = data_path()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# Runtime de JavaScript que el instalador de Windows trae para yt-dlp (ver
+# packaging/windows/estudia.spec). Va en `runtime/` dentro de la carpeta congelada.
+BUNDLED_JS_RUNTIME = "node"
+
+
+def bundled_js_runtime() -> Path | None:
+    """El binario del runtime de JS incluido en el ejecutable congelado, si está."""
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = BUNDLED_JS_RUNTIME + (".exe" if sys.platform == "win32" else "")
+    path = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "runtime" / exe
+    return path if path.is_file() else None

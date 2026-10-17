@@ -14,3 +14,8 @@ web/dist/
 *.db-shm
 # Carpeta de datos local (si se apunta dentro del repo)
 /data/
+
+# Empaquetado de Windows
+/build/
+/dist/
+packaging/windows/runtime/
