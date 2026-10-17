@@ -1,0 +1,64 @@
+name: Mi facultad no funciona
+description: Tu facultad no está en la lista, no podés iniciar sesión o no aparecen tus materias.
+title: "[Facultad] "
+labels: ["facultad"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Hoy Estudia está probado de punta a punta solo con UTN-FRBA. El resto de las facultades llega en la etapa 5, y tu reporte nos ayuda a sumarlas.
+        **Nunca pegues tu contraseña, tu token ni enlaces que empiecen con `moodlemobile://` o `estudia://`**: llevan tu sesión.
+  - type: input
+    id: facultad
+    attributes:
+      label: Universidad y facultad
+      placeholder: "UBA, Ciclo Básico Común"
+    validations:
+      required: true
+  - type: input
+    id: campus
+    attributes:
+      label: Dirección del campus
+      placeholder: "https://cbccampusvirtual.uba.ar"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Resultado de la prueba del campus
+      description: |
+        Abrí `https://<tu-campus>/lib/ajax/service-nologin.php?args=[{"index":0,"methodname":"tool_mobile_get_public_config","args":{}}]`
+        y copiá los valores de `enablewebservices`, `enablemobilewebservice` y `typeoflogin`. Si da error, contá cuál.
+      placeholder: |
+        enablewebservices: 1
+        enablemobilewebservice: 1
+        typeoflogin: 1
+  - type: dropdown
+    id: paso
+    attributes:
+      label: Dónde se trabó
+      options:
+        - Mi facultad no está en la lista
+        - No pude iniciar sesión
+        - Inicié sesión pero no aparecen mis materias
+        - Aparecen las materias pero no se procesa ninguna clase
+        - Otro
+    validations:
+      required: true
+  - type: textarea
+    id: detalle
+    attributes:
+      label: Qué hiciste y qué pasó
+      description: El mensaje de error que viste, en qué pantalla, qué navegador.
+  - type: input
+    id: sistema
+    attributes:
+      label: Sistema operativo
+      placeholder: "Windows 11, macOS 15, Fedora 44..."
+  - type: checkboxes
+    id: privacidad
+    attributes:
+      label: Privacidad
+      options:
+        - label: Confirmo que no adjunto material de la cátedra ni datos de otras personas, ni mi contraseña o token.
+          required: true

@@ -1,0 +1,16 @@
+.superpowers/
+node_modules/
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+web/node_modules/
+web/dist/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Carpeta de datos local (si se apunta dentro del repo)
+/data/

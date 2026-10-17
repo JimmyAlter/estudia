@@ -1,0 +1,380 @@
+"""Proveedor de IA basado en Gemini (google-genai)."""
+import hashlib
+import logging
+import os
+import sys
+import time
+from collections.abc import Callable, Collection
+from pathlib import Path
+
+import httpx
+from google import genai
+from google.genai import errors, types
+from pydantic import ValidationError
+
+from estudia.ai.base import (
+    AIAuthError,
+    AIFormatError,
+    AIQuotaError,
+    AIUnavailableError,
+    AIVideoUnavailableError,
+    GenQuestion,
+    VideoAnalysis,
+    option_key,
+)
+from estudia.ai.blind import BlindItems, blind_config, blind_prompt, parse_blind
+from estudia.ai.rotation import (
+    DAILY,
+    QUOTA,
+    TRANSIENT,
+    UNREADABLE,
+    UNSUPPORTED,
+    ModelRotation,
+    NextModel,
+    is_daily_quota,
+    is_invalid_key,
+    is_permission_denied,
+    is_quota,
+    is_transient,
+    is_unsupported,
+    mentions_url,
+    retry_delay,
+)
+from estudia.config import ANALYZE_MODELS, BLIND_MODELS, GEMINI_TIMEOUT_S, data_dir
+from estudia.generation.prompts import ANALYSIS_PROMPT
+from estudia.material.video import VideoDownloadError, download_video, mime_type
+
+# Un 429 con espera corta es el límite por minuto del plan gratuito: se espera y se reintenta.
+MAX_RETRY_WAIT_S = 60.0
+QUOTA_RETRIES = 2
+# Un 503 ("alta demanda") o un 504 (DEADLINE_EXCEEDED) se reintenta una vez después de
+# esperar; si sigue, se pasa al próximo modelo de la cadena (sin marcarlo agotado).
+OVERLOAD_WAIT_S = 20.0
+TRANSIENT_RETRIES = 1
+# Un video subido tarda en quedar listo (ACTIVE); se consulta cada tanto hasta este tope.
+FILE_ACTIVE_TIMEOUT_S = 300.0
+FILE_POLL_S = 5.0
+
+# De dónde sale el video en un pedido de análisis.
+YOUTUBE_URL, UPLOADED_FILE = "youtube_url", "uploaded_file"
+
+# Modelos que puede usar cada clave (client.models.list()), por huella de la clave.
+# Se consulta una vez y vale mientras dure el proceso: si Google agrega o saca un
+# modelo, se nota recién al reabrir la app.
+_LISTED_MODELS: dict[str, frozenset[str]] = {}
+
+log = logging.getLogger(__name__)
+
+
+class _YoutubeUrlRejected(Exception):
+    """Gemini no aceptó el enlace de YouTube; `remember`: vale para todos los videos."""
+
+    def __init__(self, remember: bool):
+        super().__init__("Gemini no aceptó el enlace de YouTube")
+        self.remember = remember
+
+
+def _question_ok(q: GenQuestion) -> bool:
+    if len(q.options) != 4 or not 0 <= q.correct_index <= 3 or not q.stem.strip():
+        return False
+    keys = [option_key(o) for o in q.options]
+    return all(keys) and len(set(keys)) == 4
+
+
+def _validate(analysis: VideoAnalysis) -> VideoAnalysis:
+    """Rechaza el análisis si el resumen o los temas son inválidos; descarta preguntas sueltas.
+
+    Una pregunta con un tema fuera de `topics` se acepta: la tubería crea el tema.
+    """
+    if not analysis.summary_md.strip():
+        raise AIFormatError("el resumen está vacío")
+    if not 1 <= len(analysis.topics) <= 3 or any(not t.strip() for t in analysis.topics):
+        raise AIFormatError("debe haber entre 1 y 3 temas")
+    questions = [q for q in analysis.questions if _question_ok(q)]
+    if not questions:
+        raise AIFormatError("no hay preguntas válidas")
+    return analysis.model_copy(update={"questions": questions})
+
+
+def _short_name(name: str) -> str:
+    return name.removeprefix("models/")
+
+
+def _can_generate(model) -> bool:
+    actions = getattr(model, "supported_actions", None)
+    return actions is None or "generateContent" in actions
+
+
+def _analysis_config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=VideoAnalysis,
+        # Menos tokens por fotograma: alcanza para pizarrón y diapositivas.
+        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+    )
+
+
+def _state(file) -> str:
+    state = getattr(file, "state", None)
+    return str(getattr(state, "value", state))
+
+
+class GeminiProvider:
+    def __init__(self, api_key: str, analyze_models: list[str] | None = None,
+                 blind_models: list[str] | None = None, client=None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.time,
+                 download: Callable[[str, Path], Path] = download_video,
+                 video_dir: Path | None = None, youtube_url_denied: bool = False):
+        self._analyze_models = list(analyze_models or ANALYZE_MODELS)
+        self._blind_models = list(blind_models or BLIND_MODELS)
+        self._sleep = sleep
+        self._download = download
+        self._video_dir = video_dir
+        # Huella corta de la clave (nunca la clave): separa el cache de modelos y las
+        # marcas de cuota de cada clave (la cuota es por proyecto).
+        self.key_id = hashlib.sha256(api_key.encode()).hexdigest()[:12]
+        # Algunas claves no pueden pasarle a Gemini un enlace de YouTube (403): entonces
+        # se baja el video y se sube. Se recuerda para no gastar un pedido por video.
+        self.youtube_url_denied = youtube_url_denied
+        self._rotation = ModelRotation(clock)
+        self.last_analysis_model: str | None = None
+        self.last_blind_model: str | None = None
+        if client is None:
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_S * 1000),
+            )
+        self._client = client
+
+    # --- Cadena de modelos -------------------------------------------------------
+
+    def _listed_models(self) -> frozenset[str] | None:
+        """Modelos que esta clave puede usar; None si no se pudo consultar (no se cachea)."""
+        cached = _LISTED_MODELS.get(self.key_id)
+        if cached is not None:
+            return cached
+        try:
+            names = frozenset(_short_name(m.name) for m in self._client.models.list()
+                              if _can_generate(m))
+        except (errors.APIError, httpx.TransportError):
+            return None
+        if names:
+            _LISTED_MODELS[self.key_id] = names
+        return names or None
+
+    @property
+    def exhausted_until(self) -> dict[str, float]:
+        """Modelo agotado por el día -> epoch en que vuelve (la tubería lo carga y guarda)."""
+        return self._rotation.exhausted_until
+
+    def _rotate(self, chain: list[str], attempt: Callable[[str], object]):
+        """Corre `attempt` sobre los modelos de la cadena que esta clave puede usar."""
+        listed = self._listed_models()
+        return self._rotation.run([m for m in chain if listed is None or m in listed], attempt)
+
+    def _generate(self, model: str, contents, config, *, video: str | None = None):
+        """Un pedido a `model`. `video`: de dónde sale el video (YOUTUBE_URL o UPLOADED_FILE);
+        None si es solo texto. Lanza NextModel si conviene probar el siguiente modelo."""
+        quota_tries = transient_tries = 0
+        while True:
+            try:
+                return self._client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except errors.APIError as e:
+                if is_quota(e):
+                    if is_daily_quota(e):
+                        self._rotation.mark_exhausted(model, retry_delay(e))
+                        raise NextModel(DAILY) from None
+                    delay = retry_delay(e)
+                    if quota_tries < QUOTA_RETRIES and delay is not None and delay <= MAX_RETRY_WAIT_S:
+                        quota_tries += 1
+                        log.info("Gemini: %s llegó al límite por minuto; se espera %.0f s", model, delay)
+                        self._sleep(delay)
+                        continue
+                    raise NextModel(QUOTA) from None
+                if is_transient(e):
+                    if transient_tries < TRANSIENT_RETRIES:
+                        transient_tries += 1
+                        log.info("Gemini: %s no respondió (código %s); se reintenta", model, e.code)
+                        self._sleep(OVERLOAD_WAIT_S)
+                        continue
+                    raise NextModel(TRANSIENT) from None
+                if is_unsupported(e, youtube_url=video == YOUTUBE_URL):
+                    raise NextModel(UNSUPPORTED) from None
+                self._raise_mapped(e, video)
+            except httpx.TransportError:
+                raise AIUnavailableError("no se pudo conectar con Gemini") from None
+
+    @staticmethod
+    def _raise_mapped(e: errors.APIError, video: str | None):
+        """Traduce el error a uno propio; los mensajes llevan solo el código, nunca la clave.
+
+        Con video, un 403 no prueba que la clave sea mala (la de texto puede andar):
+        la clave se juzga solo con pedidos de texto.
+        """
+        code = e.code
+        if video == YOUTUBE_URL and is_permission_denied(e):
+            raise _YoutubeUrlRejected(remember=True) from None
+        if code == 401 or (code == 400 and is_invalid_key(e)) or (code == 403 and video is None):
+            raise AIAuthError(f"Gemini rechazó la clave (código {code})") from None
+        if code == 408 or (isinstance(code, int) and code >= 500):
+            raise AIUnavailableError(f"Gemini no disponible (código {code})") from None
+        if video == YOUTUBE_URL and code == 400 and mentions_url(e):
+            raise _YoutubeUrlRejected(remember=False) from None
+        if video and code in (400, 403):
+            raise AIVideoUnavailableError(f"Gemini no pudo abrir el video (código {code})") from None
+        raise AIFormatError(f"pedido inválido a Gemini (código {code})") from None
+
+    def analyze_video(self, youtube_id: str, title: str) -> VideoAnalysis:
+        """Primero con el enlace de YouTube; si Gemini no lo acepta, baja el video y lo sube."""
+        self.last_analysis_model = None
+        prompt = types.Part(text=ANALYSIS_PROMPT.format(title=title))
+        if not self.youtube_url_denied:
+            url = f"https://www.youtube.com/watch?v={youtube_id}"
+            try:
+                return self._analyze(types.FileData(file_uri=url), prompt, YOUTUBE_URL)
+            except _YoutubeUrlRejected as e:
+                if e.remember:
+                    self.youtube_url_denied = True
+        return self._analyze_uploaded(youtube_id, prompt)
+
+    def _analyze(self, file_data: types.FileData, prompt: types.Part, video: str) -> VideoAnalysis:
+        """Rota por la cadena de análisis; el mismo video (enlace o subido) sirve para todos."""
+        contents = types.Content(parts=[types.Part(file_data=file_data), prompt])
+
+        def attempt(model: str) -> VideoAnalysis:
+            response = self._generate(model, contents, _analysis_config(), video=video)
+            try:
+                analysis = VideoAnalysis.model_validate_json(response.text or "")
+            except ValidationError:
+                raise AIFormatError("la respuesta no es un análisis válido") from None
+            analysis = _validate(analysis)
+            self.last_analysis_model = model
+            return analysis
+
+        return self._rotate(self._analyze_models, attempt)
+
+    def _analyze_uploaded(self, youtube_id: str, prompt: types.Part) -> VideoAnalysis:
+        """Baja el video, lo sube a Gemini, lo analiza y borra la copia remota siempre."""
+        video_dir = self._video_dir or data_dir() / "videos"
+        try:
+            path = self._download(youtube_id, video_dir)
+        except (VideoDownloadError, OSError):
+            raise AIVideoUnavailableError("no se pudo bajar el video") from None
+        uploaded = None
+        try:
+            uploaded = self._upload(path)
+            active = self._wait_active(uploaded)
+            file_data = types.FileData(file_uri=active.uri, mime_type=active.mime_type)
+            analysis = self._analyze(file_data, prompt, UPLOADED_FILE)
+        except (AIQuotaError, AIUnavailableError, AIAuthError):
+            raise  # el material queda pendiente: la copia local se reusa en el reintento
+        except Exception:
+            _remove_local(path)  # el material termina fallido: la copia ya no sirve
+            raise
+        finally:
+            if uploaded is not None:
+                self._delete_remote(uploaded)
+        # El análisis queda guardado en la base: la copia local ya no hace falta.
+        _remove_local(path)
+        return analysis
+
+    def _upload(self, path: Path):
+        try:
+            return self._client.files.upload(file=path, config={"mime_type": mime_type(path)})
+        except errors.APIError as e:
+            if is_quota(e):
+                raise AIQuotaError("cuota de Gemini agotada") from None
+            raise AIVideoUnavailableError(f"no se pudo subir el video (código {e.code})") from None
+        except (httpx.TransportError, OSError):
+            raise AIVideoUnavailableError("no se pudo subir el video") from None
+
+    def _wait_active(self, uploaded):
+        file, waited = uploaded, 0.0
+        while _state(file) != "ACTIVE":
+            if _state(file) == "FAILED" or waited >= FILE_ACTIVE_TIMEOUT_S:
+                raise AIVideoUnavailableError("Gemini no pudo procesar el video subido")
+            self._sleep(FILE_POLL_S)
+            waited += FILE_POLL_S
+            try:
+                file = self._client.files.get(name=uploaded.name)
+            except errors.APIError as e:
+                if is_quota(e):
+                    raise AIQuotaError("cuota de Gemini agotada") from None
+                self._raise_mapped(e, UPLOADED_FILE)
+            except httpx.TransportError:
+                raise AIUnavailableError("no se pudo conectar con Gemini") from None
+        return file
+
+    def _delete_remote(self, uploaded) -> None:
+        try:
+            self._client.files.delete(name=uploaded.name)
+        except Exception as exc:  # noqa: BLE001 - Gemini lo borra solo a las 48 h
+            log.warning("No se pudo borrar el video subido a Gemini (%s)", type(exc).__name__)
+
+    def check_key(self) -> None:
+        """Valida la clave listando modelos: no gasta pedidos de generación."""
+        try:
+            names = frozenset(_short_name(m.name) for m in self._client.models.list()
+                              if _can_generate(m))
+        except errors.APIError as e:
+            if is_quota(e):
+                return  # la clave autenticó: solo hay límite de pedidos
+            code = e.code
+            if code in (401, 403) or (code == 400 and is_invalid_key(e)):
+                raise AIAuthError(f"Gemini rechazó la clave (código {code})") from None
+            if code == 408 or (isinstance(code, int) and code >= 500):
+                raise AIUnavailableError(f"Gemini no disponible (código {code})") from None
+            raise AIFormatError(f"pedido inválido a Gemini (código {code})") from None
+        except httpx.TransportError:
+            raise AIUnavailableError("no se pudo conectar con Gemini") from None
+        if names:
+            _LISTED_MODELS[self.key_id] = names
+
+    def answer_blind_batch(self, items: BlindItems,
+                           exclude_models: Collection[str] = ()) -> list[int | None]:
+        """Un solo pedido para todas las preguntas; solo enunciado y opciones (nunca la
+        respuesta ni la explicación). Una respuesta ilegible prueba el siguiente modelo."""
+        if not items:
+            return []
+        prompt = blind_prompt(items)
+        chain = [m for m in self._blind_models if m not in exclude_models]
+
+        def attempt(model: str) -> list[int | None]:
+            response = self._generate(model, prompt, blind_config(model))
+            answers = parse_blind(response.text or "", items)
+            if answers is None:
+                log.info("Gemini: %s no devolvió respuestas legibles; se prueba otro", model)
+                raise NextModel(UNREADABLE)
+            self.last_blind_model = model
+            return answers
+
+        return self._rotate(chain, attempt)
+
+
+def _remove_local(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("No se pudo borrar el video bajado (%s)", type(exc).__name__)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("uso: python -m estudia.ai.gemini <youtube_id>", file=sys.stderr)
+        return 2
+    key = os.environ.get("ESTUDIA_GEMINI_KEY")
+    if not key:
+        print("falta la variable de entorno ESTUDIA_GEMINI_KEY", file=sys.stderr)
+        return 2
+    analysis = GeminiProvider(key).analyze_video(argv[1], argv[1])
+    print(analysis.summary_md)
+    print(f"\nTemas: {', '.join(analysis.topics)}")
+    print(f"Preguntas: {len(analysis.questions)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

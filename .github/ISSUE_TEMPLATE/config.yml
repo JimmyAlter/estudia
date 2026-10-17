@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Preguntas y charla
+    url: https://github.com/JimmyAlter/estudia/discussions
+    about: Dudas de uso, ideas para votar y anuncios.
+  - name: Problema de seguridad
+    url: https://github.com/JimmyAlter/estudia/security/advisories/new
+    about: Reportalo en privado, no en un issue público. Ver SECURITY.md.

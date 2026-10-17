@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Estudia (inicio de sesión)
+Exec=python3 -m estudia.server.handler %u
+NoDisplay=true
+Terminal=false
+MimeType=x-scheme-handler/estudia;x-scheme-handler/moodlemobile;

@@ -1,0 +1,116 @@
+@import "tailwindcss";
+
+/* Paleta: monocromo cálido. El color solo marca bien/mal en la práctica. */
+:root {
+  --canvas: #fbfbfa;
+  --ink: #2a2c2e;
+  --muted: #74726e;
+  --faint: #8a8782;
+  --line: rgba(40, 36, 30, 0.1);
+  --hover: rgba(40, 36, 30, 0.04);
+  --track: rgba(40, 36, 30, 0.1);
+  /* Bordes de campos: al menos 3:1 contra el fondo. */
+  --field: rgba(40, 36, 30, 0.55);
+  --ok: #2f7a4d;
+  --bad: #b3423f;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #1a1a19;
+    --ink: #e8e6e1;
+    --muted: #9c9a95;
+    --faint: #85827d;
+    --line: rgba(255, 250, 240, 0.1);
+    --hover: rgba(255, 250, 240, 0.045);
+    --track: rgba(255, 250, 240, 0.12);
+    --field: rgba(255, 250, 240, 0.42);
+    --ok: #6cc08f;
+    --bad: #e2817c;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-hover: var(--hover);
+  --color-track: var(--track);
+  --color-field: var(--field);
+  --color-ok: var(--ok);
+  --color-bad: var(--bad);
+  --font-sans: ui-sans-serif, -apple-system, "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue",
+    "Noto Sans", "Cantarell", sans-serif;
+  /* Para enunciados con cuentas: serif legible con cifras tabulares. */
+  --font-serif: "Iowan Old Style", "Charter", "Bitstream Charter", "Source Serif 4", "Noto Serif",
+    "Cambria", "Georgia", serif;
+  --ease-out-strong: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+html,
+body {
+  background: var(--canvas);
+  color: var(--ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Texto con matemática: cifras alineadas y signos claros. */
+.math {
+  font-family: var(--font-serif);
+  font-variant-numeric: tabular-nums lining-nums;
+  /* Una fórmula que no entra en la línea se corta antes que desbordar. */
+  overflow-wrap: break-word;
+}
+
+/* En la capa base, así las utilidades (focus-visible:…) pueden ajustarlo. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+/* Todo lo que se aprieta responde al apretarlo. */
+.press {
+  transition: transform 140ms var(--ease-out-strong), background-color 150ms ease, opacity 150ms ease;
+}
+.press:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+/* Aparición de lo que llega después de una acción (corrección, resultado). */
+.reveal {
+  animation: reveal 220ms var(--ease-out-strong);
+}
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .press:active:not(:disabled) {
+    transform: none;
+  }
+  .reveal {
+    animation: fade 160ms ease;
+  }
+  @keyframes fade {
+    from {
+      opacity: 0;
+    }
+  }
+}

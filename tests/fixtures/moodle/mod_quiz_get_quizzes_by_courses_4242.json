@@ -1,0 +1,32 @@
+{
+ "quizzes": [
+  {
+   "id": 8201,
+   "coursemodule": 7002,
+   "course": 4242,
+   "name": "CUESTIONARIO DE EJEMPLO",
+   "intro": "",
+   "introformat": 1,
+   "introfiles": [],
+   "section": 1,
+   "visible": true,
+   "groupmode": 0,
+   "groupingid": 0,
+   "lang": "",
+   "enableaitools": null,
+   "enabledaiactions": null,
+   "timeopen": 1805511600,
+   "timeclose": 1805857140,
+   "timelimit": 7200,
+   "preferredbehaviour": "deferredfeedback",
+   "attempts": 1,
+   "grademethod": 1,
+   "decimalpoints": 2,
+   "questiondecimalpoints": -1,
+   "sumgrades": 12,
+   "grade": 12,
+   "hasfeedback": 0
+  }
+ ],
+ "warnings": []
+}

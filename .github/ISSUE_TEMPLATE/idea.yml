@@ -1,0 +1,34 @@
+name: Idea
+description: Algo que te falta o que cambiarías.
+title: "[Idea] "
+labels: ["idea"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Antes de abrir, fijate si ya está en el roadmap del README o en [Discussions > Ideas](https://github.com/JimmyAlter/estudia/discussions/categories/ideas). Si ya está, dejale un pulgar: las más votadas van primero.
+  - type: textarea
+    id: problema
+    attributes:
+      label: Qué te pasa hoy
+      description: El problema, no la solución. Por ejemplo, "no sé qué entra en el parcial de Química".
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Qué te serviría
+    validations:
+      required: true
+  - type: input
+    id: donde
+    attributes:
+      label: Dónde estudiás (opcional)
+      placeholder: "UTN-FRBA ingreso, CBC, UBA XXI..."
+  - type: checkboxes
+    id: privacidad
+    attributes:
+      label: Privacidad
+      options:
+        - label: Confirmo que no adjunto material de la cátedra ni datos de otras personas.
+          required: true

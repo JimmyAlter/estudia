@@ -1,0 +1,84 @@
+<style>
+  .m { font-family: system-ui, sans-serif; font-size: 13px; line-height: 1.45; }
+  .m .row { display:flex; gap:24px; }
+  .m .muted { opacity:.6; }
+  .m .big { font-size: 34px; font-weight: 650; letter-spacing:-.02em; line-height:1.1; }
+  .m .h { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
+  .m .lbl { font-size: 11px; text-transform: uppercase; letter-spacing:.06em; opacity:.55; margin-bottom:6px; }
+  .m .bar { height:4px; border-radius:2px; background: rgba(128,128,128,.25); overflow:hidden; margin-top:4px; }
+  .m .bar > i { display:block; height:100%; background: currentColor; opacity:.8; }
+  .m .topic { display:grid; grid-template-columns: 1fr 70px; gap:10px; align-items:center; padding:7px 0; border-bottom:1px solid rgba(128,128,128,.15); }
+  .m .btn { display:inline-block; padding:8px 14px; border-radius:8px; background: currentColor; }
+  .m .btn span { color: var(--bg-primary, #fff); filter: invert(1); font-weight:600; }
+  .m .pill { display:inline-block; padding:8px 14px; border-radius:8px; border:1px solid rgba(128,128,128,.4); font-weight:600; }
+  .m .side { width:170px; flex:none; border-right:1px solid rgba(128,128,128,.2); padding-right:16px; }
+  .m .side div { padding:6px 0; }
+  .m .sel { font-weight:600; }
+  .m .item { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(128,128,128,.15); }
+</style>
+
+<h2>Pantalla de inicio: ¿qué ves primero al abrirla?</h2>
+<p class="subtitle">Dos maneras de ordenar la misma información, con tus datos reales del campus. Hacé clic en la que te resulte más cómoda.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>El próximo examen manda</h3>
+      <p>Lo primero es lo que se viene y qué tan preparado estás. Las materias quedan en segundo plano.</p>
+      <div class="mockup"><div class="mockup-body m">
+        <div class="lbl">Próximo examen</div>
+        <div class="big">Primer cuestionario</div>
+        <div class="muted" style="margin:4px 0 18px">Matemática · abre 20 de marzo · 1 intento, 2 horas · faltan 154 días</div>
+        <div class="row">
+          <div style="flex:1">
+            <div class="h">Temas que entran</div>
+            <div class="topic"><div>Funciones lineales y pendiente<div class="bar"><i style="width:80%"></i></div></div><div class="muted">80% bien</div></div>
+            <div class="topic"><div>Paralelismo y perpendicularidad<div class="bar"><i style="width:45%"></i></div></div><div class="muted">45% bien</div></div>
+            <div class="topic"><div>Funciones cuadráticas<div class="bar"><i style="width:10%"></i></div></div><div class="muted">sin practicar</div></div>
+            <div class="topic"><div>Geometría y Pitágoras<div class="bar"><i style="width:0%"></i></div></div><div class="muted">sin practicar</div></div>
+          </div>
+          <div style="width:200px">
+            <div class="h">Seguir estudiando</div>
+            <p class="muted" style="margin:0 0 12px">Lo más flojo ahora: funciones cuadráticas.</p>
+            <div class="pill" style="margin-bottom:8px">Quiz de 10 preguntas</div><br>
+            <div class="pill" style="margin-bottom:8px">Problemas con solución</div><br>
+            <div class="pill">Leer resumen</div>
+          </div>
+        </div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Materias a la izquierda, como un campus ordenado</h3>
+      <p>Elegís materia y ves su material, fechas y progreso. Se parece a lo que ya conocés, pero prolijo.</p>
+      <div class="mockup"><div class="mockup-body m">
+        <div class="row">
+          <div class="side">
+            <div class="lbl">Materias</div>
+            <div class="sel">Matemática</div>
+            <div class="muted">Física</div>
+            <div class="muted">Intro. a la Universidad</div>
+            <div class="lbl" style="margin-top:16px">Todas</div>
+            <div class="muted">Fechas</div>
+            <div class="muted">Resultados</div>
+          </div>
+          <div style="flex:1">
+            <div class="big" style="font-size:24px">Matemática</div>
+            <div class="muted" style="margin:4px 0 14px">Próximo: Primer cuestionario, 14 de marzo</div>
+            <div class="lbl">Unidad 1 · Números reales, función lineal y cuadrática</div>
+            <div class="item"><span>Clase 1: Rectas</span><span class="muted">20 min · resumen listo</span></div>
+            <div class="item"><span>Clase 2: Paralelismo y perpendicularidad</span><span class="muted">17 min · resumen listo</span></div>
+            <div class="item"><span>Clase 3: Funciones cuadráticas</span><span class="muted">15 min · sin procesar</span></div>
+            <div class="item"><span>4 videos prácticos</span><span class="muted">41 min</span></div>
+            <div class="lbl" style="margin-top:14px">Unidades 2 a 6 · todavía no habilitadas</div>
+            <div style="margin-top:10px"><span class="pill">Generar actividad de esta unidad</span></div>
+          </div>
+        </div>
+      </div></div>
+    </div>
+  </div>
+</div>

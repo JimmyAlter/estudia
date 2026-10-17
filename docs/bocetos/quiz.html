@@ -1,0 +1,60 @@
+<style>
+  .m { font-family: system-ui, sans-serif; font-size: 13px; line-height: 1.5; }
+  .m .muted { opacity:.6; }
+  .m .lbl { font-size: 11px; text-transform: uppercase; letter-spacing:.06em; opacity:.55; margin-bottom:6px; }
+  .m .q { font-size: 17px; font-weight: 600; margin: 4px 0 14px; letter-spacing:-.01em; }
+  .m .opt { padding:9px 12px; border-radius:8px; border:1px solid rgba(128,128,128,.3); margin-bottom:7px; }
+  .m .ok { border-color: #2f9e62; box-shadow: inset 3px 0 0 #2f9e62; }
+  .m .bad { border-color: #d14b4b; box-shadow: inset 3px 0 0 #d14b4b; }
+  .m .exp { margin-top:14px; padding-top:12px; border-top:1px solid rgba(128,128,128,.2); }
+  .m .top { display:flex; justify-content:space-between; margin-bottom:12px; }
+  .m .src { font-size:12px; text-decoration: underline; text-underline-offset:3px; }
+  .m .dots { display:flex; gap:5px; margin-top:16px; }
+  .m .dots i { width:22px; height:5px; border-radius:3px; background: rgba(128,128,128,.3); }
+  .m .dots i.d { background: currentColor; opacity:.7; }
+</style>
+
+<h2>Haciendo un quiz: ¿cómo querés practicar?</h2>
+<p class="subtitle">La misma pregunta, en dos modos. Pueden existir los dos; contame cuál usarías más y si le falta algo. Podés marcar las dos.</p>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="practica" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Práctica: corrección al instante</h3>
+      <p>Respondés y enseguida ves si estuvo bien, por qué, y de qué clase sale. Para aprender.</p>
+      <div class="mockup"><div class="mockup-body m">
+        <div class="top"><span class="lbl">Funciones lineales · pregunta 4 de 10</span><span class="muted">Esta está mal</span></div>
+        <div class="q">La recta de pendiente 3 que pasa por (2, 1) corta al eje y en…</div>
+        <div class="opt">1</div>
+        <div class="opt bad">7 · tu respuesta</div>
+        <div class="opt ok">−5</div>
+        <div class="opt">3</div>
+        <div class="exp">
+          <div style="font-weight:600;margin-bottom:4px">Por qué es −5</div>
+          y = 3x + b. Como (2, 1) está en la recta: 1 = 3·2 + b, entonces b = 1 − 6 = −5. El corte con el eje y es (0, b).
+          <div style="margin-top:8px" class="muted">Error común: sumar en vez de restar al despejar b.</div>
+          <div style="margin-top:8px"><span class="src">Clase-video 1, minuto 17:40</span> <span class="muted">· cuenta verificada</span></div>
+        </div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="simulacro" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Simulacro: como el cuestionario real</h3>
+      <p>Con reloj, sin ayuda y sin corrección hasta el final. Para medir si llegás.</p>
+      <div class="mockup"><div class="mockup-body m">
+        <div class="top"><span class="lbl">Simulacro · Primer cuestionario</span><span style="font-weight:600">1:42:10</span></div>
+        <div class="q">La recta de pendiente 3 que pasa por (2, 1) corta al eje y en…</div>
+        <div class="opt">1</div>
+        <div class="opt" style="border-color:currentColor">7</div>
+        <div class="opt">−5</div>
+        <div class="opt">3</div>
+        <div class="dots"><i class="d"></i><i class="d"></i><i class="d"></i><i class="d"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <div class="muted" style="margin-top:12px">Al terminar: nota sobre 12 (como el real), qué temas fallaste y un quiz de práctica armado con esos errores.</div>
+      </div></div>
+    </div>
+  </div>
+</div>

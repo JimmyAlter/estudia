@@ -1,0 +1,143 @@
+import httpx
+import pytest
+import respx
+
+from estudia.server import handler
+
+
+def test_handler_posts_callback_to_local_port(tmp_path, monkeypatch):
+    (tmp_path / "port").write_text("8765", "utf-8")
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get("http://127.0.0.1:8765/api/state").mock(
+            return_value=httpx.Response(200, json={"step": "login"})
+        )
+        route = mock.post("http://127.0.0.1:8765/api/login/callback").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        assert handler.main(["estudia://token=abc"]) == 0
+    assert route.calls.last.request.read() == b'{"url":"estudia://token=abc"}'
+
+
+def test_handler_without_running_app(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    assert handler.main(["estudia://token=secreto"]) == 1
+    assert "secreto" not in capsys.readouterr().err
+
+
+def test_desktop_entry_registers_scheme():
+    entry = handler.desktop_entry("/usr/bin/python3")
+    assert "MimeType=x-scheme-handler/estudia;x-scheme-handler/moodlemobile;" in entry
+    assert 'Exec="/usr/bin/python3" -m estudia.server.handler %u' in entry
+
+
+def test_handler_refuses_when_port_is_not_estudia(tmp_path, monkeypatch, capsys):
+    (tmp_path / "port").write_text("8765", "utf-8")
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get("http://127.0.0.1:8765/api/state").mock(
+            return_value=httpx.Response(200, text="<html>otra cosa</html>")
+        )
+        callback = mock.post("http://127.0.0.1:8765/api/login/callback")
+        assert handler.main(["estudia://token=secreto"]) == 1
+    assert not callback.called
+    assert "secreto" not in capsys.readouterr().err
+
+
+def test_handler_forwards_moodlemobile_url(tmp_path, monkeypatch):
+    (tmp_path / "port").write_text("8765", "utf-8")
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get("http://127.0.0.1:8765/api/state").mock(
+            return_value=httpx.Response(200, json={"step": "login"})
+        )
+        route = mock.post("http://127.0.0.1:8765/api/login/callback").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        assert handler.main(["moodlemobile://token=abc"]) == 0
+    assert route.calls.last.request.read() == b'{"url":"moodlemobile://token=abc"}'
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(handler.Path, "home", lambda: tmp_path)
+    runs = []
+    monkeypatch.setattr(handler.subprocess, "run", lambda cmd, check: runs.append(cmd))
+    monkeypatch.setattr(handler.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(handler.sys, "platform", "linux")
+    return tmp_path, runs
+
+
+def test_install_registers_both_schemes(fake_home, capsys):
+    home, runs = fake_home
+    assert handler.main(["--install"]) == 0
+    assert (home / ".local/share/applications/estudia-handler.desktop").is_file()
+    assert ["xdg-mime", "default", "estudia-handler.desktop", "x-scheme-handler/estudia"] in runs
+    assert ["xdg-mime", "default", "estudia-handler.desktop", "x-scheme-handler/moodlemobile"] in runs
+
+
+def test_ensure_installed_runs_once(fake_home):
+    home, runs = fake_home
+    handler.ensure_installed()
+    assert (home / ".local/share/applications/estudia-handler.desktop").is_file()
+    count = len(runs)
+    assert count > 0
+    handler.ensure_installed()
+    assert len(runs) == count
+
+
+def test_ensure_installed_skips_without_xdg_mime(fake_home, monkeypatch):
+    home, runs = fake_home
+    monkeypatch.setattr(handler.shutil, "which", lambda name: None)
+    handler.ensure_installed()
+    assert runs == []
+    assert not (home / ".local/share/applications/estudia-handler.desktop").exists()
+
+
+def test_ensure_installed_fails_quietly(fake_home, monkeypatch, capsys):
+    home, _ = fake_home
+
+    def broken(cmd, check):
+        raise handler.subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(handler.subprocess, "run", broken)
+    handler.ensure_installed()
+    # Sin registrar: se vuelve a intentar en el próximo arranque.
+    assert not (home / ".local/share/applications/estudia-handler.desktop").exists()
+    assert capsys.readouterr().out == ""
+
+
+def test_ensure_installed_only_on_linux(fake_home, monkeypatch):
+    home, runs = fake_home
+    monkeypatch.setattr(handler.sys, "platform", "win32")
+    handler.ensure_installed()
+    assert runs == []
+
+
+DESKTOP = ".local/share/applications/estudia-handler.desktop"
+
+
+@pytest.mark.parametrize("stale", [
+    "",  # vacío
+    "[Desktop Entry]\nExec=\"{python}\" -m estudia.server.handler %u\n"
+    "MimeType=x-scheme-handler/estudia;\n",  # sin moodlemobile
+    "[Desktop Entry]\nExec=\"/venv/vieja/bin/python\" -m estudia.server.handler %u\n"
+    "MimeType=x-scheme-handler/estudia;x-scheme-handler/moodlemobile;\n",  # otro intérprete
+])
+def test_ensure_installed_reinstalls_a_stale_file(fake_home, stale):
+    home, runs = fake_home
+    path = home / DESKTOP
+    path.parent.mkdir(parents=True)
+    path.write_text(stale.format(python=handler.sys.executable), "utf-8")
+    handler.ensure_installed()
+    assert len(runs) >= 2
+    assert path.read_text("utf-8") == handler.desktop_entry(handler.sys.executable)
+
+
+def test_ensure_installed_keeps_a_current_file(fake_home):
+    home, runs = fake_home
+    path = home / DESKTOP
+    path.parent.mkdir(parents=True)
+    path.write_text(handler.desktop_entry(handler.sys.executable), "utf-8")
+    handler.ensure_installed()
+    assert runs == []

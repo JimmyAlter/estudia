@@ -1,0 +1,56 @@
+name: Pregunta incorrecta
+description: Una pregunta de práctica tiene la respuesta mal, o la explicación no cierra.
+title: "[Pregunta incorrecta] "
+labels: ["pregunta-incorrecta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Gracias por avisar: es el error que más nos importa.
+        Si todavía no lo hiciste, tocá "Reportar error en la pregunta" adentro de la app para sacarla de tu banco.
+        Contalo **con tus palabras**. No pegues material de la cátedra (diapositivas, PDFs, capturas de clases).
+  - type: input
+    id: materia
+    attributes:
+      label: Materia y tema
+      placeholder: "Matemática del ingreso, funciones lineales"
+    validations:
+      required: true
+  - type: textarea
+    id: pregunta
+    attributes:
+      label: Qué preguntaba
+      description: Resumila con tus palabras. Si es una cuenta, podés copiar la cuenta.
+    validations:
+      required: true
+  - type: textarea
+    id: problema
+    attributes:
+      label: Qué marcó como correcta y por qué está mal
+      description: Si sabés cuál es la respuesta correcta, ponela con el razonamiento.
+    validations:
+      required: true
+  - type: dropdown
+    id: tipo
+    attributes:
+      label: Qué tipo de error es
+      options:
+        - La respuesta marcada como correcta está mal
+        - Hay dos opciones correctas
+        - La explicación está mal aunque la respuesta esté bien
+        - La fuente (clase y minuto) no corresponde
+        - Otro
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versión o commit de Estudia
+      placeholder: "por ejemplo 0.1.0, o el hash del commit"
+  - type: checkboxes
+    id: privacidad
+    attributes:
+      label: Privacidad
+      options:
+        - label: Confirmo que no adjunto material de la cátedra ni datos de otras personas (docentes o compañeros).
+          required: true
