@@ -189,7 +189,9 @@ def serving(tmp_path, monkeypatch):
     monkeypatch.setattr(entry.signal, "signal", lambda *a: None)
     monkeypatch.setattr(entry.webbrowser, "open", lambda url: None)
     monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
-    return SimpleNamespace(lock=lock, server=server, port_file=tmp_path / "port")
+    exits = []
+    monkeypatch.setattr(entry.os, "_exit", exits.append)
+    return SimpleNamespace(lock=lock, server=server, port_file=tmp_path / "port", exits=exits)
 
 
 def test_main_runs_server_in_thread_and_tray_in_main(serving, monkeypatch):
@@ -210,6 +212,7 @@ def test_main_runs_server_in_thread_and_tray_in_main(serving, monkeypatch):
     assert serving.server.should_exit
     assert not serving.port_file.exists()
     assert serving.lock.closed
+    assert serving.exits == [0]  # con bandeja se sale sin esperar hilos colgados
 
 
 def test_main_cleans_up_when_tray_crashes(serving, monkeypatch):
@@ -244,6 +247,7 @@ def test_main_headless_has_no_tray(serving, monkeypatch):
     entry.main()
     assert serving.server.run_thread is threading.main_thread()
     assert serving.lock.closed
+    assert serving.exits == []  # sin bandeja, sale normal
 
 
 def test_main_server_thread_dies_stops_tray_and_cleans_up(serving, monkeypatch, capsys):
@@ -261,10 +265,67 @@ def test_main_server_thread_dies_stops_tray_and_cleans_up(serving, monkeypatch, 
     monkeypatch.setattr(entry, "run_tray", fake_run_tray)
     monkeypatch.setattr(entry.sys, "platform", "win32")
     monkeypatch.setattr(entry, "_message_box", boxes.append)
-    with pytest.raises(SystemExit) as exc:
-        entry.main()
-    assert exc.value.code == 1
+    entry.main()
+    assert serving.exits == [1]
     assert boxes == [entry.CRASH_TEXT]
     assert entry.CRASH_TEXT in capsys.readouterr().err
     assert not serving.port_file.exists()
     assert serving.lock.closed
+
+
+def test_quit_does_not_hang_on_endless_background_task(tmp_path, monkeypatch):
+    """Una tarea de fondo que no termina no deja a "Salir" esperando para siempre."""
+    from fastapi import BackgroundTasks, FastAPI
+    import httpx
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def endless() -> None:
+        started.set()
+        release.wait(60)
+
+    app = FastAPI()
+    app.state.jobs = None
+
+    @app.post("/hang")
+    def hang(background: BackgroundTasks) -> dict:
+        background.add_task(endless)
+        return {}
+
+    lock = FakeLock()
+    exits = []
+    monkeypatch.setattr(entry, "ensure_installed", lambda: None)
+    monkeypatch.setattr(entry, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(entry, "running_instance", lambda *_: None)
+    monkeypatch.setattr(entry, "acquire_lock", lambda path: lock)
+    monkeypatch.setattr(entry, "create_app", lambda port: app)
+    monkeypatch.setattr(entry, "periodic_sync", lambda jobs, stop: None)
+    monkeypatch.setattr(entry.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(entry.webbrowser, "open", lambda url: None)
+    monkeypatch.setattr(entry.os, "_exit", exits.append)
+    monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
+    monkeypatch.setattr(entry, "tray_available", lambda: True)
+
+    def fake_run_tray(url, on_quit, should_stop):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                httpx.post(url + "hang", timeout=5)
+                break
+            except httpx.HTTPError:
+                time.sleep(0.05)
+        assert started.wait(5)
+        on_quit()  # "Salir" mientras la tarea sigue
+
+    monkeypatch.setattr(entry, "run_tray", fake_run_tray)
+    begin = time.monotonic()
+    try:
+        entry.main()
+    finally:
+        release.set()
+    elapsed = time.monotonic() - begin
+    assert elapsed < entry.GRACEFUL_SHUTDOWN_S + entry.SERVER_JOIN_S + 3
+    assert exits == [0]
+    assert lock.closed
+    assert not (tmp_path / "port").exists()

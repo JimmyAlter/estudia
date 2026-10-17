@@ -5,6 +5,7 @@ un subproceso que vuelve a importar este módulo (spawn en Windows).
 """
 import logging
 import multiprocessing
+import os
 import signal
 import socket
 import sys
@@ -25,6 +26,8 @@ log = logging.getLogger(__name__)
 
 STARTUP_WAIT_S = 15
 INSTANCE_WAIT_S = 10  # espera a que la otra instancia, que ya tiene el lock, termine de arrancar
+GRACEFUL_SHUTDOWN_S = 3  # uvicorn corta los pedidos y tareas de fondo que sigan después de esto
+SERVER_JOIN_S = 5
 
 
 def free_port() -> int:
@@ -35,7 +38,10 @@ def free_port() -> int:
 
 def uvicorn_config(app, port: int) -> uvicorn.Config:
     # Sin colores: sin consola no hay terminal que los entienda (ver estudia.streams).
-    return uvicorn.Config(app, host=HOST, port=port, log_level="warning", use_colors=False)
+    # Con un límite al apagar: una tarea de fondo larga (primera sincronización, Gemini)
+    # no puede dejar a "Salir" esperando para siempre.
+    return uvicorn.Config(app, host=HOST, port=port, log_level="warning", use_colors=False,
+                          timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S)
 
 
 def _open_when_ready(server: uvicorn.Server, url: str) -> None:
@@ -123,6 +129,7 @@ def main() -> None:
     if not headless():
         threading.Thread(target=_open_when_ready, args=(server, page_url), daemon=True).start()
     server_thread = None
+    exit_code = 0
     try:
         if use_tray:
             # pystray exige el hilo principal en Windows, así que el servidor va en otro.
@@ -133,14 +140,36 @@ def main() -> None:
                 _fail(CRASH_TEXT)
         else:
             server.run()
+    except SystemExit as exc:
+        if not use_tray:
+            raise
+        exit_code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
     finally:
         shutdown(server)
         if server_thread is not None:
-            server_thread.join()
+            server_thread.join(SERVER_JOIN_S)
         stop.set()
         # Un archivo viejo haría que el handler mande el token a otro proceso.
         port_file.unlink(missing_ok=True)
         lock.close()
+    if use_tray:
+        _hard_exit(exit_code)
+
+
+def _hard_exit(code: int) -> None:
+    """Termina ya, sin esperar hilos que sigan en un trabajo largo.
+
+    Si no, el proceso queda vivo sin ícono ni servidor. SQLite aguanta un corte así.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    os._exit(code)
+
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
