@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
@@ -146,7 +148,8 @@ def test_ensure_installed_keeps_a_current_file(fake_home):
 def test_handler_command_frozen(monkeypatch):
     monkeypatch.setattr(handler.sys, "frozen", True, raising=False)
     monkeypatch.setattr(handler.sys, "executable", "/app/Estudia.exe")
-    assert handler.handler_command() == '"/app/EstudiaHandler.exe" "%1"'
+    # Path usa \\ en Windows: se compara con la misma conversión.
+    assert handler.handler_command() == f'"{Path("/app/EstudiaHandler.exe")}" "%1"'
 
 
 def test_handler_command_not_frozen(tmp_path, monkeypatch):

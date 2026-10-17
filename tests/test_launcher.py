@@ -129,6 +129,7 @@ def lock_held(isolated, monkeypatch):
 
 
 def test_main_gives_up_after_wait(lock_held, monkeypatch, capsys):
+    monkeypatch.setattr(entry.sys, "platform", "linux")
     opened = []
     monkeypatch.setattr(entry.webbrowser, "open", opened.append)
     with pytest.raises(SystemExit) as exc:
