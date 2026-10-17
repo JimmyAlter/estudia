@@ -70,13 +70,21 @@ def _message_box(text: str) -> None:
     ctypes.windll.user32.MessageBoxW(None, text, "Estudia", 0x40)
 
 
-def _report_busy() -> None:
-    """El lock lo tiene otra instancia que no contesta: avisar y salir con error."""
-    print(BUSY_TEXT, file=sys.stderr)
+CRASH_TEXT = "Estudia no pudo arrancar. Volvé a abrirla; si sigue pasando, avisanos en GitHub."
+
+
+def _fail(text: str) -> None:
+    """Avisa y sale con error."""
+    print(text, file=sys.stderr)
     # Sin consola (la app de Windows no la tiene) el aviso se ve en un cuadro nativo.
     if sys.platform == "win32" and not headless():
-        _message_box(BUSY_TEXT)
+        _message_box(text)
     sys.exit(1)
+
+
+def _report_busy() -> None:
+    """El lock lo tiene otra instancia que no contesta."""
+    _fail(BUSY_TEXT)
 
 
 def main() -> None:
@@ -118,7 +126,9 @@ def main() -> None:
             # pystray exige el hilo principal en Windows, así que el servidor va en otro.
             server_thread = threading.Thread(target=server.run, name="uvicorn")
             server_thread.start()
-            run_tray(page_url, lambda: shutdown(server))
+            run_tray(page_url, lambda: shutdown(server), lambda: not server_thread.is_alive())
+            if not server.should_exit:  # el hilo murió solo: error de arranque o caída
+                _fail(CRASH_TEXT)
         else:
             server.run()
     finally:

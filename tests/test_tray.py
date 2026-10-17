@@ -15,10 +15,12 @@ class FakeIcon:
     def __init__(self, name, image, title, menu):
         self.name, self.image, self.title, self.menu = name, image, title, menu
         self.stopped = False
+        self.visible = False
         FakeIcon.instances.append(self)
 
-    def run(self):
-        pass
+    def run(self, setup=None):
+        if setup:
+            setup(self)
 
     def stop(self):
         self.stopped = True
@@ -90,3 +92,16 @@ def test_shutdown_terminates_children():
     finally:
         if child.is_alive():
             child.kill()
+
+
+def test_tray_uses_light_variant_icon():
+    from importlib import resources
+
+    assert (resources.files("estudia") / "assets" / "icono-bandeja.png").is_file()
+
+
+def test_should_stop_stops_icon(fake_pystray):
+    tray.run_tray("http://127.0.0.1:1/", lambda: None, lambda: True)
+    icon = FakeIcon.instances[0]
+    assert icon.stopped
+    assert icon.visible is True

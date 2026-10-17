@@ -201,7 +201,7 @@ def test_main_runs_server_in_thread_and_tray_in_main(serving, monkeypatch):
         on_quit()
 
     monkeypatch.setattr(entry, "tray_available", lambda: True)
-    monkeypatch.setattr(entry, "run_tray", fake_run_tray)
+    monkeypatch.setattr(entry, "run_tray", lambda url, on_quit, stop: fake_run_tray(url, on_quit))
     entry.main()
     assert seen["tray_thread"] is threading.main_thread()
     assert seen["url"].startswith("http://127.0.0.1:")
@@ -212,7 +212,7 @@ def test_main_runs_server_in_thread_and_tray_in_main(serving, monkeypatch):
 
 
 def test_main_cleans_up_when_tray_crashes(serving, monkeypatch):
-    def boom(url, on_quit):
+    def boom(url, on_quit, stop):
         raise RuntimeError("tray")
 
     monkeypatch.setattr(entry, "tray_available", lambda: True)
@@ -242,4 +242,28 @@ def test_main_headless_has_no_tray(serving, monkeypatch):
     threading.Timer(0.3, lambda: setattr(serving.server, "should_exit", True)).start()
     entry.main()
     assert serving.server.run_thread is threading.main_thread()
+    assert serving.lock.closed
+
+
+def test_main_server_thread_dies_stops_tray_and_cleans_up(serving, monkeypatch, capsys):
+    boxes = []
+    serving.server.run = lambda: None  # arranque que falla: el hilo termina enseguida
+
+    def fake_run_tray(url, on_quit, should_stop):
+        for _ in range(100):
+            if should_stop():
+                return  # equivale a icon.stop()
+            time.sleep(0.01)
+        pytest.fail("el vigilante no vio morir al servidor")
+
+    monkeypatch.setattr(entry, "tray_available", lambda: True)
+    monkeypatch.setattr(entry, "run_tray", fake_run_tray)
+    monkeypatch.setattr(entry.sys, "platform", "win32")
+    monkeypatch.setattr(entry, "_message_box", boxes.append)
+    with pytest.raises(SystemExit) as exc:
+        entry.main()
+    assert exc.value.code == 1
+    assert boxes == [entry.CRASH_TEXT]
+    assert entry.CRASH_TEXT in capsys.readouterr().err
+    assert not serving.port_file.exists()
     assert serving.lock.closed
