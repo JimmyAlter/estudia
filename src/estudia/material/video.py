@@ -1,9 +1,10 @@
 """Descarga local de un video de YouTube, para subirlo a Gemini cuando no acepta el enlace.
 
 YouTube ahora exige resolver un desafío en JavaScript. yt-dlp lo resuelve con un
-runtime externo: se usa el `deno` que viene como dependencia (paquete `deno` de
-PyPI, así nadie tiene que instalar nada, tampoco en Windows) y, si está, también
-`node` (yt-dlp elige el que sirva).
+runtime externo. En el instalador de Windows se usa solo el `node` que viene
+incluido. Si no, el `deno` que viene como dependencia (paquete `deno` de PyPI,
+así nadie tiene que instalar nada) y, si está, también `node` (yt-dlp elige el
+que sirva).
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+
+from estudia.config import BUNDLED_JS_RUNTIME, bundled_js_runtime
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +59,11 @@ def cached_video(youtube_id: str, dest_dir: Path) -> Path | None:
 
 
 def js_runtimes() -> dict[str, dict]:
-    """Runtimes de JavaScript para yt-dlp: el deno de la dependencia y node si está."""
+    """Runtimes de JavaScript para yt-dlp: el incluido en el instalador o, si no
+    hay, el deno de la dependencia y node si está."""
+    bundled = bundled_js_runtime()
+    if bundled is not None:
+        return {BUNDLED_JS_RUNTIME: {"path": str(bundled)}}
     runtimes: dict[str, dict] = {}
     try:
         from deno import find_deno_bin

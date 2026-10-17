@@ -2,7 +2,9 @@
 
 Uso: `python -m estudia.server.handler <url>` (lo invoca el sistema al volver
 del login en el navegador) o `python -m estudia.server.handler --install` para
-registrar los esquemas en Linux. Moodle suele forzar `moodlemobile://`
+registrar los esquemas (en Windows, `--install` / `--uninstall` escriben o borran
+las claves de HKCU; `--data-dir` imprime la carpeta de datos sin crearla;
+`--forget-secrets` borra del keyring la clave de IA y los tokens del campus). Moodle suele forzar `moodlemobile://`
 (`tool_mobile/forcedurlscheme`), por eso se registran los dos.
 """
 import shutil
@@ -12,8 +14,13 @@ from pathlib import Path
 
 import httpx
 
-from estudia.config import data_dir
-from estudia.server.app import HOST
+from estudia import winreg_schemes
+from estudia.catalog import load_catalog
+from estudia.config import data_dir, data_path
+from estudia.launcher import headless
+from estudia.secrets import delete_secret
+from estudia.server.app import GEMINI_KEY, HOST, moodle_private_name, moodle_token_name
+from estudia.streams import redirect_missing_streams
 
 DESKTOP_FILE = "estudia-handler.desktop"
 SCHEME_MIMES = ("x-scheme-handler/estudia", "x-scheme-handler/moodlemobile")
@@ -55,10 +62,34 @@ def _register() -> Path:
     return path
 
 
+def handler_command() -> str:
+    """Comando que Windows ejecuta al volver del login (`%1` es la URL)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).with_name("EstudiaHandler.exe")
+        return f'"{exe}" "%1"'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.exists():
+        pythonw = Path(sys.executable)
+    return f'"{pythonw}" -m estudia.server.handler "%1"'
+
+
 def install() -> int:
-    """Registra el handler de `estudia://` y `moodlemobile://` para el usuario actual (Linux)."""
+    """Registra el handler de `estudia://` y `moodlemobile://` para el usuario actual."""
+    if sys.platform == "win32":
+        winreg_schemes.register(winreg_schemes.RealReg(), handler_command())
+        print("Listo: estudia:// y moodlemobile:// quedan a cargo de Estudia")
+        return 0
     path = _register()
     print(f"Listo: {', '.join(SCHEME_MIMES)} quedan a cargo de {path}")
+    return 0
+
+
+def uninstall() -> int:
+    """Deshace `install()`; en Windows devuelve `moodlemobile://` a la app que lo tenía."""
+    if sys.platform == "win32":
+        winreg_schemes.unregister(winreg_schemes.RealReg(), handler_command())
+    else:
+        _desktop_path().unlink(missing_ok=True)
     return 0
 
 
@@ -76,7 +107,16 @@ def _is_current(path: Path) -> bool:
 
 
 def ensure_installed() -> None:
-    """Al arrancar, en Linux: registra el handler si falta o quedó viejo. Sin xdg-mime no hace nada."""
+    """Al arrancar: registra el handler si falta o quedó viejo. En Linux, sin xdg-mime no hace nada."""
+    if sys.platform == "win32":
+        reg, cmd = winreg_schemes.RealReg(), handler_command()
+        try:
+            # Al arrancar no se le saca moodlemobile:// a otra app; eso lo hace --install.
+            if not winreg_schemes.is_registered(reg, cmd, takeover_moodle=False):
+                winreg_schemes.register(reg, cmd, takeover_moodle=False)
+        except OSError:
+            pass  # se puede pegar el enlace a mano en la pantalla de inicio de sesión
+        return
     if not sys.platform.startswith("linux") or _is_current(_desktop_path()):
         return
     if shutil.which("xdg-mime") is None:
@@ -87,7 +127,7 @@ def ensure_installed() -> None:
         pass  # se puede pegar el enlace a mano en la pantalla de inicio de sesión
 
 
-def _is_estudia(base: str) -> bool:
+def is_estudia(base: str) -> bool:
     """El puerto puede haber quedado de una corrida anterior: se confirma antes de mandar el token."""
     try:
         datos = httpx.get(f"{base}/api/state", timeout=5).json()
@@ -96,36 +136,79 @@ def _is_estudia(base: str) -> bool:
     return isinstance(datos, dict) and "step" in datos
 
 
+_is_estudia = is_estudia
+
+
+CLOSED_TEXT = "Abrí Estudia y volvé a iniciar sesión en el campus."
+
+
+def _message_box(text: str) -> None:
+    import ctypes
+
+    ctypes.windll.user32.MessageBoxW(None, text, "Estudia", 0x30)
+
+
+def _not_running(message: str) -> int:
+    """Estudia no está abierta: el login vuelve y no hay a quién dárselo."""
+    print(message, file=sys.stderr)
+    # EstudiaHandler.exe no tiene consola: sin el cuadro, el login se perdería en silencio.
+    # Solo en el .exe de Windows, así nunca aparece en otra plataforma ni en las pruebas.
+    if sys.platform == "win32" and getattr(sys, "frozen", False) and not headless():
+        _message_box(CLOSED_TEXT)
+    return 1
+
+
 def forward(url: str) -> int:
     try:
         port = int((data_dir() / "port").read_text("utf-8").strip())
     except (OSError, ValueError):
-        print("No se encontró Estudia. ¿Está abierta?", file=sys.stderr)
-        return 1
+        return _not_running("No se encontró Estudia. ¿Está abierta?")
     base = f"http://{HOST}:{port}"
-    if not _is_estudia(base):
-        print("No se pudo avisar a Estudia. ¿Está abierta?", file=sys.stderr)
-        return 1
+    if not is_estudia(base):
+        return _not_running("No se pudo avisar a Estudia. ¿Está abierta?")
     try:
         respuesta = httpx.post(f"{base}/api/login/callback", json={"url": url}, timeout=15)
     except httpx.HTTPError:
         # Sin la URL en el mensaje: lleva el token.
-        print("No se pudo avisar a Estudia. ¿Está abierta?", file=sys.stderr)
-        return 1
+        return _not_running("No se pudo avisar a Estudia. ¿Está abierta?")
     if respuesta.status_code != 200:
         print(f"Estudia rechazó el inicio de sesión (HTTP {respuesta.status_code}).", file=sys.stderr)
         return 1
     return 0
 
 
+def forget_secrets() -> int:
+    """Borra todo lo que Estudia guardó en el keyring (lo usa el desinstalador).
+
+    El keyring no se puede listar: se borran los nombres posibles, de todas las facultades.
+    """
+    names = [GEMINI_KEY]
+    for site in load_catalog():
+        names += [moodle_token_name(site.id), moodle_private_name(site.id)]
+    for name in names:
+        delete_secret(name)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--install"]:
         return install()
+    if argv == ["--uninstall"]:
+        return uninstall()
+    if argv == ["--forget-secrets"]:
+        return forget_secrets()
+    if argv == ["--data-dir"]:
+        print(data_path())
+        return 0
     if len(argv) != 1:
-        print("uso: python -m estudia.server.handler <url> | --install", file=sys.stderr)
+        print("uso: python -m estudia.server.handler <url> | --install | --uninstall | --data-dir"
+              " | --forget-secrets",
+              file=sys.stderr)
         return 2
     return forward(argv[0])
 
 
 if __name__ == "__main__":
+    # EstudiaHandler.exe no tiene consola. Sin log: `--data-dir` no debe crear nada.
+    redirect_missing_streams(None)
     sys.exit(main(sys.argv[1:]))

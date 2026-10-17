@@ -1,12 +1,13 @@
 [project]
 name = "estudia"
-version = "0.1.0"
+version = "0.1.1"
 description = "Herramienta local de estudio para estudiantes universitarios"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
+    "packaging",
     "google-genai",
     "sympy",
     "keyring",
@@ -14,6 +15,8 @@ dependencies = [
     "pydantic",
     "tzdata",
     "yt-dlp[default,deno]>=2026.8.19",
+    "pystray>=0.19.5",
+    "pillow>=13.0.0",
 ]
 
 [project.optional-dependencies]

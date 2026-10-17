@@ -608,3 +608,49 @@ def test_new_ai_key_forgets_exhausted_models(env):
     conn.close()
     assert "model_exhausted:abc123abc123:gemini-2.5-flash" not in keys
     assert "ai_quota_resets_at" not in keys
+
+
+def test_api_version_route(tmp_path):
+    import httpx
+    import respx
+
+    from estudia.updates import RELEASE_API
+    from estudia.version import __version__
+
+    url = "https://github.com/JimmyAlter/estudia/releases/tag/v9.9.9"
+    app = create_app(
+        db_path=tmp_path / "e.db",
+        web_dist=tmp_path / "no-existe",
+        port=PORT,
+        update_http_factory=httpx.Client,
+    )
+    c = TestClient(app, base_url=BASE)
+    with respx.mock:
+        route = respx.get(RELEASE_API).mock(
+            return_value=httpx.Response(200, json={"tag_name": "v9.9.9", "html_url": url})
+        )
+        assert c.get("/api/version").json() == {
+            "current": __version__,
+            "latest": {"version": "9.9.9", "url": url},
+        }
+        c.get("/api/version")
+        assert route.call_count == 1
+        route.mock(side_effect=httpx.ConnectError("sin internet"))
+        assert c.get("/api/version").status_code == 200
+
+
+def test_api_version_without_internet(tmp_path):
+    import httpx
+    import respx
+
+    from estudia.updates import RELEASE_API
+
+    app = create_app(
+        db_path=tmp_path / "e.db", web_dist=tmp_path / "no-existe", port=PORT,
+        update_http_factory=httpx.Client,
+    )
+    with respx.mock:
+        respx.get(RELEASE_API).mock(side_effect=httpx.ConnectError("sin internet"))
+        r = TestClient(app, base_url=BASE).get("/api/version")
+    assert r.status_code == 200
+    assert r.json()["latest"] is None

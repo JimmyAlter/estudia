@@ -1,4 +1,5 @@
 """Rutas y constantes de la aplicación."""
+import sys
 from pathlib import Path
 
 import platformdirs
@@ -30,8 +31,27 @@ SYNC_EVERY_S = 21600
 SECRETS_SERVICE = "estudia"
 
 
+def data_path() -> Path:
+    """Dónde van los datos del usuario, sin crear nada."""
+    return Path(platformdirs.user_data_dir("estudia"))
+
+
 def data_dir() -> Path:
     """Carpeta de datos del usuario; se crea si no existe."""
-    path = Path(platformdirs.user_data_dir("estudia"))
+    path = data_path()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# Runtime de JavaScript que el instalador de Windows trae para yt-dlp (ver
+# packaging/windows/estudia.spec). Va en `runtime/` dentro de la carpeta congelada.
+BUNDLED_JS_RUNTIME = "node"
+
+
+def bundled_js_runtime() -> Path | None:
+    """El binario del runtime de JS incluido en el ejecutable congelado, si está."""
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = BUNDLED_JS_RUNTIME + (".exe" if sys.platform == "win32" else "")
+    path = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "runtime" / exe
+    return path if path.is_file() else None

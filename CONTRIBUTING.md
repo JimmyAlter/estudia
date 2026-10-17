@@ -112,6 +112,22 @@ Abrí `http://127.0.0.1:8780/`. La base va a una carpeta temporal y los secretos
 
 Mirá los issues con la etiqueta [`para-empezar`](https://github.com/JimmyAlter/estudia/labels/para-empezar). Si querés encarar algo más grande, abrí antes una discusión en Ideas así no se pisa con lo que viene en el roadmap.
 
+### Publicar una versión
+
+Lo hace quien mantiene el repo. La versión vive en el repo: `src/estudia/version.py` y `pyproject.toml`. Desde `main` actualizado, subí la versión en version.py y pyproject, hacé el commit, poné el tag `vX.Y.Z` y subí las dos cosas:
+
+```bash
+python scripts/version_from_tag.py --bump v0.2.0   # version.py, pyproject y version_info de Windows
+uv lock
+git commit -am "Estudia 0.2.0"
+git tag v0.2.0
+git push origin main v0.2.0
+```
+
+El resto lo hace CI (`.github/workflows/release-windows.yml`): verifica que el tag sea `v` + la versión del repo (si no coincide, falla sin publicar nada), corre las pruebas, arma `EstudiaSetup-X.Y.Z.exe`, lo instala y lo abre en Windows para probarlo, lo desinstala y lo sube al release del tag con las notas de `packaging/windows/release-notes.md`. Si algo falla, no se publica nada. Los tags son solo `vX.Y.Z`, sin `-rc` ni otros sufijos.
+
+Para probar el armado sin publicar, corré el workflow a mano desde la pestaña Actions con `v` + la versión del repo en `tag` y `publish` sin marcar: el instalador queda como artefacto de la corrida. A mano solo se publica si `publish` está marcado y lo corrés sobre `main`.
+
 ---
 
 ## Convivencia

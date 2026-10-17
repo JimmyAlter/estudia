@@ -104,17 +104,31 @@ Estudia se conecta a campus Moodle que tengan activo el servicio para celulares,
 
 ## Instalación
 
-**El instalador para Windows está en camino** ([etapa 6](#roadmap)). Mientras tanto, Estudia se corre desde el código. Son cinco comandos y no hace falta saber programar, pero sí usar una terminal.
-
-**Hoy necesitás:**
+**Necesitás:**
 
 - una cuenta en el campus de **UTN-FRBA** (las demás facultades llegan en la etapa 5);
-- una clave gratis de Gemini, que se saca en [Google AI Studio](https://aistudio.google.com/apikey) (la app te guía);
+- una clave gratis de Gemini, que se saca en [Google AI Studio](https://aistudio.google.com/apikey) (la app te guía).
+
+### Instalar en Windows
+
+1. Bajá `EstudiaSetup-<versión>.exe` de la [última versión](https://github.com/JimmyAlter/estudia/releases/latest), en la lista de archivos (Assets).
+2. Abrilo con doble clic y seguí los pasos. No pide permisos de administrador: se instala solo para tu usuario.
+3. Al terminar se abre Estudia. Después la encontrás en el menú Inicio.
+
+**Si aparece "Windows protegió su PC":** es el filtro SmartScreen. Tocá **Más información** y después **Ejecutar de todas formas**. Sale porque el instalador no está firmado con un certificado de pago, no porque haya algo raro: el código es abierto, lo podés revisar en este repo, y el instalador lo arma GitHub a partir de ese código. Es probable que el aviso aparezca durante las primeras semanas de cada versión, hasta que Windows la vea en más computadoras.
+
+- **Actualizar:** bajá el instalador nuevo y abrilo. Tus materias y tu progreso se mantienen. Cuando hay una versión nueva, Estudia te avisa.
+- **Desinstalar:** desde Configuración → Aplicaciones → Estudia. Te pregunta si querés borrar también tus datos de estudio; si decís que no, quedan por si la volvés a instalar.
+
+### Desde el código (avanzado)
+
+Para macOS y Linux, o si querés tocar el código. Son cinco comandos y no hace falta saber programar, pero sí usar una terminal. Además de lo de arriba necesitás:
+
 - [uv](https://docs.astral.sh/uv/), que instala Python solo;
 - [Node.js](https://nodejs.org/) 22 o más nuevo, para armar la interfaz una vez;
 - git.
 
-### 1. Instalá uv, Node y git
+#### 1. Instalá uv, Node y git
 
 **Windows** (PowerShell):
 
@@ -139,7 +153,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 Cerrá y volvé a abrir la terminal para que tome los comandos nuevos.
 
-### 2. Bajá Estudia y armá la interfaz
+#### 2. Bajá Estudia y armá la interfaz
 
 ```bash
 git clone https://github.com/JimmyAlter/estudia.git
@@ -148,40 +162,42 @@ uv sync
 cd web && npm ci && npm run build && cd ..
 ```
 
-### 3. Abrila
+#### 3. Abrila
 
 ```bash
 uv run python -m estudia
 ```
 
-Se abre Estudia en tu navegador, en una página de tu propia PC (`127.0.0.1`). Elegís tu facultad, iniciás sesión en el campus y pegás tu clave de Gemini. Después procesa las clases de a una y te avisa cuando hay preguntas.
+#### Actualizar y desinstalar
+
+- **Actualizar:** `git pull`, después `uv sync` y `cd web && npm ci && npm run build`.
+- **Desinstalar:** en Windows, primero `uv run python -m estudia.server.handler --uninstall` para soltar el enlace de vuelta del login. Después borrá la carpeta `estudia` y la de datos:
+  - Windows: `%LOCALAPPDATA%\estudia`
+  - macOS: `~/Library/Application Support/estudia`
+  - Linux: `~/.local/share/estudia` y `~/.local/share/applications/estudia-handler.desktop`
+
+  El permiso del campus y la clave de Gemini quedan en el almacén seguro del sistema con el nombre `estudia`; los podés borrar desde ahí.
+
+### Primeros pasos
+
+Estudia se abre en tu navegador, en una página de tu propia PC (`127.0.0.1`). Elegís tu facultad, iniciás sesión en el campus y pegás tu clave de Gemini. Después procesa las clases de a una y te avisa cuando hay preguntas.
 
 **Sobre el inicio de sesión:** al terminar el login, el campus te manda de vuelta con un enlace que empieza con `moodlemobile://`.
 
-- **En Linux** Estudia lo registra solo y vuelve sin que hagas nada.
-- **En Windows y macOS** todavía no (llega con el instalador). Si no vuelve solo, la pantalla de Estudia te deja pegar el enlace. En Chrome o Edge lo encontrás así: antes de iniciar sesión apretá F12 y abrí la pestaña **Consola**; al terminar aparece un aviso con la dirección `moodlemobile://token=…`. Copiala desde `moodlemobile://` hasta el final. Ese enlace es tu acceso: no se lo pases a nadie.
+- **En Windows y Linux** Estudia lo registra y el login vuelve solo, sin que hagas nada. La excepción es Windows desde el código con la app de Moodle ya instalada: ahí Estudia no le saca el enlace a esa app (el instalador sí, y lo devuelve al desinstalar).
+- **En macOS** todavía no. Ahí, o si por algo no vuelve solo, la pantalla de Estudia te deja pegar el enlace. En Chrome o Edge lo encontrás así: antes de iniciar sesión apretá F12 y abrí la pestaña **Consola**; al terminar aparece un aviso con la dirección `moodlemobile://token=…`. Copiala desde `moodlemobile://` hasta el final. Ese enlace es tu acceso: no se lo pases a nadie.
 
 **Sobre el plan gratis de Gemini:** tiene un límite por día. Si se termina, Estudia lo dice y sigue con las clases que faltan al día siguiente.
 
 ### ¿Querés verla sin campus?
 
-Con datos de ejemplo, sin tocar internet ni tus datos:
+Desde el código, con datos de ejemplo y sin tocar internet ni tus datos:
 
 ```bash
 uv run python scripts/dev_seed.py --port 8780
 ```
 
 y abrí `http://127.0.0.1:8780/`.
-
-### Actualizar y desinstalar
-
-- **Actualizar:** `git pull`, después `uv sync` y `cd web && npm ci && npm run build`.
-- **Desinstalar:** borrá la carpeta `estudia` y la de datos:
-  - Windows: `%LOCALAPPDATA%\estudia`
-  - macOS: `~/Library/Application Support/estudia`
-  - Linux: `~/.local/share/estudia` y `~/.local/share/applications/estudia-handler.desktop`
-
-  El permiso del campus y la clave de Gemini quedan en el almacén seguro del sistema con el nombre `estudia`; los podés borrar desde ahí.
 
 ## Sumá tu facultad
 

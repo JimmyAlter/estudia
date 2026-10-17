@@ -1,0 +1,6 @@
+{
+  "comment": "node.exe que va adentro del instalador. Lo baja el workflow release-windows y verifica el SHA256; ver la cabecera de estudia.spec.",
+  "url": "https://nodejs.org/dist/v24.22.0/win-x64/node.exe",
+  "sha256": "ba93f9a70bd86fce3ebbb39ec758501458453467aa92a34a0a3602d1e3fc2b9c",
+  "dest": "packaging/windows/runtime/node.exe"
+}

@@ -124,4 +124,40 @@ describe("App", () => {
     render(<App />);
     expect(await screen.findByRole("button", { name: "Volver a entrar" })).toBeInTheDocument();
   });
+
+  it("muestra el aviso cuando hay versión nueva", async () => {
+    const url = "https://github.com/JimmyAlter/estudia/releases/tag/v0.2.0";
+    mockApi({
+      "GET /api/state": READY,
+      "GET /api/home": HOME,
+      "GET /api/version": { current: "0.1.0", latest: { version: "0.2.0", url } },
+    });
+    render(<App />);
+    expect(await screen.findByText("Estudia 0.1.0")).toBeInTheDocument();
+    expect(await screen.findByText(/Hay una versión nueva \(0\.2\.0\)\./)).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: "Descargar" });
+    expect(link).toHaveAttribute("href", url);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+  });
+
+  it("no muestra nada sin versión nueva", async () => {
+    mockApi({
+      "GET /api/state": READY,
+      "GET /api/home": HOME,
+      "GET /api/version": { current: "0.1.0", latest: null },
+    });
+    render(<App />);
+    expect(await screen.findByText("Estudia 0.1.0")).toBeInTheDocument();
+    expect(screen.queryByText(/versión nueva/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Descargar" })).not.toBeInTheDocument();
+  });
+
+  it("si falla la consulta de versión no muestra errores", async () => {
+    mockApi({ "GET /api/state": READY, "GET /api/home": HOME });
+    render(<App />);
+    await screen.findByText("Sin exámenes próximos");
+    expect(screen.queryByText(/versión nueva/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
+  });
 });

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
@@ -23,6 +25,39 @@ def test_handler_without_running_app(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
     assert handler.main(["estudia://token=secreto"]) == 1
     assert "secreto" not in capsys.readouterr().err
+
+
+@pytest.fixture
+def boxes(monkeypatch):
+    shown = []
+    monkeypatch.setattr(handler, "_message_box", shown.append)
+    monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
+    return shown
+
+
+def test_handler_closed_app_shows_message_box_in_windows_exe(tmp_path, monkeypatch, boxes):
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(handler.sys, "platform", "win32")
+    monkeypatch.setattr(handler.sys, "frozen", True, raising=False)
+    assert handler.main(["estudia://token=secreto"]) == 1
+    assert boxes == [handler.CLOSED_TEXT]
+    assert "secreto" not in boxes[0]
+
+
+@pytest.mark.parametrize("platform, frozen, headless", [
+    ("linux", True, False),   # otra plataforma
+    ("win32", False, False),  # pruebas y modo dev
+    ("win32", True, True),    # sin escritorio
+])
+def test_handler_closed_app_no_message_box(tmp_path, monkeypatch, boxes, platform, frozen,
+                                           headless):
+    monkeypatch.setattr(handler, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(handler.sys, "platform", platform)
+    monkeypatch.setattr(handler.sys, "frozen", frozen, raising=False)
+    if headless:
+        monkeypatch.setenv("ESTUDIA_HEADLESS", "1")
+    assert handler.main(["estudia://token=abc"]) == 1
+    assert boxes == []
 
 
 def test_desktop_entry_registers_scheme():
@@ -107,9 +142,9 @@ def test_ensure_installed_fails_quietly(fake_home, monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_ensure_installed_only_on_linux(fake_home, monkeypatch):
+def test_ensure_installed_ignores_other_platforms(fake_home, monkeypatch):
     home, runs = fake_home
-    monkeypatch.setattr(handler.sys, "platform", "win32")
+    monkeypatch.setattr(handler.sys, "platform", "darwin")
     handler.ensure_installed()
     assert runs == []
 
@@ -141,3 +176,86 @@ def test_ensure_installed_keeps_a_current_file(fake_home):
     path.write_text(handler.desktop_entry(handler.sys.executable), "utf-8")
     handler.ensure_installed()
     assert runs == []
+
+
+def test_handler_command_frozen(monkeypatch):
+    monkeypatch.setattr(handler.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(handler.sys, "executable", "/app/Estudia.exe")
+    # Path usa \\ en Windows: se compara con la misma conversión.
+    assert handler.handler_command() == f'"{Path("/app/EstudiaHandler.exe")}" "%1"'
+
+
+def test_handler_command_not_frozen(tmp_path, monkeypatch):
+    monkeypatch.delattr(handler.sys, "frozen", raising=False)
+    monkeypatch.setattr(handler.sys, "executable", str(tmp_path / "python.exe"))
+    (tmp_path / "pythonw.exe").touch()
+    assert handler.handler_command() == f'"{tmp_path / "pythonw.exe"}" -m estudia.server.handler "%1"'
+
+
+def test_handler_command_falls_back_to_python_without_pythonw(tmp_path, monkeypatch):
+    monkeypatch.delattr(handler.sys, "frozen", raising=False)
+    monkeypatch.setattr(handler.sys, "executable", str(tmp_path / "python.exe"))
+    assert handler.handler_command() == f'"{tmp_path / "python.exe"}" -m estudia.server.handler "%1"'
+
+
+class _Spy:
+    def __init__(self):
+        self.calls = []
+
+    def register(self, reg, cmd, takeover_moodle=True):
+        self.calls.append(("register", cmd, takeover_moodle))
+
+    def unregister(self, reg, cmd):
+        self.calls.append(("unregister", cmd))
+
+    def is_registered(self, reg, cmd, takeover_moodle=True):
+        self.calls.append(("is_registered", cmd, takeover_moodle))
+        return False
+
+    RealReg = staticmethod(lambda: "reg")
+
+
+@pytest.fixture
+def win(monkeypatch):
+    spy = _Spy()
+    monkeypatch.setattr(handler, "winreg_schemes", spy)
+    monkeypatch.setattr(handler.sys, "platform", "win32")
+    monkeypatch.setattr(handler, "handler_command", lambda: "CMD")
+    return spy
+
+
+def test_install_and_uninstall_on_windows(win):
+    assert handler.main(["--install"]) == 0
+    assert handler.main(["--uninstall"]) == 0
+    assert win.calls == [("register", "CMD", True), ("unregister", "CMD")]
+
+
+def test_ensure_installed_on_windows_registers_when_stale(win):
+    handler.ensure_installed()
+    assert win.calls == [("is_registered", "CMD", False), ("register", "CMD", False)]
+
+
+def test_data_dir_flag_prints_without_creating(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "nueva"
+    monkeypatch.setattr(handler, "data_path", lambda: target)
+    assert handler.main(["--data-dir"]) == 0
+    assert capsys.readouterr().out.strip() == str(target)
+    assert not target.exists()
+
+
+def test_forget_secrets_deletes_every_estudia_secret(memory_keyring):
+    from estudia.catalog import load_catalog
+    from estudia.secrets import get_secret, set_secret
+    from estudia.server.app import GEMINI_KEY, moodle_private_name, moodle_token_name
+
+    sites = [s.id for s in load_catalog()]
+    names = [GEMINI_KEY] + [f(s) for s in sites for f in (moodle_token_name, moodle_private_name)]
+    for name in names:
+        set_secret(name, "secreto")
+    memory_keyring.set_password("otra-app", GEMINI_KEY, "ajeno")
+
+    assert handler.main(["--forget-secrets"]) == 0
+    assert all(get_secret(name) is None for name in names)
+    assert memory_keyring.get_password("otra-app", GEMINI_KEY) == "ajeno"
+    # Repetirlo sin nada guardado no falla.
+    assert handler.main(["--forget-secrets"]) == 0
