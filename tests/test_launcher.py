@@ -215,17 +215,22 @@ def test_main_runs_server_in_thread_and_tray_in_main(serving, monkeypatch):
     assert serving.exits == [0]  # con bandeja se sale sin esperar hilos colgados
 
 
-def test_main_cleans_up_when_tray_crashes(serving, monkeypatch):
+def test_main_keeps_serving_when_tray_crashes(serving, monkeypatch, caplog):
     def boom(url, on_quit, stop):
         raise RuntimeError("tray")
 
     monkeypatch.setattr(entry, "tray_available", lambda: True)
     monkeypatch.setattr(entry, "run_tray", boom)
-    with pytest.raises(RuntimeError):
+    timer = threading.Timer(0.3, lambda: setattr(serving.server, "should_exit", True))
+    timer.start()
+    with caplog.at_level("ERROR"):
         entry.main()
-    assert serving.server.should_exit
+    assert "La bandeja dejó de andar" in caplog.text
+    assert serving.server.run_thread is not threading.main_thread()
+    assert not timer.is_alive()  # el servidor siguió hasta que se le pidió terminar
     assert not serving.port_file.exists()
     assert serving.lock.closed
+    assert serving.exits == [0]
 
 
 def test_main_without_pystray_runs_server_in_main_thread(serving, monkeypatch, caplog):

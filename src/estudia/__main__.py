@@ -135,7 +135,13 @@ def main() -> None:
             # pystray exige el hilo principal en Windows, así que el servidor va en otro.
             server_thread = threading.Thread(target=server.run, name="uvicorn")
             server_thread.start()
-            run_tray(page_url, lambda: shutdown(server), lambda: not server_thread.is_alive())
+            try:
+                run_tray(page_url, lambda: shutdown(server), lambda: not server_thread.is_alive())
+            except Exception:
+                # Sin ícono se puede seguir usando desde el navegador: no se corta el servidor.
+                log.exception("La bandeja dejó de andar; Estudia sigue sin ícono.")
+                while server_thread.is_alive():
+                    server_thread.join(0.5)
             if not server.should_exit:  # el hilo murió solo: error de arranque o caída
                 _fail(CRASH_TEXT)
         else:
