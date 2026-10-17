@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import estudia.__main__ as entry
-from estudia.launcher import acquire_lock, headless, running_instance
+from estudia.launcher import acquire_lock, headless, opens_browser, running_instance
 
 
 def test_no_port_file_returns_none(tmp_path):
@@ -73,6 +73,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(entry, "ensure_installed", lambda: None)
     monkeypatch.setattr(entry, "data_dir", lambda: tmp_path)
     monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
+    monkeypatch.delenv("ESTUDIA_NO_BROWSER", raising=False)
 
     def no_server(*a, **k):
         raise AssertionError("no debía crear el servidor")
@@ -189,6 +190,7 @@ def serving(tmp_path, monkeypatch):
     monkeypatch.setattr(entry.signal, "signal", lambda *a: None)
     monkeypatch.setattr(entry.webbrowser, "open", lambda url: None)
     monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
+    monkeypatch.delenv("ESTUDIA_NO_BROWSER", raising=False)
     exits = []
     monkeypatch.setattr(entry.os, "_exit", exits.append)
     return SimpleNamespace(lock=lock, server=server, port_file=tmp_path / "port", exits=exits)
@@ -345,3 +347,39 @@ def test_main_takes_the_lock_when_the_other_instance_dies(serving, monkeypatch):
     entry.main()
     assert serving.server.started  # arrancó como instancia principal
     assert serving.lock.closed
+
+
+def test_opens_browser_env(monkeypatch):
+    monkeypatch.delenv("ESTUDIA_HEADLESS", raising=False)
+    monkeypatch.delenv("ESTUDIA_NO_BROWSER", raising=False)
+    assert opens_browser()
+    monkeypatch.setenv("ESTUDIA_NO_BROWSER", "1")
+    assert not opens_browser()
+    monkeypatch.delenv("ESTUDIA_NO_BROWSER")
+    monkeypatch.setenv("ESTUDIA_HEADLESS", "1")
+    assert not opens_browser()
+
+
+def test_main_no_browser_keeps_tray(serving, monkeypatch):
+    opened, trays = [], []
+    monkeypatch.setenv("ESTUDIA_NO_BROWSER", "1")
+    monkeypatch.setattr(entry.webbrowser, "open", opened.append)
+    monkeypatch.setattr(entry, "tray_available", lambda: True)
+
+    def fake_run_tray(url, on_quit, should_stop):
+        trays.append(url)
+        on_quit()
+
+    monkeypatch.setattr(entry, "run_tray", fake_run_tray)
+    entry.main()
+    assert len(trays) == 1
+    assert opened == []
+
+
+def test_main_reuse_no_browser_does_not_open_browser(isolated, monkeypatch):
+    opened = []
+    monkeypatch.setenv("ESTUDIA_NO_BROWSER", "1")
+    monkeypatch.setattr(entry, "running_instance", lambda *_: "http://127.0.0.1:4321")
+    monkeypatch.setattr(entry.webbrowser, "open", opened.append)
+    entry.main()
+    assert opened == []

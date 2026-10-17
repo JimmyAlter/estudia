@@ -21,6 +21,11 @@ def headless() -> bool:
     return os.environ.get("ESTUDIA_HEADLESS") == "1"
 
 
+def opens_browser() -> bool:
+    """False sin escritorio o con ESTUDIA_NO_BROWSER=1 (la bandeja sigue: lo usa la prueba de CI)."""
+    return not headless() and os.environ.get("ESTUDIA_NO_BROWSER") != "1"
+
+
 def acquire_lock(path: Path) -> object | None:
     """Lock exclusivo de archivo que dura lo que viva el proceso. None si ya está tomado.
 

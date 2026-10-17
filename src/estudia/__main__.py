@@ -17,7 +17,7 @@ import uvicorn
 
 from estudia.config import data_dir
 from estudia.server.app import HOST, create_app, periodic_sync
-from estudia.launcher import acquire_lock, headless, running_instance
+from estudia.launcher import acquire_lock, headless, opens_browser, running_instance
 from estudia.server.handler import ensure_installed, is_estudia
 from estudia.streams import redirect_missing_streams
 from estudia.tray import run_tray, shutdown, tray_available
@@ -53,7 +53,7 @@ def _open_when_ready(server: uvicorn.Server, url: str) -> None:
 
 
 def _reuse(url: str) -> None:
-    if not headless():
+    if opens_browser():
         webbrowser.open(url + "/")
 
 
@@ -133,7 +133,7 @@ def main() -> None:
     if use_tray and not tray_available():
         log.warning("No se pudo cargar la bandeja del sistema; Estudia sigue sin ícono.")
         use_tray = False
-    if not headless():
+    if opens_browser():
         threading.Thread(target=_open_when_ready, args=(server, page_url), daemon=True).start()
     server_thread = None
     exit_code = 0
