@@ -13,6 +13,11 @@ export interface AppState {
   last_sync_error: string | null;
 }
 
+export interface VersionInfo {
+  current: string;
+  latest: { version: string; url: string } | null;
+}
+
 export interface Site {
   id: string;
   name: string;
@@ -114,6 +119,7 @@ const post = <T>(path: string, body?: unknown) => request<T>(path, { method: "PO
 
 export const api = {
   state: () => request<AppState>("/api/state"),
+  version: () => request<VersionInfo>("/api/version"),
   catalog: () => request<Site[]>("/api/catalog"),
   chooseSite: (siteId: string) => post<{ ok: true }>("/api/site", { site_id: siteId }),
   startLogin: () => post<{ url: string }>("/api/login/start"),

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RotateCw } from "lucide-react";
-import { ApiError, api, type AppState, type QuizParams } from "./api";
+import { ApiError, api, type AppState, type QuizParams, type VersionInfo } from "./api";
 import { timeAgo } from "./format";
 import Home, { type Screen } from "./screens/Home";
 import Materials from "./screens/Materials";
@@ -148,7 +148,46 @@ export default function App() {
         {screen === "practica" && <Practice params={practice} onExit={() => navigate("inicio")} />}
         {screen === "materiales" && <Materials key={refreshKey} aiStopReason={state.ai_stop_reason} />}
       </main>
+
+      <Footer />
     </div>
+  );
+}
+
+/** Versión instalada y, si hay una más nueva, el link para bajarla. Falla en silencio. */
+function Footer() {
+  const [info, setInfo] = useState<VersionInfo | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .version()
+      .then((v) => alive && setInfo(v))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const current = info?.current ?? import.meta.env.VITE_APP_VERSION;
+  if (!current) return null;
+  return (
+    <footer className="mt-24 flex flex-wrap items-baseline gap-x-4 border-t border-line pt-4 text-xs text-muted">
+      <span>Estudia {current}</span>
+      {info?.latest && (
+        <span>
+          Hay una versión nueva ({info.latest.version}).{" "}
+          <a
+            href={info.latest.url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-2 hover:text-ink"
+          >
+            Descargar
+          </a>
+        </span>
+      )}
+    </footer>
   );
 }
 

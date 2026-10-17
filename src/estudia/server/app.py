@@ -47,6 +47,8 @@ from estudia.generation.pipeline import (
 from estudia.moodle.auth import AuthError, launch_url, parse_callback
 from estudia.moodle.client import MoodleClient, MoodleError, TokenInvalid
 from estudia.moodle.sync import sync_all
+from estudia.updates import default_http, latest_release
+from estudia.version import __version__
 from estudia.secrets import delete_secret, get_secret, set_secret
 from estudia.study.home import home_view, next_exam
 from estudia.study.practice import (
@@ -417,6 +419,7 @@ def create_app(
     open_browser: Callable[[str], Any] | None = None,
     web_dist: Path | None = None,
     port: int | None = None,
+    update_http_factory: Callable[[], httpx.Client] | None = None,
 ) -> FastAPI:
     if db_path is None:
         db_path = data_dir() / "estudia.db"
@@ -484,6 +487,22 @@ def create_app(
             "last_sync_at": int(last) if last else None,
             "last_sync_error": _kv_get(conn, SYNC_ERROR_KEY),
         }
+
+    @app.get("/api/version")
+    def version(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        # La consulta a GitHub es perezosa (una vez por día) y falla en silencio.
+        latest = None
+        try:
+            with (update_http_factory or default_http)() as http:
+                latest = latest_release(
+                    http,
+                    int(time.time()),
+                    lambda key: _kv_get(conn, key),
+                    lambda key, value: _kv_set(conn, key, value),
+                )
+        except Exception:  # noqa: BLE001 - sin aviso, pero la ruta responde igual
+            log.info("falló el aviso de versión", exc_info=True)
+        return {"current": __version__, "latest": latest}
 
     @app.get("/api/catalog")
     def catalog() -> list[dict]:
