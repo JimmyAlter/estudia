@@ -55,6 +55,7 @@ def setup(tmp_path):
         conn.execute("INSERT INTO material(id, section_id, cmid, kind, title, ref, status)"
                      " VALUES (?, 1, ?, 'youtube', 'V', ?, 'pending')", (mid, 100 + mid, f"v{mid}"))
     _kv_set(conn, "site_id", SITE_ID)
+    _kv_set(conn, "age_gate", "adult")
     _kv_set(conn, "last_sync_at", str(int(clock())))  # la sincronización no toca todavía
     conn.close()
     set_secret(f"moodle_token:{SITE_ID}", "tok")
@@ -172,3 +173,15 @@ def test_periodic_loop_waits_while_busy(setup):
     jobs.finish()
     assert sleeps == [POLL_S, POLL_S]
     assert setup["moodle_calls"] == 0
+
+
+def test_youtube_cap_waits_until_its_reset(setup):
+    jobs, clock = setup["jobs"], setup["clock"]
+    conn = jobs.connect()
+    try:
+        _kv_set(conn, "ai_stop_reason", "youtube_cap")
+        _kv_set(conn, "ai_quota_resets_at", str(int(clock() + 5000)))
+        jobs._plan_retry(conn, 0)
+    finally:
+        conn.close()
+    assert jobs.retry_at == clock() + 5000

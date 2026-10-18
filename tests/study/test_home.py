@@ -2,13 +2,15 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from fakes import commit_answers
 
 from estudia.db import connect
 from estudia.study.home import home_view
+from estudia.study.mastery import topic_probability
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 NOW = int(datetime(2026, 10, 17, 15, 30, tzinfo=TZ).timestamp())
-EXAM_AT = int(datetime(2027, 3, 20, tzinfo=TZ).timestamp())
+REAL_EXAM = 1805061600  # 14/3/2027 19:00 ART (fecha de ejemplo)
 DAY = 86400
 
 
@@ -58,32 +60,32 @@ def answer(conn, qid, correct):
         "INSERT INTO answer(question_id, chosen_index, correct, at) VALUES (?, 0, ?, ?)",
         (qid, correct, NOW),
     )
-    conn.commit()
+    commit_answers(conn)
 
 
 def test_next_exam_is_soonest_future(conn):
-    add_exam(conn, 1, 10, EXAM_AT + 30 * DAY, name="SEGUNDO")
-    add_exam(conn, 2, 10, EXAM_AT)
+    add_exam(conn, 1, 10, REAL_EXAM + 30 * DAY, name="SEGUNDO")
+    add_exam(conn, 2, 10, REAL_EXAM)
     add_exam(conn, 3, 10, NOW - 5 * DAY, NOW - DAY, name="VIEJO")
     exam = home_view(conn, NOW).exam
     assert exam.name == "PRIMER CUESTIONARIO"
     assert exam.course == "Análisis Matemático"
-    assert exam.days_left == 154
+    assert exam.days_left == 148
     assert (exam.attempts, exam.time_limit_s, exam.max_grade) == (1, 7200, 12)
-    assert exam.opens_at == EXAM_AT
+    assert exam.opens_at == REAL_EXAM
 
 
 def test_days_left_ignores_hour_of_day(conn):
-    add_exam(conn, 1, 10, EXAM_AT)
+    add_exam(conn, 1, 10, REAL_EXAM)
     late = int(datetime(2026, 10, 17, 23, 59, tzinfo=TZ).timestamp())
     early = int(datetime(2026, 10, 17, 0, 0, tzinfo=TZ).timestamp())
-    assert home_view(conn, late).exam.days_left == 154
-    assert home_view(conn, early).exam.days_left == 154
+    assert home_view(conn, late).exam.days_left == 148
+    assert home_view(conn, early).exam.days_left == 148
 
 
 def test_open_exam_is_next_with_zero_days(conn):
     add_exam(conn, 1, 10, NOW - DAY, NOW + DAY)
-    add_exam(conn, 2, 10, EXAM_AT)
+    add_exam(conn, 2, 10, REAL_EXAM)
     exam = home_view(conn, NOW).exam
     assert exam.days_left == 0
     assert exam.opens_at == NOW - DAY
@@ -95,7 +97,7 @@ def test_exam_without_close_date_uses_opens_at(conn):
 
 
 def test_topics_are_those_of_visible_sections(conn):
-    add_exam(conn, 1, 10, EXAM_AT)
+    add_exam(conn, 1, 10, REAL_EXAM)
     add_topic(conn, 1, 10, "Zeta", 1)
     add_topic(conn, 2, 10, "Alfa", 1)
     add_topic(conn, 3, 10, "Oculto", 2, visible=0)
@@ -105,7 +107,9 @@ def test_topics_are_those_of_visible_sections(conn):
     topics = home_view(conn, NOW).topics
     assert [t.name for t in topics] == ["Primero", "Alfa", "Zeta"]
     assert [t.practiced for t in topics] == [False, True, False]
-    assert topics[1].mastery == pytest.approx(1.0)
+    # El dominio es la probabilidad de saberlo el día del examen (en 148 días), no hoy.
+    assert topics[1].mastery == pytest.approx(topic_probability(conn, 2, REAL_EXAM))
+    assert 0 < topics[1].mastery < topic_probability(conn, 2, NOW) == pytest.approx(1.0)
 
 
 def test_suggestion_is_weakest(conn):
@@ -149,10 +153,37 @@ def test_processing_counts_visible_sections_only(conn):
 
 
 def test_answers_to_retired_questions_do_not_mark_practiced(conn):
-    add_exam(conn, 1, 10, EXAM_AT)
+    add_exam(conn, 1, 10, REAL_EXAM)
     add_topic(conn, 1, 10, "Alfa", 1)
     answer(conn, 1, 1)
     conn.execute("UPDATE question SET retired = 1 WHERE id = 1")
     conn.commit()
     topic = home_view(conn, NOW).topics[0]
     assert (topic.practiced, topic.mastery) == (False, 0)
+
+
+def test_topic_rows_say_how_many_questions_were_seen_and_for_which_date(conn):
+    add_exam(conn, 1, 10, REAL_EXAM)
+    add_topic(conn, 1, 10, "Visto", 1)
+    add_topic(conn, 2, 10, "Nuevo", 1)
+    conn.execute(
+        "INSERT INTO question(id, topic_id, stem, options_json, correct_index, verified) "
+        "VALUES (50, 1, 'p', '[\"x\",\"y\"]', 0, 1)"
+    )
+    conn.execute(
+        "INSERT INTO question(id, topic_id, stem, options_json, correct_index, verified, retired) "
+        "VALUES (51, 1, 'p', '[\"x\",\"y\"]', 0, 1, 1)"
+    )
+    conn.commit()
+    answer(conn, 1, 1)
+    topics = {t.name: t for t in home_view(conn, NOW).topics}
+    # Solo cuentan las verificadas y no retiradas.
+    assert (topics["Visto"].seen, topics["Visto"].total) == (1, 2)
+    assert (topics["Nuevo"].seen, topics["Nuevo"].total) == (0, 1)
+    # La fecha a la que se refiere la probabilidad: la del examen; sin examen, ninguna.
+    assert topics["Visto"].at == REAL_EXAM
+
+
+def test_topic_row_without_exam_has_no_date(conn):
+    add_topic(conn, 1, 10, "Tema", 1)
+    assert home_view(conn, NOW).topics[0].at is None

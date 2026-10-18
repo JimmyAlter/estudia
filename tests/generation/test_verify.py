@@ -176,3 +176,138 @@ def test_tristate_error_del_worker_es_none(monkeypatch):
     verify._stop_worker()
     assert check_math_tristate("1+1", "2") is None
     assert check_math("1+1", "2") is False
+
+
+# --- Respuesta escrita (práctica) --------------------------------------------------------------
+
+@pytest.mark.parametrize("exact, typed", [
+    ("sqrt(2)", "1.41"), ("2*sqrt(2)", "2.83"), ("2*sqrt(2)", "2.828"), ("1/3", "0.333"),
+    ("pi", "3.14"), ("1000/3", "333.3"), ("1/2", "0.5"),
+    # formas exactas equivalentes
+    ("2*sqrt(2)", "2√2"), ("2*sqrt(2)", "2*sqrt(2)"), ("2*sqrt(2)", "2 raiz 2"),
+    ("2*sqrt(2)", "2 raíz de 2"), ("2*sqrt(2)", "√8"), ("2*sqrt(2)", "2,828"),
+    ("-5", "−5"), ("1/2", "0,5"), ("1/4", "0.25"), ("25/2", "12.5"), ("9", "3²"), ("100", "１００"),
+    ("1/2", "0.50"),
+    # exponentes con superíndices
+    ("1/2", "2⁻¹"), ("16", "2⁴"), ("1/1000", "10⁻³"), ("1000", "10³"),
+    # decimal que empieza con punto y signo separado
+    ("1/3", ".333"), ("-1/2", "-.5"), ("-sqrt(2)", "- 1.41"), ("-sqrt(2)", "−  1.41"),
+])
+def test_typed_accepted(exact, typed):
+    from estudia.generation.verify import grade_typed
+
+    assert grade_typed(exact, typed) is True
+
+
+@pytest.mark.parametrize("exact, typed", [
+    ("1/3", "0.3"), ("1/3", "0.33"), ("sqrt(2)", "1.4"), ("sqrt(2)", "1.42"), ("pi", "3.15"),
+    ("1000/3", "333.4"), ("100", "99.99"), ("100", "99.9"), ("100", "100.1"), ("3", "2.99"),
+    ("2*sqrt(2)", "2.82"), ("10", "9.99"),
+    # casi iguales sin ser iguales: hace falta prueba simbólica
+    ("1", "1+10^(-30)"), ("sqrt(2)", "sqrt(2)+10^(-40)"),
+    ("2*sqrt(2)", "3"), ("2*sqrt(2)", "sqrt(2)"), ("9", "32"),
+    # superíndices: no se pegan como dígitos sueltos
+    ("1", "2⁻¹"), ("24", "2⁴"), ("21", "2⁻¹"),
+    # exacto con desarrollo finito: solo vale igual, con los decimales que sean
+    ("12345.678", "12345.68"), ("1/8", "0.13"), ("12345.678", "12345.7"),
+    ("1/3", ".33"),
+    # racional que queda sin evaluar: igual de exacto
+    ("12345.678*(sqrt(2)+1)*(sqrt(2)-1)", "12345.68"),
+])
+def test_typed_rejected(exact, typed):
+    from estudia.generation.verify import grade_typed
+
+    assert grade_typed(exact, typed) is False
+
+
+def test_typed_ilegible_es_none():
+    from estudia.generation.verify import grade_typed
+
+    for typed in ["", "   ", "dos", "x+1", "2√", "import os", "1/2 cm", "½", None,
+                  "2ⁿ", "H₂", "2₁", "x²", "2⁻", "2^⁽1⁾"]:
+        assert grade_typed("2", typed) is None, typed
+
+
+def test_typed_control_ilegible_no_es_falla_del_worker():
+    from estudia.generation import verify
+
+    for check_expr in ["1/0", "x+1", "import os", None]:
+        with pytest.raises(verify.UncheckableExpr):
+            verify.grade_typed(check_expr, "2")
+
+
+def test_typed_worker_caido_o_lento_no_es_ilegible(monkeypatch):
+    from estudia.generation import verify
+
+    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    with pytest.raises(verify.GradingUnavailable):
+        verify.grade_typed("2", "2")
+    monkeypatch.undo()
+    monkeypatch.setattr(verify, "_start_worker", lambda: False)
+    verify._stop_worker()
+    with pytest.raises(verify.GradingUnavailable):
+        verify.grade_typed("2", "2")
+
+
+# --- ¿La regla escrita acepta un distractor? (contradicción opción múltiple / escrita) ------
+
+@pytest.mark.parametrize("check_expr, option, expected", [
+    ("sqrt(2)", "1.41", True),       # la regla escrita lo acepta: contradice la opción múltiple
+    ("sqrt(2)", "1,41", True),
+    ("sqrt(2)", "√2", True),
+    ("sqrt(2)", "2", False),
+    ("sqrt(2)", "1.4", False),
+    ("sqrt(2)", "hola", False),      # ilegible como respuesta escrita: no se acepta
+])
+def test_typed_accepts_option(check_expr, option, expected):
+    from estudia.generation.verify import typed_accepts_option
+
+    assert typed_accepts_option(check_expr, option) is expected
+
+
+def test_typed_accepts_option_runs_in_the_worker_and_timeout_is_none(monkeypatch):
+    from estudia.generation import verify
+
+    seen = []
+    real = verify._equal_with_timeout
+
+    def spy(expected, given, places="option"):
+        seen.append(places)
+        return real(expected, given, places)
+
+    monkeypatch.setattr(verify, "_equal_with_timeout", spy)
+    assert verify.typed_accepts_option("sqrt(2)", "1.41") is True
+    assert seen == [verify.TYPED_OPTION]
+    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    assert verify.typed_accepts_option("sqrt(2)", "1.41") is None
+
+
+def test_typed_accepts_option_with_unusable_control_is_none():
+    from estudia.generation.verify import typed_accepts_option
+
+    assert typed_accepts_option("x+1", "1") is None
+    assert typed_accepts_option(None, "1") is None
+
+
+def test_typed_accepts_option_backs_off_after_a_failed_start(monkeypatch):
+    from estudia.generation import verify
+
+    starts = []
+
+    def failing_start():
+        starts.append(1)
+        return False
+
+    verify._stop_worker()
+    monkeypatch.setattr(verify, "_start_worker", failing_start)
+    assert verify.typed_accepts_option("2", "3") is None
+    assert verify.typed_accepts_option("2", "3") is None
+    assert len(starts) == 1
+    # Corregir una respuesta de verdad no espera: vuelve a probar.
+    with pytest.raises(verify.GradingUnavailable):
+        verify.grade_typed("2", "2")
+    assert len(starts) == 2
+    # Pasada la espera se prueba de nuevo.
+    monkeypatch.setattr(verify, "_unavailable_until", 0.0)
+    assert verify.typed_accepts_option("2", "3") is None
+    assert len(starts) == 3

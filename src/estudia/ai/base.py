@@ -25,6 +25,11 @@ class AIVideoUnavailableError(AIFormatError):
     """Gemini no pudo abrir el video (400 al analizarlo): suele ser privado o no listado."""
 
 
+class AINeedsPublicLinkError(AIVideoUnavailableError):
+    """Gemini no acepta el enlace y la descarga está apagada: hace falta un video público
+    (o activar la descarga en Ajustes). No se gastó ningún pedido extra."""
+
+
 class AIUnavailableError(Exception):
     """Falla transitoria (5xx, 408, red, timeout): conviene reintentar más tarde."""
 
@@ -56,9 +61,11 @@ class VideoAnalysis(BaseModel):
 
 
 class AIProvider(Protocol):
-    # True si el proveedor no puede recibir el enlace de YouTube y tiene que subir el
-    # video. La tubería lo recuerda entre corridas (kv "youtube_url_input").
-    youtube_url_denied: bool
+    # Epoch hasta el que no se prueba el enlace de YouTube (Gemini lo rechazó con esta
+    # clave); 0 = se prueba. La tubería lo recuerda entre corridas (kv "youtube_url_input").
+    youtube_url_denied_until: float
+    # Si se puede bajar el video y subirlo cuando el enlace no alcanza (kv "allow_download").
+    allow_download: bool
     # Huella corta de la clave (nunca la clave): las marcas de cuota son por clave.
     key_id: str
     # Modelo agotado por el día -> epoch en que vuelve. La tubería lo carga y lo guarda
@@ -66,6 +73,8 @@ class AIProvider(Protocol):
     exhausted_until: dict[str, float]
     # Modelo que hizo el último análisis bien hecho: la pasada a ciegas no lo usa.
     last_analysis_model: str | None
+    # Segundos de video del último análisis, según Gemini; None si no se sabe.
+    last_video_seconds: float | None
 
     def analyze_video(self, youtube_id: str, title: str) -> VideoAnalysis: ...
 

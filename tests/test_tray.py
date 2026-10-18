@@ -105,3 +105,19 @@ def test_should_stop_stops_icon(fake_pystray):
     icon = FakeIcon.instances[0]
     assert icon.stopped
     assert icon.visible is True
+
+
+def test_icon_registered_only_once_visible(fake_pystray, monkeypatch):
+    seen = {}
+
+    class WatchingIcon(FakeIcon):
+        def run(self, setup=None):
+            seen["before"] = tray._icon
+            setup(self)
+            seen["after"] = tray._icon
+
+    monkeypatch.setattr(fake_pystray, "Icon", WatchingIcon)
+    tray.run_tray("http://127.0.0.1:1/", lambda: None)
+    icon = FakeIcon.instances[0]
+    assert seen == {"before": None, "after": icon}
+    assert tray._icon is None  # al salir se olvida

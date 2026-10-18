@@ -11,7 +11,8 @@ class FakeProvider:
     """Proveedor falso. `blind(stem, options)` responde cada pregunta de la pasada a
     ciegas; si lanza AIFormatError, esa pregunta queda sin respuesta (None)."""
 
-    youtube_url_denied = False
+    youtube_url_denied_until = 0.0
+    allow_download = False
     key_id = "fake"
 
     def __init__(
@@ -19,8 +20,16 @@ class FakeProvider:
         analyses: dict[str, VideoAnalysis],
         blind: Callable[[str, list[str]], int | None],
         analysis_model: str | None = "analizador",
+        video_seconds: float | None = None,
+        by_link: bool = True,
     ):
         self.analyses = analyses
+        self.video_seconds = video_seconds
+        self.by_link = by_link
+        self.last_video_seconds: float | None = None
+        self.last_link_sent = False
+        self.url_denied_videos: set[str] = set()
+        self.analyzed_refs: list[str] = []
         self.blind = blind
         self.analysis_model = analysis_model
         self.exhausted_until: dict[str, float] = {}
@@ -28,9 +37,13 @@ class FakeProvider:
         self.blind_batches: list[tuple[list[tuple[str, list[str]]], tuple[str, ...]]] = []
 
     def analyze_video(self, youtube_id: str, title: str) -> VideoAnalysis:
+        self.analyzed_refs.append(youtube_id)
+        self.last_link_sent = False
         if youtube_id not in self.analyses:
             raise AIFormatError(f"sin análisis simulado para {youtube_id}")
         self.last_analysis_model = self.analysis_model
+        self.last_video_seconds = self.video_seconds
+        self.last_link_sent = self.by_link
         return self.analyses[youtube_id]
 
     def answer_blind(self, stem: str, options: list[str]) -> int | None:
@@ -52,17 +65,22 @@ class DeniedYoutubeUrlClient:
 
     `blind`: texto de la respuesta a la pasada a ciegas (un JSON con "answers")."""
 
-    def __init__(self, analysis_text=None, blind='{"answers": [{"q": 1, "answer": 1}]}'):
-        self.analysis_text, self.blind = analysis_text, blind
+    def __init__(self, analysis_text=None, blind='{"answers": [{"q": 1, "answer": 1}]}', denied=None):
+        """`denied`: ids de YouTube que dan 403 (None = todos); los demás responden por el enlace."""
+        self.analysis_text, self.blind, self.denied_ids = analysis_text, blind, denied
         self.models = self
         self.files = self
         self.deleted = []
+        self.url_calls = 0
 
     def generate_content(self, model, contents, config):
         if isinstance(contents, str):
             return SimpleNamespace(text=self.blind)
         uri = contents.parts[0].file_data.file_uri
         if "youtube.com" in uri:
+            self.url_calls += 1
+            if self.denied_ids is not None and uri.rsplit("=", 1)[-1] not in self.denied_ids:
+                return SimpleNamespace(text=self.analysis_text)
             raise errors.ClientError(403, {"error": {
                 "code": 403, "status": "PERMISSION_DENIED",
                 "message": "The caller does not have permission"}})
@@ -77,3 +95,12 @@ class DeniedYoutubeUrlClient:
 
     def delete(self, name):
         self.deleted.append(name)
+
+
+def commit_answers(conn) -> None:
+    """Para tests que insertan respuestas con SQL crudo: refleja en `review_state` lo que entró
+    (como hacen `connect` y `record_answer`) y confirma. Las lecturas ya no sincronizan."""
+    from estudia.study.srs import sync_review_state
+
+    sync_review_state(conn)
+    conn.commit()

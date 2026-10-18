@@ -12,13 +12,16 @@ import sys
 import threading
 import time
 import webbrowser
+from functools import partial
 
 import uvicorn
 
 from estudia.config import data_dir
+from estudia.db import connect as db_connect
 from estudia.server.app import HOST, create_app, periodic_sync
 from estudia.launcher import acquire_lock, headless, opens_browser, running_instance
 from estudia.server.handler import ensure_installed, is_estudia
+from estudia.reminders import run_reminders
 from estudia.streams import redirect_missing_streams
 from estudia.tray import run_tray, shutdown, tray_available
 
@@ -100,6 +103,35 @@ def _report_busy() -> None:
     _fail(BUSY_TEXT)
 
 
+CHECK_WORKER_FLAG = "--check-worker"
+
+
+def _worker_works() -> bool:
+    """El worker de SymPy arranca (forkserver o spawn, también congelado) y corrige bien."""
+    from estudia.generation.verify import check_math_tristate, grade_typed
+
+    try:
+        return (check_math_tristate("sqrt(2)", "√2") is True
+                and grade_typed("sqrt(2)", "1.41") is True
+                and grade_typed("sqrt(2)", "1.4") is False)
+    except Exception:
+        return False
+
+
+def check_worker() -> int:
+    """`Estudia.exe --check-worker`: 0 si el worker de SymPy anda, 1 si no (lo usa la prueba de CI)."""
+    ok = _worker_works()
+    print("worker de SymPy: " + ("bien" if ok else "no anda"))
+    return 0 if ok else 1
+
+
+def warn_if_worker_broken() -> None:
+    """Al arrancar: un solo aviso en el log si el worker de SymPy no anda (sin detalles)."""
+    if not _worker_works():
+        log.warning("No arrancó el verificador de matemática (SymPy): las respuestas escritas "
+                    "y la verificación de preguntas nuevas no van a andar.")
+
+
 def main() -> None:
     # El login vuelve por `estudia://` o `moodlemobile://`: en Linux se registra solo.
     ensure_installed()
@@ -120,7 +152,9 @@ def main() -> None:
             _report_busy()
     port = free_port()
     port_file.write_text(str(port), "utf-8")
-    app = create_app(port=port)
+    # Una sola base para el servidor y los recordatorios.
+    db_path = data_dir() / "estudia.db"
+    app = create_app(db_path=db_path, port=port)
     server = uvicorn.Server(uvicorn_config(app, port))
 
     # uvicorn vuelve a lanzar SIGTERM al terminar; sin esto el proceso muere
@@ -128,6 +162,9 @@ def main() -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     stop = threading.Event()
     threading.Thread(target=periodic_sync, args=(app.state.jobs, stop), daemon=True).start()
+    threading.Thread(target=warn_if_worker_broken, name="worker-check", daemon=True).start()
+    if not headless():
+        threading.Thread(target=run_reminders, args=(stop, partial(db_connect, db_path)), daemon=True).start()
     page_url = f"http://{HOST}:{port}/"
     use_tray = not headless()
     if use_tray and not tray_available():
@@ -188,4 +225,6 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     # Estudia.exe no tiene consola: lo que se imprima (uvicorn, errores) va al log.
     redirect_missing_streams(data_dir() / "estudia.log")
+    if CHECK_WORKER_FLAG in sys.argv[1:]:
+        sys.exit(check_worker())
     main()

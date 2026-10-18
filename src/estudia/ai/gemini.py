@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from estudia.ai.base import (
     AIAuthError,
     AIFormatError,
+    AINeedsPublicLinkError,
     AIQuotaError,
     AIUnavailableError,
     AIVideoUnavailableError,
@@ -23,12 +24,15 @@ from estudia.ai.base import (
     option_key,
 )
 from estudia.ai.blind import BlindItems, blind_config, blind_prompt, parse_blind
+from estudia.ai.gate import age_is_adult
 from estudia.ai.rotation import (
     DAILY,
+    DENIED,
     QUOTA,
     TRANSIENT,
     UNREADABLE,
     UNSUPPORTED,
+    LinkDenied,
     ModelRotation,
     NextModel,
     is_daily_quota,
@@ -40,9 +44,16 @@ from estudia.ai.rotation import (
     mentions_url,
     retry_delay,
 )
-from estudia.config import ANALYZE_MODELS, BLIND_MODELS, GEMINI_TIMEOUT_S, data_dir
+from estudia.config import (
+    ANALYZE_MODELS,
+    BLIND_MODELS,
+    GEMINI_TIMEOUT_S,
+    YOUTUBE_URL_DENIED_S,
+    data_dir,
+)
 from estudia.generation.prompts import ANALYSIS_PROMPT
-from estudia.material.video import VideoDownloadError, download_video, mime_type
+from estudia.material import video as video_module
+from estudia.material.video import VideoDownloadError, mime_type
 
 # Un 429 con espera corta es el límite por minuto del plan gratuito: se espera y se reintenta.
 MAX_RETRY_WAIT_S = 60.0
@@ -54,6 +65,15 @@ TRANSIENT_RETRIES = 1
 # Un video subido tarda en quedar listo (ACTIVE); se consulta cada tanto hasta este tope.
 FILE_ACTIVE_TIMEOUT_S = 300.0
 FILE_POLL_S = 5.0
+
+# Tokens por segundo de video con MEDIA_RESOLUTION_LOW: el audio va a 32 por segundo y
+# cada fotograma (uno por segundo) a 66. Sirven para saber cuánto video se mandó.
+AUDIO_TOKENS_PER_S = 32
+LOW_RES_FRAME_TOKENS = 66
+
+# La clave entera se da por rechazada para enlaces recién con 403 en esta cantidad de
+# videos distintos: un solo video privado no frena a los demás.
+DENIED_VIDEOS_FOR_KEY = 2
 
 # De dónde sale el video en un pedido de análisis.
 YOUTUBE_URL, UPLOADED_FILE = "youtube_url", "uploaded_file"
@@ -114,6 +134,28 @@ def _analysis_config() -> types.GenerateContentConfig:
     )
 
 
+def _video_seconds(response) -> float | None:
+    """Duración del video según el uso que informa Gemini; None si no lo informa."""
+    usage = getattr(response, "usage_metadata", None)
+    tokens: dict[str, int] = {}
+    for item in getattr(usage, "prompt_tokens_details", None) or []:
+        modality = getattr(item, "modality", None)
+        name = str(getattr(modality, "value", modality))
+        count = getattr(item, "token_count", None)
+        if isinstance(count, int) and count > 0:
+            tokens[name] = tokens.get(name, 0) + count
+    if "AUDIO" in tokens:
+        return tokens["AUDIO"] / AUDIO_TOKENS_PER_S
+    if "VIDEO" in tokens:
+        return tokens["VIDEO"] / LOW_RES_FRAME_TOKENS
+    return None
+
+
+def _download_video(youtube_id: str, dest_dir: Path) -> Path:
+    """yt-dlp, buscado recién al usarlo (con la descarga apagada nunca se llega acá)."""
+    return video_module.download_video(youtube_id, dest_dir)
+
+
 def _state(file) -> str:
     state = getattr(file, "state", None)
     return str(getattr(state, "value", state))
@@ -124,19 +166,31 @@ class GeminiProvider:
                  blind_models: list[str] | None = None, client=None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.time,
-                 download: Callable[[str, Path], Path] = download_video,
-                 video_dir: Path | None = None, youtube_url_denied: bool = False):
+                 download: Callable[[str, Path], Path] = _download_video,
+                 video_dir: Path | None = None, youtube_url_denied: bool = False,
+                 allow_download: bool = False):
         self._analyze_models = list(analyze_models or ANALYZE_MODELS)
         self._blind_models = list(blind_models or BLIND_MODELS)
         self._sleep = sleep
+        self._clock = clock
         self._download = download
         self._video_dir = video_dir
         # Huella corta de la clave (nunca la clave): separa el cache de modelos y las
         # marcas de cuota de cada clave (la cuota es por proyecto).
         self.key_id = hashlib.sha256(api_key.encode()).hexdigest()[:12]
-        # Algunas claves no pueden pasarle a Gemini un enlace de YouTube (403): entonces
-        # se baja el video y se sube. Se recuerda para no gastar un pedido por video.
+        # Algunas claves no pueden pasarle a Gemini un enlace de YouTube (403 en toda la
+        # cadena). Se recuerda 7 días (epoch hasta cuándo) para no gastar un pedido por video.
+        self.youtube_url_denied_until = 0.0
         self.youtube_url_denied = youtube_url_denied
+        # Bajar el video y subirlo cuando el enlace no alcanza: solo si el estudiante lo
+        # activó en Ajustes (la tubería lo carga de kv "allow_download").
+        self.allow_download = allow_download
+        # Videos cuyo enlace rechazó toda la cadena (la tubería los recuerda en el día).
+        self.url_denied_videos: set[str] = set()
+        self.last_video_seconds: float | None = None
+        # True si Gemini leyó el video por el enlace en el último análisis (cuenta para
+        # el tope diario de YouTube), aunque la respuesta no haya servido.
+        self.last_link_sent = False
         self._rotation = ModelRotation(clock)
         self.last_analysis_model: str | None = None
         self.last_blind_model: str | None = None
@@ -146,6 +200,14 @@ class GeminiProvider:
                 http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_S * 1000),
             )
         self._client = client
+
+    @property
+    def youtube_url_denied(self) -> bool:
+        return self.youtube_url_denied_until > self._clock()
+
+    @youtube_url_denied.setter
+    def youtube_url_denied(self, denied: bool) -> None:
+        self.youtube_url_denied_until = self._clock() + YOUTUBE_URL_DENIED_S if denied else 0.0
 
     # --- Cadena de modelos -------------------------------------------------------
 
@@ -203,6 +265,10 @@ class GeminiProvider:
                     raise NextModel(TRANSIENT) from None
                 if is_unsupported(e, youtube_url=video == YOUTUBE_URL):
                     raise NextModel(UNSUPPORTED) from None
+                if video == YOUTUBE_URL and is_permission_denied(e):
+                    # Otro modelo puede aceptar el enlace: se prueba antes de darlo por rechazado.
+                    log.info("Gemini: %s no aceptó el enlace de YouTube; se prueba otro", model)
+                    raise NextModel(DENIED) from None
                 self._raise_mapped(e, video)
             except httpx.TransportError:
                 raise AIUnavailableError("no se pudo conectar con Gemini") from None
@@ -215,8 +281,6 @@ class GeminiProvider:
         la clave se juzga solo con pedidos de texto.
         """
         code = e.code
-        if video == YOUTUBE_URL and is_permission_denied(e):
-            raise _YoutubeUrlRejected(remember=True) from None
         if code == 401 or (code == 400 and is_invalid_key(e)) or (code == 403 and video is None):
             raise AIAuthError(f"Gemini rechazó la clave (código {code})") from None
         if code == 408 or (isinstance(code, int) and code >= 500):
@@ -228,8 +292,11 @@ class GeminiProvider:
         raise AIFormatError(f"pedido inválido a Gemini (código {code})") from None
 
     def analyze_video(self, youtube_id: str, title: str) -> VideoAnalysis:
-        """Primero con el enlace de YouTube; si Gemini no lo acepta, baja el video y lo sube."""
+        """Primero con el enlace de YouTube. Si Gemini no lo acepta: con la descarga
+        activada baja el video y lo sube; si no, AINeedsPublicLinkError (sin otro pedido)."""
         self.last_analysis_model = None
+        self.last_video_seconds = None
+        self.last_link_sent = False
         prompt = types.Part(text=ANALYSIS_PROMPT.format(title=title))
         if not self.youtube_url_denied:
             url = f"https://www.youtube.com/watch?v={youtube_id}"
@@ -237,8 +304,17 @@ class GeminiProvider:
                 return self._analyze(types.FileData(file_uri=url), prompt, YOUTUBE_URL)
             except _YoutubeUrlRejected as e:
                 if e.remember:
-                    self.youtube_url_denied = True
+                    self._remember_denied(youtube_id)
+        if not self.allow_download:
+            raise AINeedsPublicLinkError("Gemini no acepta el enlace y la descarga está apagada")
         return self._analyze_uploaded(youtube_id, prompt)
+
+    def _remember_denied(self, youtube_id: str) -> None:
+        """Un 403 en toda la cadena puede ser un video privado: la clave queda marcada
+        recién cuando le pasa a DENIED_VIDEOS_FOR_KEY videos distintos."""
+        self.url_denied_videos.add(youtube_id)
+        if len(self.url_denied_videos) >= DENIED_VIDEOS_FOR_KEY:
+            self.youtube_url_denied = True
 
     def _analyze(self, file_data: types.FileData, prompt: types.Part, video: str) -> VideoAnalysis:
         """Rota por la cadena de análisis; el mismo video (enlace o subido) sirve para todos."""
@@ -246,15 +322,21 @@ class GeminiProvider:
 
         def attempt(model: str) -> VideoAnalysis:
             response = self._generate(model, contents, _analysis_config(), video=video)
+            if video == YOUTUBE_URL:
+                self.last_link_sent = True
             try:
                 analysis = VideoAnalysis.model_validate_json(response.text or "")
             except ValidationError:
                 raise AIFormatError("la respuesta no es un análisis válido") from None
             analysis = _validate(analysis)
             self.last_analysis_model = model
+            self.last_video_seconds = _video_seconds(response)
             return analysis
 
-        return self._rotate(self._analyze_models, attempt)
+        try:
+            return self._rotate(self._analyze_models, attempt)
+        except LinkDenied:
+            raise _YoutubeUrlRejected(remember=True) from None
 
     def _analyze_uploaded(self, youtube_id: str, prompt: types.Part) -> VideoAnalysis:
         """Baja el video, lo sube a Gemini, lo analiza y borra la copia remota siempre."""
@@ -369,6 +451,10 @@ def main(argv: list[str]) -> int:
     if not key:
         print("falta la variable de entorno ESTUDIA_GEMINI_KEY", file=sys.stderr)
         return 2
+    # Mismo bloqueo que la app: sin respuesta de edad adulta en la base real, no se envía nada.
+    if not age_is_adult():
+        print("la IA no está habilitada (falta la respuesta de edad o es menor)", file=sys.stderr)
+        return 3
     analysis = GeminiProvider(key).analyze_video(argv[1], argv[1])
     print(analysis.summary_md)
     print(f"\nTemas: {', '.join(analysis.topics)}")

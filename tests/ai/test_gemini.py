@@ -8,6 +8,7 @@ from google.genai import errors, types
 
 from estudia.ai.base import (
     AIAuthError,
+    AINeedsPublicLinkError,
     AIFormatError,
     AIQuotaError,
     AIUnavailableError,
@@ -98,14 +99,16 @@ class FakeClient:
 
 def _provider(text=None, error=None, outcomes=None, sleeps=None, files=None, download=None,
               video_dir=None, analyze_models=("m",), blind_models=("b",), listed=None,
-              list_error=None, **kwargs):
+              list_error=None, allow_download=True, **kwargs):
+    """Por defecto con la descarga encendida: casi todos los tests de la ruta local la usan."""
     listed = listed if listed is not None else (*analyze_models, *blind_models)
     client = FakeClient(text=text, error=error, outcomes=outcomes, files=files, listed=listed,
                         list_error=list_error)
     sleep = sleeps.append if sleeps is not None else _no_sleep
     provider = GeminiProvider("clave-falsa", analyze_models=list(analyze_models),
                               blind_models=list(blind_models), client=client, sleep=sleep,
-                              download=download or _no_download, video_dir=video_dir, **kwargs)
+                              download=download or _no_download, video_dir=video_dir,
+                              allow_download=allow_download, **kwargs)
     return provider, client
 
 
@@ -591,17 +594,40 @@ def test_403_on_youtube_url_falls_back_to_upload(tmp_path):
     assert files.deleted == ["files/abc"]
     assert sleeps and all(s > 0 for s in sleeps)  # esperó a que quede ACTIVE
     assert not (tmp_path / "aaaaaaaaaa1.mp4").exists()  # se borra al terminar bien
-    assert p.youtube_url_denied is True
+    # Un solo video rechazado puede ser privado: la clave no queda marcada.
+    assert p.youtube_url_denied is False
+    assert p.url_denied_videos == {"aaaaaaaaaa1"}
 
 
-def test_after_a_denial_the_next_video_skips_the_url(tmp_path):
+def test_403_on_two_distinct_videos_marks_the_key_and_the_next_skips_the_url(tmp_path):
     files = FakeFiles(polls=0)
-    p, client = _provider(outcomes=[_denied(), json.dumps(_analysis()), json.dumps(_analysis())],
+    ok = json.dumps(_analysis())
+    p, client = _provider(outcomes=[_denied(), ok, _denied(), ok, ok],
                           files=files, download=FakeDownloader(), video_dir=tmp_path)
     p.analyze_video("aaaaaaaaaaa", "Clase 1")
+    assert p.youtube_url_denied is False
     p.analyze_video("bbbbbbbbbbb", "Clase 2")
-    assert len(client.calls) == 3
-    assert _file_uris(client.calls[2]) == ["https://gemini/files/abc"]
+    assert p.youtube_url_denied is True
+    p.analyze_video("ccccccccccc", "Clase 3")
+    assert len(client.calls) == 5
+    assert _file_uris(client.calls[4]) == ["https://gemini/files/abc"]
+
+
+def test_the_same_video_rejected_twice_does_not_mark_the_key(tmp_path):
+    p, _ = _provider(outcomes=[_denied(), _denied()], allow_download=False)
+    for _ in range(2):
+        with pytest.raises(AINeedsPublicLinkError):
+            p.analyze_video("aaaaaaaaaaa", "Clase 1")
+    assert p.youtube_url_denied is False
+
+
+def test_one_private_video_does_not_condemn_the_next(tmp_path):
+    """Con la descarga apagada, un 403 deja solo ese video pidiendo enlace público."""
+    p, client = _provider(outcomes=[_denied(), json.dumps(_analysis())], allow_download=False)
+    with pytest.raises(AINeedsPublicLinkError):
+        p.analyze_video("aaaaaaaaaaa", "Clase 1")
+    assert p.analyze_video("bbbbbbbbbbb", "Clase 2").topics == ["Funciones"]
+    assert _file_uris(client.calls[1]) == ["https://www.youtube.com/watch?v=bbbbbbbbbbb"]
 
 
 def test_remembered_denial_goes_straight_to_upload(tmp_path):
@@ -776,3 +802,176 @@ def test_daily_429_after_upload_reuses_the_file_for_the_next_model(tmp_path):
     p.analyze_video("aaaaaaaaaa1", "Clase 1")
     assert len(files.uploaded) == 1
     assert files.deleted == ["files/abc"]
+
+
+# --- D2: YouTube por enlace por defecto; la descarga es opcional -------------------
+
+def test_download_off_by_default_never_calls_ytdlp(tmp_path):
+    """Sin activar la descarga, un enlace rechazado no baja nada: pide un enlace público."""
+    download = FakeDownloader()
+    client = FakeClient(outcomes=[_denied()], listed=("m", "b"))
+    p = GeminiProvider("clave-falsa", analyze_models=["m"], blind_models=["b"], client=client,
+                       sleep=_no_sleep, download=download, video_dir=tmp_path)
+    assert p.allow_download is False
+    with pytest.raises(AINeedsPublicLinkError) as exc:
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert isinstance(exc.value, AIVideoUnavailableError)
+    assert download.calls == []
+    assert client.files.uploaded == []
+    assert p.youtube_url_denied is False  # un video no condena a la clave
+
+
+def test_download_off_never_imports_or_calls_the_real_ytdlp(tmp_path, monkeypatch):
+    """Con el descargador real por defecto: yt-dlp no se toca si la descarga está apagada."""
+    import estudia.material.video as video
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no debería llamar a yt-dlp")
+
+    monkeypatch.setattr(video, "download_video", boom)
+    client = FakeClient(outcomes=[_denied()], listed=("m", "b"))
+    p = GeminiProvider("clave-falsa", analyze_models=["m"], blind_models=["b"], client=client,
+                       sleep=_no_sleep, video_dir=tmp_path)
+    with pytest.raises(AINeedsPublicLinkError):
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+
+
+def test_denied_url_with_download_off_spends_no_request(tmp_path):
+    """Con el enlace ya rechazado y la descarga apagada no se gasta ningún pedido."""
+    p, client = _provider(outcomes=[], allow_download=False, youtube_url_denied=True,
+                          download=FakeDownloader(), video_dir=tmp_path)
+    with pytest.raises(AINeedsPublicLinkError):
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert client.calls == []
+
+
+def test_400_about_the_url_with_download_off_needs_a_public_link(tmp_path):
+    error = errors.ClientError(400, {"error": {"code": 400, "status": "INVALID_ARGUMENT",
+                                               "message": "Unsupported YouTube URL for this request."}})
+    download = FakeDownloader()
+    p, _ = _provider(outcomes=[error], allow_download=False, download=download, video_dir=tmp_path)
+    with pytest.raises(AINeedsPublicLinkError):
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert download.calls == []
+    assert p.youtube_url_denied is False
+
+
+def test_403_retries_next_model_before_denied(tmp_path):
+    """Un 403 con el enlace prueba el siguiente modelo de la cadena antes de darlo por rechazado."""
+    download = FakeDownloader()
+    p, client = _provider(outcomes=[_denied(), json.dumps(_analysis())], analyze_models=("m", "n"),
+                          download=download, video_dir=tmp_path)
+    assert p.analyze_video("aaaaaaaaaa1", "Clase 1").topics == ["Funciones"]
+    assert [c.model for c in client.calls] == ["m", "n"]
+    assert all(_file_uris(c) == ["https://www.youtube.com/watch?v=aaaaaaaaaa1"] for c in client.calls)
+    assert p.youtube_url_denied is False
+    assert download.calls == []
+    assert p.last_analysis_model == "n"
+    assert p.exhausted_until == {}  # un 403 no es cuota
+
+
+def test_403_on_every_model_falls_back_to_download(tmp_path):
+    download = FakeDownloader()
+    p, client = _provider(outcomes=[_denied(), _denied(), json.dumps(_analysis())],
+                          analyze_models=("m", "n"), files=FakeFiles(polls=0),
+                          download=download, video_dir=tmp_path)
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert [_file_uris(c) for c in client.calls] == [
+        ["https://www.youtube.com/watch?v=aaaaaaaaaa1"]] * 2 + [["https://gemini/files/abc"]]
+    assert p.url_denied_videos == {"aaaaaaaaaa1"}
+    assert len(download.calls) == 1
+
+
+def test_403_and_quota_on_the_rest_is_quota_not_denied():
+    """Si el resto de la cadena está sin cuota, todavía no se sabe: el material queda pendiente."""
+    p, _ = _provider(outcomes=[_denied(), _daily_limit()], analyze_models=("m", "n"))
+    with pytest.raises(AIQuotaError):
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert p.youtube_url_denied is False
+
+
+def test_denied_expires_after_7_days(tmp_path):
+    now = {"t": 1_000_000.0}
+    ok = json.dumps(_analysis())
+    p, client = _provider(outcomes=[_denied(), ok, _denied(), ok, ok, ok],
+                          files=FakeFiles(polls=0), download=FakeDownloader(), video_dir=tmp_path,
+                          clock=lambda: now["t"])
+    p.analyze_video("aaaaaaaaaaa", "Clase 1")
+    p.analyze_video("ddddddddddd", "Clase 0")
+    assert p.youtube_url_denied is True
+    assert p.youtube_url_denied_until == 1_000_000.0 + 7 * 86400
+    now["t"] += 7 * 86400 - 1
+    p.analyze_video("bbbbbbbbbbb", "Clase 2")
+    assert _file_uris(client.calls[-1]) == ["https://gemini/files/abc"]  # sigue sin probar el enlace
+    now["t"] += 2
+    assert p.youtube_url_denied is False
+    p.analyze_video("ccccccccccc", "Clase 3")
+    assert _file_uris(client.calls[-1]) == ["https://www.youtube.com/watch?v=ccccccccccc"]
+
+
+def test_denial_set_through_the_flag_lasts_7_days_from_now():
+    now = {"t": 5000.0}
+    p, _ = _provider(text=json.dumps(_analysis()), clock=lambda: now["t"])
+    p.youtube_url_denied = True
+    assert p.youtube_url_denied_until == 5000.0 + 7 * 86400
+    p.youtube_url_denied = False
+    assert p.youtube_url_denied_until == 0.0
+
+
+def _usage(text, audio_tokens=None, video_tokens=None):
+    details = []
+    if audio_tokens is not None:
+        details.append(types.ModalityTokenCount(modality=types.MediaModality.AUDIO, token_count=audio_tokens))
+    if video_tokens is not None:
+        details.append(types.ModalityTokenCount(modality=types.MediaModality.VIDEO, token_count=video_tokens))
+    return SimpleNamespace(text=text, usage_metadata=SimpleNamespace(prompt_tokens_details=details))
+
+
+class UsageClient(FakeClient):
+    def __init__(self, response):
+        super().__init__(listed=("m", "b"))
+        self._response = response
+
+    def generate_content(self, model, contents, config):
+        self.calls.append(SimpleNamespace(model=model, contents=contents, config=config))
+        return self._response
+
+
+@pytest.mark.parametrize("audio, video, expected", [
+    (32 * 5400, 66 * 5400, 5400.0),   # el audio va a 32 tokens por segundo
+    (None, 66 * 3000, 3000.0),        # sin audio: 66 tokens por fotograma, uno por segundo
+    (None, None, None),               # sin datos de uso: no se sabe
+])
+def test_video_seconds_come_from_the_usage_metadata(audio, video, expected):
+    client = UsageClient(_usage(json.dumps(_analysis()), audio, video))
+    p = GeminiProvider("clave-falsa", analyze_models=["m"], blind_models=["b"], client=client,
+                       sleep=_no_sleep, download=_no_download)
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert p.last_video_seconds == expected
+
+
+def test_link_sent_only_when_gemini_read_the_video_by_link(tmp_path):
+    p, _ = _provider(text=json.dumps(_analysis()))
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert p.last_link_sent is True
+
+
+def test_link_sent_even_when_the_answer_is_unusable():
+    p, _ = _provider(text="esto no es json")
+    with pytest.raises(AIFormatError):
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert p.last_link_sent is True
+
+
+def test_uploaded_video_is_not_a_link_send(tmp_path):
+    p, _ = _provider(outcomes=[_denied(), json.dumps(_analysis())], files=FakeFiles(polls=0),
+                     download=FakeDownloader(), video_dir=tmp_path)
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert p.last_link_sent is False
+
+
+def test_rejected_link_is_not_a_link_send():
+    p, _ = _provider(outcomes=[_denied()], allow_download=False)
+    with pytest.raises(AINeedsPublicLinkError):
+        p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert p.last_link_sent is False

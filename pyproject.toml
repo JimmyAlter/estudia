@@ -1,6 +1,6 @@
 [project]
 name = "estudia"
-version = "0.1.1"
+version = "0.2.0"
 description = "Herramienta local de estudio para estudiantes universitarios"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,13 +17,19 @@ dependencies = [
     "yt-dlp[default,deno]>=2026.8.19",
     "pystray>=0.19.5",
     "pillow>=13.0.0",
+    "genanki>=0.13.1",
+    "fsrs>=6.3.2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "respx"]
 
 [dependency-groups]
-dev = ["pytest", "respx"]
+dev = [
+    "icalendar>=7.3.0",
+    "pytest",
+    "respx",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -38,4 +44,5 @@ filterwarnings = [
     # Avisos de dependencias, ajenos al código de Estudia.
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
     "ignore:'_UnionGenericAlias' is deprecated:DeprecationWarning:google.genai",
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:cached_property",
 ]

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ApiError, api, type AppState, type Site } from "../api";
 import { Button, Label } from "../ui";
+import { AgeStep } from "./Age";
 
 const AI_STUDIO_URL = "https://aistudio.google.com/apikey";
 const POLL_MS = 2000;
@@ -11,7 +12,7 @@ interface Props {
   onChange: () => void;
 }
 
-const STEP_NUMBER = { facultad: 1, login: 2, ia: 3, listo: 3 } as const;
+const STEP_NUMBER = { facultad: 1, login: 2, edad: 3, ia: 3, listo: 3 } as const;
 
 export default function Onboarding({ state, onChange }: Props) {
   return (
@@ -20,6 +21,7 @@ export default function Onboarding({ state, onChange }: Props) {
       <Label className="mb-3">Paso {STEP_NUMBER[state.step]} de 3</Label>
       {state.step === "facultad" && <ChooseSite onDone={onChange} />}
       {state.step === "login" && <CampusLogin onDone={onChange} />}
+      {state.step === "edad" && <AgeStep onDone={onChange} heading={<Heading>¿Tenés 18 años o más?</Heading>} />}
       {(state.step === "ia" || state.step === "listo") && (
         <ConnectAI rejected={state.ai_stop_reason === "auth"} onDone={onChange} />
       )}
@@ -310,10 +312,11 @@ function ConnectAI({ rejected, onDone }: { rejected: boolean; onDone: () => void
           {fieldError}
         </p>
       )}
-      <p className="mb-6 text-sm text-muted">
-        En el plan gratuito, Google puede usar lo que le envíes para mejorar sus productos.{" "}
-        Google pide tener 18 años o más para usar Gemini.
-      </p>
+      <div className="mb-6 text-sm text-muted">
+        <Label className="mb-1">Qué ve Google</Label>
+        <p>Google recibe el video de cada clase y las preguntas que Estudia arma. No recibe tus respuestas ni tus datos personales.</p>
+        <p>En el plan gratuito, personas de Google pueden leer lo que se envía y usarlo para mejorar sus productos.</p>
+      </div>
       <Button type="submit" disabled={busy}>
         {busy ? "Verificando…" : "Guardar clave"}
       </Button>

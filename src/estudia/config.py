@@ -22,6 +22,17 @@ LEGACY_ANALYSIS_MODEL = "gemini-2.5-flash"
 BLIND_MODELS = ["gemini-3.5-flash-lite", "gemma-4-31b-it", "gemini-2.5-flash-lite",
                 "gemini-3.1-flash-lite"]
 
+# Si Gemini no acepta enlaces de YouTube con una clave (403 en toda la cadena), no se
+# vuelve a probar el enlace durante 7 días; después se prueba de nuevo.
+YOUTUBE_URL_DENIED_S = 7 * 86400
+# Tope de video de YouTube que se manda a Gemini por día local (el plan gratuito
+# admite 8 h de YouTube por día). El día es el de la cuota de Gemini (Pacífico).
+DAILY_VIDEO_CAP_S = 8 * 3600
+# Duración que se supone para un video antes de mandarlo: el campus da solo el id de
+# YouTube y averiguar la duración real pediría a YouTube (o a yt-dlp). Después del
+# análisis se cuenta la duración que informa Gemini.
+VIDEO_ESTIMATE_S = 3600
+
 # Tope de espera por pedido a Gemini (el video tarda).
 GEMINI_TIMEOUT_S = 300
 

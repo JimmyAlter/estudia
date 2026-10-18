@@ -11,6 +11,20 @@ OPEN_LABEL = "Abrir Estudia"
 QUIT_LABEL = "Salir"
 CHILD_JOIN_S = 5
 
+_icon = None  # el ícono mientras la bandeja está corriendo
+
+
+def notify(title: str, text: str) -> bool:
+    """Muestra un aviso desde el ícono. False si no hay ícono o falla; nunca levanta."""
+    icon = _icon
+    if icon is None:
+        return False
+    try:
+        icon.notify(text, title)  # pystray: notify(message, title)
+        return True
+    except Exception:
+        return False
+
 
 def tray_available() -> bool:
     """False si pystray no se puede importar (por ejemplo, Linux sin pantalla)."""
@@ -54,14 +68,22 @@ def run_tray(
         pystray.MenuItem(QUIT_LABEL, quit_app),
     )
     def watch(icon) -> None:
+        global _icon
         icon.visible = True
+        # Recién con el ícono visible los avisos pueden salir por él.
+        _icon = icon
         while should_stop is not None and not done.wait(0.5):
             if should_stop():
                 icon.stop()
                 return
 
-    pystray.Icon("Estudia", image, "Estudia", menu).run(watch)
-    done.set()
+    global _icon
+    icon = pystray.Icon("Estudia", image, "Estudia", menu)
+    try:
+        icon.run(watch)
+    finally:
+        _icon = None
+        done.set()
 
 
 def shutdown(server: uvicorn.Server) -> None:

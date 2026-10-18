@@ -45,9 +45,11 @@ def normalize_existing(conn: sqlite3.Connection) -> NormalizeResult:
         if new == old:
             continue
         try:
+            # Con otras opciones el chequeo de escritas (`typed_safe`) se vuelve a hacer.
             conn.execute(
                 "UPDATE question SET stem=?, options_json=?, explanation=?, common_error=?,"
-                " dedupe_key=? WHERE id=?", (*new, row["id"]),
+                " dedupe_key=?, typed_safe=CASE WHEN ? THEN typed_safe END"
+                " WHERE id=?", (*new, options_json == row["options_json"], row["id"]),
             )
         except sqlite3.IntegrityError:
             log.warning("Pregunta %s sin cambios: el enunciado quedaría repetido", row["id"])

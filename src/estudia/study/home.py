@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from estudia.study.mastery import topic_mastery
+from estudia.study.mastery import exam_horizon, topic_probability
 
 TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 
@@ -26,6 +26,9 @@ class TopicRow:
     name: str
     mastery: float
     practiced: bool
+    seen: int = 0               # preguntas (verificadas, no retiradas) ya vistas
+    total: int = 0              # preguntas verificadas y no retiradas del tema
+    at: int | None = None       # fecha del examen al que se refiere `mastery`; None: hoy
 
 
 @dataclass
@@ -91,10 +94,21 @@ def home_view(conn: sqlite3.Connection, now: int) -> HomeView:
         params = (course_id,)
     sql += "GROUP BY t.id ORDER BY num, t.name"
     rows = conn.execute(sql, params).fetchall()
-    topics = [
-        TopicRow(r["id"], r["name"], topic_mastery(conn, r["id"], now), bool(r["practiced"]))
-        for r in rows
-    ]
+    question_counts = {
+        r["topic_id"]: (r["seen"], r["total"])
+        for r in conn.execute(
+            "SELECT q.topic_id, COUNT(*) AS total, COUNT(rs.card_key) AS seen FROM question q "
+            "LEFT JOIN review_state rs ON rs.card_key = 'q:' || q.id "
+            "WHERE q.verified = 1 AND q.retired = 0 GROUP BY q.topic_id"
+        )
+    }
+    # Dominio = probabilidad de saber el tema el día de su examen más próximo (o hoy, si no tiene).
+    topics = []
+    for r in rows:
+        horizon = exam_horizon(conn, r["id"], now)
+        seen, total = question_counts.get(r["id"], (0, 0))
+        topics.append(TopicRow(r["id"], r["name"], topic_probability(conn, r["id"], horizon),
+                               bool(r["practiced"]), seen, total, horizon if horizon != now else None))
     # `topics` ya viene ordenado por sección y nombre: min() es estable ante empates.
     suggestion = min(topics, key=lambda t: t.mastery, default=None)
 
@@ -108,6 +122,7 @@ def home_view(conn: sqlite3.Connection, now: int) -> HomeView:
     processing = ProcessingState(
         pending=counts.get("pending", 0),
         done=counts.get("done", 0),
-        failed=counts.get("failed", 0),
+        # Un video que pide un enlace público tampoco se pudo preparar.
+        failed=counts.get("failed", 0) + counts.get("needs_public_link", 0),
     )
     return HomeView(exam, topics, suggestion, processing)

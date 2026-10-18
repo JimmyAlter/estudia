@@ -213,6 +213,15 @@ jobs:
           $portFile = Join-Path $env:LOCALAPPDATA 'estudia\estudia\port'
           Remove-Item $portFile -ErrorAction SilentlyContinue
           $exe = Join-Path $env:ESTUDIA_APP 'Estudia.exe'
+          Write-Host "Verificador de SymPy congelado: $exe --check-worker"
+          $check = Start-Process -FilePath $exe -ArgumentList '--check-worker' -PassThru
+          $null = $check.Handle  # sin esto, ExitCode queda vacío
+          if (-not $check.WaitForExit(120000)) {
+            $check.Kill()
+            throw "Estudia.exe --check-worker no terminó en 120 s"
+          }
+          if ($check.ExitCode -ne 0) { throw "El worker de SymPy no anda en el .exe (código $($check.ExitCode))" }
+          Write-Host "Worker de SymPy: bien"
           Write-Host "Abriendo $exe sin navegador ni bandeja"
           $proc = Start-Process -FilePath $exe -PassThru
           $deadline = (Get-Date).AddSeconds(60)
@@ -256,6 +265,15 @@ jobs:
           Remove-Item $portFile -ErrorAction SilentlyContinue
           $logStart = if (Test-Path $logFile) { (Get-Item $logFile).Length } else { 0 }
           $exe = Join-Path $env:ESTUDIA_APP 'Estudia.exe'
+          Write-Host "Verificador de SymPy congelado: $exe --check-worker"
+          $check = Start-Process -FilePath $exe -ArgumentList '--check-worker' -PassThru
+          $null = $check.Handle  # sin esto, ExitCode queda vacío
+          if (-not $check.WaitForExit(120000)) {
+            $check.Kill()
+            throw "Estudia.exe --check-worker no terminó en 120 s"
+          }
+          if ($check.ExitCode -ne 0) { throw "El worker de SymPy no anda en el .exe (código $($check.ExitCode))" }
+          Write-Host "Worker de SymPy: bien"
           Write-Host "Abriendo $exe con bandeja y sin navegador"
           $proc = Start-Process -FilePath $exe -PassThru
           $deadline = (Get-Date).AddSeconds(60)
