@@ -1,4 +1,5 @@
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -16,9 +17,11 @@ from estudia.ai.gemini import GeminiProvider
 from estudia.db import connect
 from estudia.generation.pipeline import (
     GENERIC_ERROR_TEXT,
+    NEEDS_LINK_TEXT,
     VIDEO_ERROR_TEXT,
     process_material,
     process_pending,
+    retry_failed,
     slugify,
 )
 from estudia.material.video import VideoDownloadError
@@ -560,8 +563,10 @@ def test_unreadable_distractor_discards_the_question(conn, distractor):
 
 # --- Gemini no acepta el enlace de YouTube (403): nunca es una clave mala ------------
 
-def _gemini(tmp_path, client, download_error=None):
+def _gemini(tmp_path, client, download_error=None, calls=None):
     def download(youtube_id, dest_dir):
+        if calls is not None:
+            calls.append(youtube_id)
         if download_error:
             raise VideoDownloadError(download_error)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -579,20 +584,27 @@ def kv(conn, key):
     return row[0] if row else None
 
 
+def allow_download(conn):
+    conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('allow_download', '1')")
+    conn.commit()
+
+
 def test_video_403_with_failed_download_never_records_auth(conn, tmp_path):
     add_material(conn, 1, "aaaaaaaaaaa")
     add_material(conn, 2, "bbbbbbbbbbb")
+    allow_download(conn)
     provider = _gemini(tmp_path, DeniedYoutubeUrlClient(), download_error="privado")
     assert process_pending(conn, provider) == 0
     assert statuses(conn) == {1: "failed", 2: "failed"}
     rows = conn.execute("SELECT error, fail_kind FROM material").fetchall()
     assert {(r["error"], r["fail_kind"]) for r in rows} == {(VIDEO_ERROR_TEXT, "video")}
     assert kv(conn, "ai_stop_reason") is None
-    assert kv(conn, "youtube_url_input") == "denied"
+    assert float(kv(conn, "youtube_url_input")) > time.time() + 6 * 86400  # vence en 7 días
 
 
 def test_video_403_falls_back_to_upload_and_finishes(conn, tmp_path):
     add_material(conn, 1, "aaaaaaaaaaa")
+    allow_download(conn)
     a = analysis([q("¿Cuánto es 1+1?", correct=1)])
     client = DeniedYoutubeUrlClient(analysis_text=a.model_dump_json())
     assert process_pending(conn, _gemini(tmp_path, client)) == 1
@@ -604,17 +616,36 @@ def test_video_403_falls_back_to_upload_and_finishes(conn, tmp_path):
 
 def test_remembered_url_denial_is_passed_to_the_provider(conn):
     add_material(conn, 1, "aaaaaaaaaaa")
+    until = time.time() + 3 * 86400
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_url_input', ?)", (str(int(until)),))
+    conn.commit()
+    seen = []
+
+    class Recording(FakeProvider):
+        def analyze_video(self, youtube_id, title):
+            seen.append((self.youtube_url_denied_until, self.allow_download))
+            return super().analyze_video(youtube_id, title)
+
+    process_pending(conn, Recording({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1))
+    assert seen == [(int(until), False)]
+    assert kv(conn, "youtube_url_input") == str(int(until))  # la marca no se corre
+
+
+def test_legacy_permanent_denial_becomes_a_7_day_denial(conn):
+    add_material(conn, 1, "aaaaaaaaaaa")
     conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_url_input', 'denied')")
     conn.commit()
     seen = []
 
     class Recording(FakeProvider):
         def analyze_video(self, youtube_id, title):
-            seen.append(self.youtube_url_denied)
+            seen.append(self.youtube_url_denied_until)
             return super().analyze_video(youtube_id, title)
 
-    process_pending(conn, Recording({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1))
-    assert seen == [True]
+    process_pending(conn, Recording({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1),
+                    clock=lambda: 1_000_000.0)
+    assert seen == [1_000_000.0 + 7 * 86400]
+    assert kv(conn, "youtube_url_input") == str(1_000_000 + 7 * 86400)
 
 
 def test_url_input_is_not_marked_denied_without_a_denial(conn):
@@ -905,3 +936,305 @@ def test_topic_dedup_across_title_and_sentence_case(conn):
     assert [tuple(r) for r in conn.execute("SELECT slug, name FROM topic")] == [
         ("funcion-lineal", "Función lineal")
     ]
+
+
+# --- D2: enlace por defecto, descarga opcional y tope diario de video ---------------
+
+def test_download_off_by_default_never_calls_ytdlp(conn, tmp_path):
+    """Sin activar la descarga: el enlace rechazado deja cada material pidiendo un enlace
+    público y nunca baja nada. Con 403 en dos videos la clave queda marcada y el tercero
+    ya no gasta ningún pedido."""
+    for n, ref in enumerate(["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"], start=1):
+        add_material(conn, n, ref)
+    downloads, client = [], DeniedYoutubeUrlClient()
+    assert process_pending(conn, _gemini(tmp_path, client, calls=downloads)) == 0
+    assert downloads == []
+    assert client.url_calls == 2
+    assert statuses(conn) == {1: "needs_public_link", 2: "needs_public_link", 3: "needs_public_link"}
+    rows = conn.execute("SELECT error, fail_kind FROM material").fetchall()
+    assert {(r["error"], r["fail_kind"]) for r in rows} == {(NEEDS_LINK_TEXT, None)}
+    assert NEEDS_LINK_TEXT == ("Este video no es público. Pedile a la cátedra el archivo en el campus,"
+                               " o activá la descarga en Ajustes")
+    assert kv(conn, "ai_stop_reason") is None
+
+
+def test_one_private_video_does_not_block_the_rest(conn, tmp_path):
+    """Un 403 en un solo video deja ese material pidiendo enlace; los demás van por el enlace."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    a = analysis([q("¿Cuánto es 1+1?", correct=1)])
+    client = DeniedYoutubeUrlClient(analysis_text=a.model_dump_json(), denied={"aaaaaaaaaaa"})
+    assert process_pending(conn, _gemini(tmp_path, client)) == 1
+    assert statuses(conn) == {1: "needs_public_link", 2: "done"}
+    assert kv(conn, "youtube_url_input") is None  # la clave no quedó marcada
+
+
+def test_one_private_video_with_download_on_falls_back_to_download(conn, tmp_path):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    allow_download(conn)
+    a = analysis([q("¿Cuánto es 1+1?", correct=1)])
+    downloads = []
+    client = DeniedYoutubeUrlClient(analysis_text=a.model_dump_json(), denied={"aaaaaaaaaaa"})
+    assert process_pending(conn, _gemini(tmp_path, client, calls=downloads)) == 2
+    assert downloads == ["aaaaaaaaaaa"]
+    assert client.url_calls == 2
+    assert kv(conn, "youtube_url_input") is None
+
+
+def test_rejected_videos_add_up_across_runs_of_the_same_day(conn, tmp_path):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    client = DeniedYoutubeUrlClient()
+    process_pending(conn, _gemini_at(tmp_path, client, BA_MORNING), budget=1, clock=lambda: BA_MORNING)
+    assert kv(conn, "youtube_url_input") is None
+    later = BA_MORNING + 3600
+    process_pending(conn, _gemini_at(tmp_path, client, later), budget=1, clock=lambda: later)
+    assert kv(conn, "youtube_url_input") == str(int(later + 7 * 86400))
+
+
+def test_rejected_videos_of_another_day_do_not_count(conn, tmp_path):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    client = DeniedYoutubeUrlClient()
+    process_pending(conn, _gemini_at(tmp_path, client, BA_MORNING), budget=1, clock=lambda: BA_MORNING)
+    tomorrow = BA_MORNING + 86400
+    process_pending(conn, _gemini_at(tmp_path, client, tomorrow), budget=1, clock=lambda: tomorrow)
+    assert kv(conn, "youtube_url_input") is None
+    assert kv(conn, "youtube_denied_videos:2026-10-17") is None  # se limpia
+
+
+def test_download_on_is_passed_to_the_provider(conn, tmp_path):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    allow_download(conn)
+    a = analysis([q("¿Cuánto es 1+1?", correct=1)])
+    downloads = []
+    client = DeniedYoutubeUrlClient(analysis_text=a.model_dump_json())
+    assert process_pending(conn, _gemini(tmp_path, client, calls=downloads)) == 1
+    assert downloads == ["aaaaaaaaaaa"]
+
+
+def test_needs_public_link_is_retried_by_retry_failed(conn):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    conn.execute("UPDATE material SET status='needs_public_link', error=? WHERE id=1", (NEEDS_LINK_TEXT,))
+    conn.execute("UPDATE material SET status='failed', fail_kind='video' WHERE id=2")
+    conn.commit()
+    assert retry_failed(conn, ("format", "error")) == 1  # clave nueva: el enlace se vuelve a probar
+    assert statuses(conn) == {1: "pending", 2: "failed"}
+    assert conn.execute("SELECT error FROM material WHERE id=1").fetchone()[0] is None
+
+
+def test_denied_expires_after_7_days(conn, tmp_path):
+    """La marca de "enlace rechazado" vence a los 7 días: después se vuelve a probar el enlace."""
+    for n in range(1, 5):
+        add_material(conn, n, f"video{n:06d}")
+    t0 = BA_MORNING
+    client = DeniedYoutubeUrlClient()
+    process_pending(conn, _gemini_at(tmp_path, client, t0), budget=2, clock=lambda: t0)
+    assert kv(conn, "youtube_url_input") == str(int(t0 + 7 * 86400))
+    assert client.url_calls == 2
+
+    # Seis días después sigue rechazado: no se prueba el enlace.
+    later = t0 + 6 * 86400
+    process_pending(conn, _gemini_at(tmp_path, client, later), budget=1, clock=lambda: later)
+    assert client.url_calls == 2
+
+    # Pasados los 7 días se prueba de nuevo; un solo 403 ya no marca la clave.
+    week = t0 + 7 * 86400 + 1
+    process_pending(conn, _gemini_at(tmp_path, client, week), budget=1, clock=lambda: week)
+    assert client.url_calls == 3
+    assert kv(conn, "youtube_url_input") is None
+
+
+def test_expired_denial_is_removed(conn):
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_url_input', '1000')")
+    conn.commit()
+    process_pending(conn, FakeProvider({}, lambda s, o: 1), clock=lambda: 5000.0)
+    assert kv(conn, "youtube_url_input") is None
+
+
+def _gemini_at(tmp_path, client, now):
+    return GeminiProvider("clave-falsa", analyze_models=["m"], blind_models=["b"], client=client,
+                          sleep=lambda s: None, clock=lambda: now,
+                          download=lambda *a: (_ for _ in ()).throw(AssertionError("no baja")),
+                          video_dir=tmp_path / "videos")
+
+
+# 2026-10-17 10:00 en Buenos Aires (UTC-3).
+BA_MORNING = 1_792_242_000.0
+
+
+def test_queue_stops_at_8h_per_day(conn):
+    """Con 8 h de video mandadas por enlace en el día local, la cola para y sigue al día siguiente."""
+    refs = [f"video{n:06d}" for n in range(1, 8)]
+    for n, ref in enumerate(refs, start=1):
+        add_material(conn, n, ref)
+    analyses = {ref: analysis([q(f"P{ref}")]) for ref in refs}
+    provider = FakeProvider(analyses, lambda s, o: 1, video_seconds=2 * 3600)
+
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 4  # 4 x 2 h = 8 h
+    assert provider.analyzed_refs == refs[:4]
+    assert kv(conn, "ai_stop_reason") == "youtube_cap"
+    # Vuelve a la medianoche del Pacífico (el día de la cuota de Gemini):
+    # 2026-10-18 00:00 -07:00 = 04:00 en Buenos Aires.
+    assert kv(conn, "ai_quota_resets_at") == str(int(BA_MORNING + 18 * 3600))
+    assert kv(conn, "youtube_seconds:2026-10-17") == str(8 * 3600)
+
+    # Pasada la medianoche de Buenos Aires sigue siendo el mismo día del Pacífico: nada.
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING + 14 * 3600 + 1) == 0
+    assert provider.analyzed_refs == refs[:4]
+
+    # Al día siguiente del Pacífico sigue la cola.
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING + 18 * 3600 + 1) == 3
+    assert provider.analyzed_refs == refs
+    assert kv(conn, "ai_stop_reason") is None
+
+
+def test_cap_counter_uses_the_pacific_day(conn):
+    """A las 2:00 de Buenos Aires todavía es el día anterior en el Pacífico: cuenta ahí."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1, video_seconds=1800)
+    early = BA_MORNING - 8 * 3600                    # 2026-10-17 02:00 -03:00 = 10-16 22:00 -07:00
+    assert process_pending(conn, provider, clock=lambda: early) == 1
+    assert kv(conn, "youtube_seconds:2026-10-16") == "1800"
+    assert kv(conn, "youtube_measured:2026-10-16") == "1:1800"
+    assert kv(conn, "youtube_seconds:2026-10-17") is None
+
+
+def test_daily_cap_uses_one_hour_without_measurements(conn):
+    """Sin duraciones medidas hoy se supone una hora: con 7 h 30 min usadas no se manda otro."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_seconds:2026-10-17', ?)", (str(7 * 3600 + 1800),))
+    conn.commit()
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1)
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 0
+    assert provider.analyzed_refs == []
+    assert kv(conn, "ai_stop_reason") == "youtube_cap"
+
+
+def test_daily_cap_estimates_with_the_average_of_today(conn):
+    """Con duraciones medidas hoy, se supone su promedio (acá 2 h 30 min, no 1 h)."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_seconds:2026-10-17', ?)", (str(6 * 3600),))
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_measured:2026-10-17', ?)", (f"2:{5 * 3600}",))
+    conn.commit()
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1)
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 0
+    assert kv(conn, "ai_stop_reason") == "youtube_cap"
+
+
+def test_measured_durations_are_recorded(conn):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")]), "bbbbbbbbbbb": analysis([q("y")])},
+                            lambda s, o: 1, video_seconds=1800)
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 2
+    assert kv(conn, "youtube_measured:2026-10-17") == "2:3600"
+    assert kv(conn, "youtube_seconds:2026-10-17") == "3600"
+
+
+def test_unknown_duration_counts_the_estimate(conn):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1)  # sin duración
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 1
+    assert kv(conn, "youtube_seconds:2026-10-17") == "3600"
+    assert kv(conn, "youtube_measured:2026-10-17") is None
+
+
+def test_uploaded_videos_do_not_count_toward_the_cap(conn):
+    """El tope copia el límite de YouTube por enlace: un video subido no cuenta."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1,
+                            video_seconds=7200, by_link=False)
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 1
+    assert kv(conn, "youtube_seconds:2026-10-17") is None
+
+
+def test_with_the_link_denied_the_cap_does_not_block_uploads(conn):
+    add_material(conn, 1, "aaaaaaaaaaa")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_seconds:2026-10-17', ?)", (str(8 * 3600),))
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_url_input', ?)", (str(int(BA_MORNING + 86400)),))
+    conn.commit()
+    allow_download(conn)
+    provider = FakeProvider({"aaaaaaaaaaa": analysis([q("x")])}, lambda s, o: 1, by_link=False)
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 1
+
+
+def test_link_read_with_an_unusable_answer_still_counts(conn):
+    """Gemini leyó el video aunque la respuesta no sirva: cuenta lo supuesto."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+
+    class Unusable(FakeProvider):
+        def analyze_video(self, youtube_id, title):
+            self.last_link_sent = True
+            raise AIFormatError("la respuesta no es un análisis válido")
+
+    process_pending(conn, Unusable({}, lambda s, o: 1), clock=lambda: BA_MORNING)
+    assert statuses(conn) == {1: "failed"}
+    assert kv(conn, "youtube_seconds:2026-10-17") == "3600"
+
+
+def test_cap_still_finishes_paid_materials(conn):
+    """Con el tope alcanzado se saltean los que mandarían video, pero los ya analizados terminan."""
+    add_material(conn, 1, "aaaaaaaaaaa")
+    add_material(conn, 2, "bbbbbbbbbbb")
+    a = analysis([q("x")])
+    conn.execute("UPDATE material SET analysis_json=?, analysis_model='m' WHERE id=2", (a.model_dump_json(),))
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_seconds:2026-10-17', ?)", (str(8 * 3600),))
+    conn.commit()
+    provider = FakeProvider({}, lambda s, o: 1)
+    assert process_pending(conn, provider, clock=lambda: BA_MORNING) == 1
+    assert provider.analyzed_refs == []
+    assert statuses(conn) == {1: "pending", 2: "done"}
+    assert kv(conn, "ai_stop_reason") == "youtube_cap"
+    assert kv(conn, "youtube_seconds:2026-10-17") == str(8 * 3600)
+
+
+def test_old_daily_counters_are_cleaned(conn):
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_seconds:2026-10-10', '100')")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('youtube_measured:2026-10-10', '1:100')")
+    conn.commit()
+    process_pending(conn, FakeProvider({}, lambda s, o: 1), clock=lambda: BA_MORNING)
+    assert kv(conn, "youtube_seconds:2026-10-10") is None
+    assert kv(conn, "youtube_measured:2026-10-10") is None
+
+
+@pytest.mark.parametrize("options", [
+    ["√2", "1.41", "2", "1"],
+    ["sqrt(2)", "1,414", "2", "1"],
+])
+def test_rejects_distractor_the_typed_rule_would_accept(conn, options):
+    """Opción múltiple dice "1.41" mal; escrita lo acepta: la pregunta se contradice y se descarta."""
+    add_material(conn, 1, "v1")
+    a = analysis([
+        q_with("contradictoria", options, check_expr="sqrt(2)"),
+        q_with("sana", ["√2", "1.4", "2", "1"], check_expr="sqrt(2)"),
+    ])
+    res = process_material(conn, FakeProvider({"v1": a}, lambda s, o: 0), 1)
+    assert (res.kept, res.discarded) == (1, 1)
+    assert [r["stem"] for r in conn.execute("SELECT stem FROM question")] == ["sana"]
+
+
+def test_typed_acceptance_check_timeout_discards_the_question(conn, monkeypatch):
+    from estudia.generation import pipeline
+
+    monkeypatch.setattr(pipeline, "typed_accepts_option", lambda expr, option: None)
+    add_material(conn, 1, "v1")
+    a = analysis([q_with("indeciso", ["√2", "1.4", "2", "1"], check_expr="sqrt(2)"),
+                  q_with("sin check", ["a", "b", "c", "d"])])
+    res = process_material(conn, FakeProvider({"v1": a}, lambda s, o: 0), 1)
+    assert [r["stem"] for r in conn.execute("SELECT stem FROM question")] == ["sin check"]
+
+
+def test_question_without_check_expr_skips_the_typed_check(conn, monkeypatch):
+    from estudia.generation import pipeline
+
+    def boom(expr, option):
+        raise AssertionError("no debería llamarse")
+
+    monkeypatch.setattr(pipeline, "typed_accepts_option", boom)
+    add_material(conn, 1, "v1")
+    a = analysis([q_with("mcq", ["1.41", "√2", "2", "1"])])
+    res = process_material(conn, FakeProvider({"v1": a}, lambda s, o: 0), 1)
+    assert res.kept == 1

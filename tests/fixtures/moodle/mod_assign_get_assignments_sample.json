@@ -1,0 +1,37 @@
+{
+  "courses": [
+    {
+      "id": 101,
+      "fullname": "AM1 - 8.30 HS",
+      "shortname": "AM1 - 8.30 HS",
+      "assignments": [
+        {
+          "id": 501,
+          "cmid": 91001,
+          "course": 101,
+          "name": "TP 1: Rectas y planos",
+          "duedate": 1807000000,
+          "cutoffdate": 1807600000,
+          "allowsubmissionsfromdate": 1805000000
+        },
+        {
+          "id": 502,
+          "cmid": 91002,
+          "course": 101,
+          "name": "TP 2: Límites",
+          "duedate": 0,
+          "cutoffdate": 1808000000
+        },
+        {
+          "id": 503,
+          "cmid": 91003,
+          "course": 101,
+          "name": "Entrega sin fechas",
+          "duedate": 0,
+          "cutoffdate": 0
+        }
+      ]
+    }
+  ],
+  "warnings": []
+}

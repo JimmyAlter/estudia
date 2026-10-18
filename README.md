@@ -7,7 +7,7 @@
 Gratis, de código abierto y corre en tu PC. Hecho por un estudiante del ingreso a la UTN.
 
 [![Licencia MIT](https://img.shields.io/badge/licencia-MIT-2a2c2e)](LICENSE)
-[![Estado: etapa 1](https://img.shields.io/badge/estado-etapa%201%20·%20FRBA-c4532b)](#roadmap)
+[![Estado: etapa 1](https://img.shields.io/badge/estado-etapa%202%20·%20FRBA-c4532b)](#roadmap)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-2a2c2e)](https://www.python.org/)
 
 <img src="docs/img/estudia-demo.gif" alt="Recorrido por Estudia: el inicio muestra el próximo examen y el tema más flojo; en la práctica se responde mal, aparece la explicación con el minuto de la clase, se responde bien, se ve el resultado y se abre un resumen en Materiales." width="860">
@@ -19,8 +19,11 @@ Gratis, de código abierto y corre en tu PC. Hecho por un estudiante del ingreso
 ## Por qué
 
 - **Practicás con el material de tu cátedra**, no con ejercicios sueltos de internet. Estudia toma las clases de tu campus Moodle y arma resúmenes y preguntas con corrección al instante.
-- **Cuando le errás, te dice por qué y de dónde sale.** Cada respuesta trae la explicación, el error común y el minuto de la clase donde se ve. Lo que fallás vuelve hasta que te sale dos veces seguidas.
-- **Sabés qué te falta para el próximo examen.** El inicio muestra cuánto falta, qué temas entran, cuánto dominás cada uno y cuál conviene practicar ahora.
+- **Cuando le errás, te dice por qué y de dónde sale.** Cada respuesta trae la explicación, el error común y el minuto de la clase donde se ve. Lo que fallás vuelve en los días siguientes, y una pregunta cuenta como sabida cuando la acertás en tres días distintos.
+- **Sabés si llegás al examen.** Para cada tema ves la probabilidad de que lo sepas el día del parcial, y "¿Llegás?" te dice por qué y qué estudiar hoy.
+- **Tu semana, ordenada.** La agenda junta tus horarios de cursada, entregas y exámenes del campus, y un plan reparte sesiones de estudio en el tiempo que le das, sin pisarse con tus clases. Se exporta a Google Calendar o al celular con un archivo `.ics`.
+- **Un simulacro antes del parcial.** Mismos temas, reloj y escala de nota que el examen, sin ver las respuestas hasta el final. Antes te pregunta cuánto creés que te sacás, para que veas si te estás sobreestimando.
+- **Practicar como pide la ciencia del aprendizaje.** Te pregunta qué tan seguro estabas (una respuesta adivinada no cuenta como sabida), a veces te pide pensar antes de ver las opciones o escribir el resultado, y antes del parcial mezcla temas para que practiques reconocer qué método va.
 
 ## Cómo se ve
 
@@ -50,15 +53,15 @@ Una pregunta con la respuesta equivocada es peor que no tener pregunta. Por eso:
 1. Las preguntas con cuentas se verifican con código antes de mostrarse.
 2. Una segunda pasada de la IA las resuelve sin ver la respuesta. Si no coinciden, la pregunta se descarta.
 3. Cada pregunta dice de qué clase y minuto sale.
-4. Si igual encontrás una mal, el botón **"Reportar error en la pregunta"** la saca de tu banco. Y si nos contás cuál era, mejor (ver [Feedback](#feedback)).
+4. Si igual encontrás una mal, el botón **"Reportar un error"** la saca de tu banco. Y si nos contás cuál era, mejor (ver [Feedback](#feedback)).
 
 ## Privacidad, en criollo
 
 - **Todo queda en tu compu.** Tus materias, los resúmenes, las preguntas y tus resultados se guardan en tu PC. No hay servidor de Estudia, no hay cuentas y no hay publicidad.
 - **No ve tu contraseña del campus.** Iniciás sesión en la página de tu campus, como siempre, y Estudia recibe un permiso de solo lectura. Ese permiso y tu clave de Gemini se guardan en el almacén seguro de tu sistema (el mismo que usa el navegador para tus contraseñas).
 - **Solo lee.** Nunca entrega, responde ni publica nada en tu campus.
-- **Lo único que sale de tu PC** es lo que se le manda a Gemini para procesar cada clase.
-- **Ojo con el plan gratis de Gemini.** Según los [términos de Google](https://ai.google.dev/gemini-api/terms), en el plan gratuito Google puede usar lo que recibe para mejorar sus productos, y puede leerlo una persona. Esos términos también piden **tener 18 años o más**. Si te importa la privacidad, usá una clave paga: ahí Google no usa tus datos para entrenar.
+- **Lo único que sale de tu PC** es lo que se le manda a Gemini para procesar cada clase. Los videos de YouTube se le pasan por enlace; bajarlos para mandarlos es opcional y viene apagado.
+- **Ojo con el plan gratis de Gemini.** Según los [términos de Google](https://ai.google.dev/gemini-api/terms), en el plan gratuito Google puede usar lo que recibe para mejorar sus productos, y puede leerlo una persona. Esos términos también piden **tener 18 años o más**: por eso Estudia te pregunta la edad, y si tenés menos usa la agenda, el plan y la práctica sin mandar nada a Gemini. Si te importa la privacidad, usá una clave paga: ahí Google no usa tus datos para entrenar.
 - **El material es de tu cátedra.** Estudia lo procesa solo para vos, con tu usuario. No lo publica, no lo comparte y no lo redistribuye. Por favor, no subas material de clases a los issues.
 
 ## Dónde funciona
@@ -232,11 +235,11 @@ Hoy el único login probado de punta a punta es `"browser"`. Las entradas nuevas
 ## Roadmap
 
 - [x] **Etapa 1:** camino UTN-FRBA de punta a punta. Login por navegador, clases en video procesadas con Gemini, preguntas verificadas, práctica con repaso de errores, inicio centrado en el próximo examen y resúmenes.
-- [ ] **Etapa 2:** simulacro con el reloj y la escala del examen real, y exámenes cargados a mano.
+- [x] **Etapa 2:** agenda con horarios, entregas y exámenes (también cargados a mano), plan de estudio con "¿Llegás?", simulacro con el reloj y la escala del examen real, repaso espaciado por pregunta, confianza y respuestas escritas, exportar a calendario (`.ics`) y a Anki, y recordatorios en la PC.
 - [ ] **Etapa 3:** problemas en papel corregidos con una foto (desde la PC o el celular por QR), y métodos de la cátedra detectados y confirmados con vos.
 - [ ] **Etapa 4:** Claude y ChatGPT además de Gemini, videos subidos a Moodle y PDFs.
 - [ ] **Etapa 5:** catálogo completo (todas las facultades de la tabla), login con usuario y contraseña y con Office 365, y materias sin cuentas con respuestas verificadas contra una cita del material.
-- [ ] **Etapa 6:** instalador para Windows, enlace de vuelta del login registrado solo y actualizaciones por GitHub Releases.
+- [x] **Etapa 6:** instalador para Windows, enlace de vuelta del login registrado solo y actualizaciones por GitHub Releases.
 
 El orden puede cambiar según lo que pidan en [Ideas](https://github.com/JimmyAlter/estudia/discussions/categories/ideas).
 
@@ -244,7 +247,7 @@ El orden puede cambiar según lo que pidan en [Ideas](https://github.com/JimmyAl
 
 Esto se hace entre estudiantes, así que lo que digas cambia lo que se construye.
 
-- **Una pregunta con la respuesta mal:** tocá "Reportar error en la pregunta" en la app y, si podés, abrí un issue de [**"Pregunta incorrecta"**](https://github.com/JimmyAlter/estudia/issues/new?template=pregunta-incorrecta.yml). Contala con tus palabras, sin pegar material de la cátedra. Es el error que más nos importa.
+- **Una pregunta con la respuesta mal:** tocá "Reportar un error" en la app y, si podés, abrí un issue de [**"Pregunta incorrecta"**](https://github.com/JimmyAlter/estudia/issues/new?template=pregunta-incorrecta.yml). Contala con tus palabras, sin pegar material de la cátedra. Es el error que más nos importa.
 - **Tu facultad no anda o no está:** issue de [**"Mi facultad no funciona"**](https://github.com/JimmyAlter/estudia/issues/new?template=facultad-no-funciona.yml).
 - **Una idea o algo que te falta:** issue de [**"Idea"**](https://github.com/JimmyAlter/estudia/issues/new?template=idea.yml) o [Discussions](https://github.com/JimmyAlter/estudia/discussions). Votá con un pulgar las que ya están.
 - **Preguntas, dudas de uso o charla:** [Discussions](https://github.com/JimmyAlter/estudia/discussions). Para todo lo demás, [abrí un issue](https://github.com/JimmyAlter/estudia/issues/new/choose).

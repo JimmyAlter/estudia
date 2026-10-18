@@ -10,8 +10,8 @@ from estudia.moodle.sync import sync_all
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "moodle"
 SITE = "utn-frba"
 PAGE = (FIXTURES / "page_video_clase_1.html").read_text("utf-8")
-CONTENTS = json.loads((FIXTURES / "core_course_get_contents_4242.json").read_text("utf-8"))
-QUIZZES = json.loads((FIXTURES / "mod_quiz_get_quizzes_by_courses_4242.json").read_text("utf-8"))
+CONTENTS = json.loads((FIXTURES / "core_course_get_contents_101.json").read_text("utf-8"))
+QUIZZES = json.loads((FIXTURES / "mod_quiz_get_quizzes_by_courses_101.json").read_text("utf-8"))
 
 
 class FakeClient:
@@ -27,11 +27,15 @@ class FakeClient:
         if fn == "core_webservice_get_site_info":
             return {"userid": 7, "fullname": "Ana Alumna"}
         if fn == "core_enrol_get_users_courses":
-            return [{"id": 4242, "fullname": "Matemática - Ejemplo", "shortname": "MAT-EJ"}]
+            return [{"id": 101, "fullname": "AM1 - 8.30 HS", "shortname": "AM1 - 8.30 HS"}]
         if fn == "core_course_get_contents":
             return self.contents
         if fn == "mod_quiz_get_quizzes_by_courses":
             return QUIZZES
+        if fn == "mod_assign_get_assignments":
+            return {"courses": []}
+        if fn == "core_calendar_get_action_events_by_timesort":
+            return {"events": []}
         raise AssertionError(f"función inesperada: {fn}")
 
     def fetch_file(self, fileurl):
@@ -53,21 +57,22 @@ def test_sync_from_fixtures(conn):
     assert len(mats) == 8
     assert {(m["kind"], m["status"]) for m in mats} == {("youtube", "pending")}
     assert len({m["ref"] for m in mats}) == 8
-    primero = conn.execute("SELECT * FROM material WHERE cmid=7101").fetchone()
-    assert primero["title"] == "Clase 1: Rectas."
+    primero = conn.execute("SELECT * FROM material WHERE cmid=1798494").fetchone()
+    assert primero["title"] == "Video-clase 1: Rectas."
     assert conn.execute("SELECT COUNT(*) FROM section").fetchone()[0] == 8
     assert conn.execute("SELECT COUNT(*) FROM section WHERE visible=1").fetchone()[0] == 3
     ex = conn.execute("SELECT * FROM exam").fetchall()
     assert len(ex) == 1
     assert (ex[0]["name"], ex[0]["attempts"], ex[0]["time_limit_s"], ex[0]["max_grade"]) == (
-        "CUESTIONARIO DE EJEMPLO", 1, 7200, 12)
-    assert (ex[0]["opens_at"], ex[0]["cmid"], ex[0]["course_id"]) == (1805511600, 7002, 4242)
+        "PRIMER CUESTIONARIO", 1, 7200, 12)
+    assert (ex[0]["opens_at"], ex[0]["cmid"], ex[0]["course_id"]) == (1805061600, 5001, 101)
     assert (res.new_materials, res.new_sections) == (8, 8)
     assert conn.execute("SELECT value FROM kv WHERE key='last_sync_at'").fetchone() is not None
-    assert conn.execute("SELECT fullname FROM course").fetchone()[0] == "Matemática - Ejemplo"
+    assert conn.execute("SELECT fullname FROM course").fetchone()[0] == "AM1 - 8.30 HS"
     assert set(cliente.calls) == {
         "core_webservice_get_site_info", "core_enrol_get_users_courses",
-        "core_course_get_contents", "mod_quiz_get_quizzes_by_courses"}
+        "core_course_get_contents", "mod_quiz_get_quizzes_by_courses",
+        "mod_assign_get_assignments", "core_calendar_get_action_events_by_timesort"}
 
 
 def test_sync_is_incremental(conn):
@@ -177,3 +182,57 @@ def test_failed_sync_leaves_no_partial_state(conn):
         sync_all(conn, Falla(), SITE)
     assert not conn.in_transaction
     assert conn.execute("SELECT COUNT(*) FROM course").fetchone()[0] == 0
+
+
+def test_fetch_phase_does_not_hold_the_write_lock(tmp_path):
+    """Mientras se baja todo del campus, otra conexión puede escribir (busy_timeout=0)."""
+    import sqlite3
+
+    path = tmp_path / "t.db"
+    conn = connect(path)
+    escrituras = []
+
+    class EscribeMientras(FakeClient):
+        def _otra_escribe(self, fn):
+            otra = sqlite3.connect(path, timeout=0)
+            try:
+                otra.execute("PRAGMA busy_timeout = 0")
+                otra.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, '1')", (f"durante:{fn}",))
+                otra.commit()
+                escrituras.append(fn)
+            finally:
+                otra.close()
+
+        def call(self, fn, **params):
+            out = super().call(fn, **params)
+            self._otra_escribe(fn)
+            return out
+
+        def fetch_file(self, fileurl):
+            out = super().fetch_file(fileurl)
+            self._otra_escribe("fetch_file")
+            return out
+
+    cliente = EscribeMientras()
+    res = sync_all(conn, cliente, SITE)
+    assert res.new_materials == 8
+    assert set(escrituras) == set(cliente.calls) | {"fetch_file"}
+    assert conn.execute("SELECT COUNT(*) FROM material").fetchone()[0] == 8
+    assert conn.execute("SELECT COUNT(*) FROM kv WHERE key LIKE 'durante:%'").fetchone()[0] == 7
+    assert not conn.in_transaction
+
+
+def test_failure_after_fetch_writes_nothing(tmp_path, monkeypatch):
+    from estudia.moodle import sync
+
+    conn = connect(tmp_path / "t.db")
+
+    def boom(*a, **k):
+        raise RuntimeError("falla al escribir")
+
+    monkeypatch.setattr(sync, "_sync_exam", boom)
+    with pytest.raises(RuntimeError):
+        sync_all(conn, FakeClient(), SITE)
+    assert not conn.in_transaction
+    for table in ("site", "course", "section", "material", "exam"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table

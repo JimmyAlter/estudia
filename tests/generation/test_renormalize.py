@@ -78,3 +78,13 @@ def test_skips_question_whose_stem_would_repeat_another(conn):
     result = normalize_existing(conn)
     assert result.skipped == [2]
     assert conn.execute("SELECT stem FROM question WHERE id=2").fetchone()[0] == "y = x**2"
+
+
+def test_rewritten_options_forget_the_typed_check(conn):
+    add_question(conn, 1, "¿Cuánto?", ["x**2", "2", "3", "4"], "2")
+    add_question(conn, 2, "¿Otra?", ["1", "2", "3", "4"], "2")       # opciones sin cambios
+    conn.execute("UPDATE question SET typed_safe = 1")
+    conn.commit()
+    normalize_existing(conn)
+    flags = dict(conn.execute("SELECT id, typed_safe FROM question").fetchall())
+    assert flags == {1: None, 2: 1}

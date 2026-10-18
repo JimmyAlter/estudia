@@ -22,6 +22,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
+from estudia.ai.gate import age_is_adult
 from estudia.ai.gemini import GeminiProvider
 from estudia.config import GEMINI_TIMEOUT_S
 from estudia.db import connect
@@ -60,6 +61,10 @@ def main() -> int:
     # httpx registra cada URL pedida; no hace falta (y algunas podrían llevar datos).
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    # Mismo bloqueo que la app: mira la edad en la base real, aunque el smoke use una temporal.
+    if not age_is_adult():
+        print("la IA no está habilitada (falta la respuesta de edad o es menor)", file=sys.stderr)
+        return 3
     key = get_secret("gemini_key")
     if not key:
         print("no hay clave de Gemini en el keyring (gemini_key)", file=sys.stderr)

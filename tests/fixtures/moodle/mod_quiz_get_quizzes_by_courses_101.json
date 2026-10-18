@@ -1,10 +1,10 @@
 {
  "quizzes": [
   {
-   "id": 8201,
-   "coursemodule": 7002,
-   "course": 4242,
-   "name": "CUESTIONARIO DE EJEMPLO",
+   "id": 164949,
+   "coursemodule": 5001,
+   "course": 101,
+   "name": "PRIMER CUESTIONARIO",
    "intro": "",
    "introformat": 1,
    "introfiles": [],
@@ -15,8 +15,8 @@
    "lang": "",
    "enableaitools": null,
    "enabledaiactions": null,
-   "timeopen": 1805511600,
-   "timeclose": 1805857140,
+   "timeopen": 1805061600,
+   "timeclose": 1805338740,
    "timelimit": 7200,
    "preferredbehaviour": "deferredfeedback",
    "attempts": 1,

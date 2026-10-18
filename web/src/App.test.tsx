@@ -57,6 +57,25 @@ describe("App", () => {
     expect(screen.getByText("Sin exámenes próximos")).toBeInTheDocument();
   });
 
+  it("una instalación sin respuesta de edad la pregunta arriba de Inicio, en una línea", async () => {
+    const fetchMock = mockApi({
+      "GET /api/state": { ...READY, age: null },
+      "GET /api/home": HOME,
+      "PUT /api/settings": { ok: true },
+    });
+    render(<App />);
+    expect(await screen.findByText(/¿Tenés 18 años o más\?/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "No" }));
+    expect(fetchMock).toHaveBeenCalledWith("/api/settings", expect.objectContaining({ method: "PUT" }));
+  });
+
+  it("con la edad respondida no hay pregunta en Inicio", async () => {
+    mockApi({ "GET /api/state": { ...READY, age: "minor" }, "GET /api/home": HOME });
+    render(<App />);
+    await screen.findByText("Sin exámenes próximos");
+    expect(screen.queryByText(/¿Tenés 18 años o más\?/)).not.toBeInTheDocument();
+  });
+
   it("avisa una sola vez que se terminó lo gratis de Gemini", async () => {
     mockApi({ "GET /api/state": { ...READY, ai_stop_reason: "quota" }, "GET /api/home": HOME });
     render(<App />);
@@ -65,6 +84,16 @@ describe("App", () => {
     ).toBeInTheDocument();
     await screen.findByText("Sin exámenes próximos");
     expect(screen.queryByText(/Preparando/)).not.toBeInTheDocument();
+  });
+
+  it("avisa una sola vez que se llegó al tope de videos de YouTube", async () => {
+    mockApi({ "GET /api/state": { ...READY, ai_stop_reason: "youtube_cap" }, "GET /api/home": HOME });
+    render(<App />);
+    expect(
+      await screen.findByText("Por hoy se llegó al tope de videos de YouTube. Mañana se preparan las clases que faltan."),
+    ).toBeInTheDocument();
+    await screen.findByText("Sin exámenes próximos");
+    expect(screen.queryByText(/Preparando|por preparar/)).not.toBeInTheDocument();
   });
 
   it("con la sesión vencida mantiene el inicio y ofrece volver a entrar", async () => {
@@ -133,7 +162,6 @@ describe("App", () => {
       "GET /api/version": { current: "0.1.0", latest: { version: "0.2.0", url } },
     });
     render(<App />);
-    expect(await screen.findByText("Estudia 0.1.0")).toBeInTheDocument();
     expect(await screen.findByText(/Hay una versión nueva \(0\.2\.0\)\./)).toBeInTheDocument();
     const link = screen.getByRole("link", { name: "Descargar" });
     expect(link).toHaveAttribute("href", url);
@@ -142,14 +170,17 @@ describe("App", () => {
   });
 
   it("no muestra nada sin versión nueva", async () => {
-    mockApi({
+    const fetchMock = mockApi({
       "GET /api/state": READY,
       "GET /api/home": HOME,
       "GET /api/version": { current: "0.1.0", latest: null },
     });
     render(<App />);
-    expect(await screen.findByText("Estudia 0.1.0")).toBeInTheDocument();
+    await screen.findByText("Sin exámenes próximos");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/version", expect.anything()));
     expect(screen.queryByText(/versión nueva/)).not.toBeInTheDocument();
+    // La versión instalada no ocupa el pie de cada pantalla: está en Ajustes.
+    expect(screen.queryByText("Estudia 0.1.0")).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Descargar" })).not.toBeInTheDocument();
   });
 
@@ -159,5 +190,20 @@ describe("App", () => {
     await screen.findByText("Sin exámenes próximos");
     expect(screen.queryByText(/versión nueva/)).not.toBeInTheDocument();
     expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("App: navegación", () => {
+  it("al cambiar de pantalla el foco va al título", async () => {
+    mockApi({
+      "GET /api/state": READY,
+      "GET /api/home": HOME,
+      "GET /api/agenda": { days: [], health: [] },
+    });
+    render(<App />);
+    await screen.findByText("Sin exámenes próximos");
+    await userEvent.click(screen.getByRole("link", { name: "Agenda" }));
+    const title = await screen.findByRole("heading", { level: 1, name: "Agenda" });
+    await waitFor(() => expect(title).toHaveFocus());
   });
 });

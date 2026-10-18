@@ -43,6 +43,30 @@ CREATE TABLE IF NOT EXISTS answer(
     correct INTEGER, at INTEGER);
 CREATE TABLE IF NOT EXISTS kv(
     key TEXT PRIMARY KEY, value TEXT);  -- last_sync_at, etc.
+CREATE TABLE IF NOT EXISTS class_slot(
+    id INTEGER PRIMARY KEY, course_id INTEGER, weekday INTEGER,  -- 0=lunes
+    start_min INTEGER, end_min INTEGER, place TEXT, created_at INTEGER);
+CREATE TABLE IF NOT EXISTS deadline(
+    id INTEGER PRIMARY KEY, course_id INTEGER, kind TEXT,        -- 'assign'|'event'
+    ext_id INTEGER, name TEXT, due_at INTEGER, url TEXT, UNIQUE(kind, ext_id));
+CREATE TABLE IF NOT EXISTS plan_session(
+    id INTEGER PRIMARY KEY, course_id INTEGER, topic_id INTEGER, exam_id INTEGER,
+    starts_at INTEGER, minutes INTEGER, done INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS availability(
+    weekday INTEGER PRIMARY KEY, minutes INTEGER);
+CREATE TABLE IF NOT EXISTS mock_attempt(
+    id INTEGER PRIMARY KEY, exam_id INTEGER, started_at INTEGER, finished_at INTEGER,
+    question_ids_json TEXT, answers_json TEXT, grade REAL, max_grade REAL);
+CREATE TABLE IF NOT EXISTS exam_result(
+    exam_id INTEGER PRIMARY KEY,        -- la nota real que cargó el estudiante, una por examen
+    grade REAL, max_grade REAL, at INTEGER);
+CREATE TABLE IF NOT EXISTS review_state(
+    card_key TEXT PRIMARY KEY,          -- 'q:<id>'; más adelante 'v:<grupo de variantes>'
+    stability REAL, difficulty REAL,    -- FSRS
+    state INTEGER,                      -- 2 repaso, 3 en reaprendizaje (como fsrs.State)
+    due INTEGER, last_review INTEGER,   -- epoch UTC
+    relearn_days INTEGER DEFAULT 0,     -- días locales distintos con acierto desde el último error
+    relearn_last_day TEXT);             -- el último de esos días, AAAA-MM-DD en Buenos Aires
 """
 
 # Columnas agregadas después de la primera versión: las bases viejas las reciben
@@ -51,6 +75,22 @@ ADDED_COLUMNS = (
     ("material", "fail_kind", "TEXT"),
     ("material", "analysis_json", "TEXT"),
     ("material", "analysis_model", "TEXT"),
+    ("exam", "source", "TEXT DEFAULT 'campus'"),   # 'campus' | 'manual'
+    ("exam", "topics_json", "TEXT"),               # solo manuales: ids de temas
+    ("mock_attempt", "seconds", "INTEGER"),        # reloj del simulacro al empezar
+    ("mock_attempt", "predicted_grade", "REAL"),   # la nota que el estudiante esperaba, en la escala del examen
+    ("mock_attempt", "typed_json", "TEXT"),        # ids de las preguntas que se responden escribiendo
+    ("answer", "confidence", "INTEGER"),           # 0 adiviné, 1 me parece, 2 seguro; NULL = seguro
+    ("answer", "latency_ms", "INTEGER"),           # desde que se mostró el enunciado
+    ("answer", "mode", "TEXT"),                    # mcq|mcq_think_first|typed|typed_then_mcq|mock|pretest|probe
+    ("answer", "option_order_json", "TEXT"),       # orden en que se mostraron las opciones
+    ("answer", "typed_text", "TEXT"),              # lo que escribió, si escribió
+    ("answer", "options_revealed_ms", "INTEGER"),  # "pensalo primero": cuándo abrió las opciones
+    ("plan_session", "kind", "TEXT DEFAULT 'focus'"),  # focus | mixed_focus | mixed_only
+    ("plan_session", "topics_json", "TEXT"),       # temas de la sesión, el foco primero; NULL = solo topic_id
+    # ¿Se puede ofrecer escrita? 1 sí; 0 no (la regla escrita aceptaría un distractor, "1.41" por √2);
+    # NULL todavía no se sabe: se calcula en el worker la primera vez que haría falta (practice.typed_safe_ids).
+    ("question", "typed_safe", "INTEGER"),
 )
 
 
@@ -71,6 +111,44 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# La descarga de videos (yt-dlp) pasó a ser opcional y apagada. Una instalación que ya
+# analizó videos bajándolos la conserva encendida, una sola vez (kv de abajo).
+DOWNLOAD_MIGRATED_KEY = "allow_download_migrated"
+VIDEO_FILE_SUFFIXES = (".mp4", ".webm", ".mkv")
+
+
+def _kv_value(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _has_downloaded_videos(video_dir: Path) -> bool:
+    try:
+        return any(p.is_file() and p.suffix.lower() in VIDEO_FILE_SUFFIXES for p in video_dir.iterdir())
+    except OSError:
+        return False
+
+
+def _migrate_allow_download(conn: sqlite3.Connection, path: Path) -> None:
+    """Prende `allow_download` si esta instalación ya usaba la descarga. Corre una vez.
+
+    No se anotaba qué material se bajó: cuenta como usada si Gemini ya había rechazado
+    el enlace (la marca vieja "denied", con la que todo se bajaba) y hay clases listas,
+    o si quedan videos bajados en la carpeta `videos` junto a la base.
+    """
+    if _kv_value(conn, DOWNLOAD_MIGRATED_KEY) is not None:
+        return
+    if _kv_value(conn, "allow_download") is None:
+        legacy_denied = _kv_value(conn, "youtube_url_input") == "denied"
+        done = conn.execute(
+            "SELECT 1 FROM material WHERE kind='youtube' AND status='done' LIMIT 1").fetchone()
+        on_disk = str(path) != ":memory:" and _has_downloaded_videos(Path(path).parent / "videos")
+        if (legacy_denied and done) or on_disk:
+            conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('allow_download', '1')")
+    conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, '1')", (DOWNLOAD_MIGRATED_KEY,))
+    conn.commit()
+
+
 def connect(path: Path | None = None, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Abre la base (por defecto en la carpeta de datos) y aplica el esquema.
 
@@ -84,4 +162,10 @@ def connect(path: Path | None = None, *, check_same_thread: bool = True) -> sqli
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     _migrate(conn)
+    _migrate_allow_download(conn, path)
+    # La primera vez reproduce la historia de respuestas en review_state; después no hace nada.
+    from estudia.study.srs import sync_review_state
+
+    sync_review_state(conn)
+    conn.commit()
     return conn

@@ -16,9 +16,9 @@ def _client(http):
 def test_call_flattens_lists():
     ruta = respx.post(ENDPOINT).respond(json=[])
     with httpx.Client() as http:
-        _client(http).call("x", courseids=[4242], opts={"a": [1]})
+        _client(http).call("x", courseids=[101], opts={"a": [1]})
     cuerpo = ruta.calls.last.request.content.decode()
-    assert "courseids%5B0%5D=4242" in cuerpo
+    assert "courseids%5B0%5D=101" in cuerpo
     assert "opts%5Ba%5D%5B0%5D=1" in cuerpo
     assert "wsfunction=x" in cuerpo and "wstoken=TOK" in cuerpo
 

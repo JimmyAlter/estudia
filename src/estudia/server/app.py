@@ -12,7 +12,9 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterator
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from secrets import token_hex
 from typing import Any
@@ -20,10 +22,10 @@ from typing import Any
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 
 from estudia.ai.base import (
     AIAuthError,
@@ -32,17 +34,23 @@ from estudia.ai.base import (
     AIQuotaError,
     AIUnavailableError,
 )
+from estudia.ai.gate import AIBlocked, GatedProvider, age_is_adult
 from estudia.catalog import get_site, load_catalog
 from estudia.config import SYNC_EVERY_S, data_dir
 from estudia.db import connect
+from estudia.generation.verify import GradingUnavailable
 from estudia.generation.pipeline import (
+    ALLOW_DOWNLOAD_KEY,
     QUOTA_RESET_KEY,
     RETRY_ON_NEW_KEY,
     STOP_KEY,
     URL_INPUT_KEY,
+    YOUTUBE_CAP,
+    download_allowed,
     forget_exhausted_models,
     process_pending,
     retry_failed,
+    retry_needs_link,
 )
 from estudia.moodle.auth import AuthError, launch_url, parse_callback
 from estudia.moodle.client import MoodleClient, MoodleError, TokenInvalid
@@ -50,13 +58,48 @@ from estudia.moodle.sync import sync_all
 from estudia.updates import default_http, latest_release
 from estudia.version import __version__
 from estudia.secrets import delete_secret, get_secret, set_secret
+from estudia.reminders import KV_ENABLED as REMINDERS_KEY
+from estudia.reminders import reminders_enabled
+from estudia.study.exams import (
+    create_manual_exam,
+    delete_manual_exam,
+    exam_topics,
+    list_exams,
+    set_exam_result,
+    skip_exam_result,
+    update_manual_exam,
+)
 from estudia.study.home import home_view, next_exam
+from estudia.study.anki import build_apkg, course_slug
+from estudia.study.ics import EXAM_MIN, build_ics
+from estudia.study.mock_exam import NotEnoughQuestions, finish_mock, mock_result, start_mock
+from estudia.study.planner import (
+    get_availability,
+    mark_done_from_answers,
+    plan_health,
+    preferred_start_min,
+    replan,
+    sessions,
+    set_availability,
+)
 from estudia.study.practice import (
     build_quiz,
+    build_session_quiz,
     record_answer,
     retire_question,
     unretire_question,
 )
+from estudia.study.schedule import (
+    TZ,
+    add_slot,
+    delete_slot,
+    dismiss_suggestion,
+    list_slots,
+    occurrences,
+    suggestions,
+    update_slot,
+)
+from estudia.study.srs import UNSURE
 
 HOST = "127.0.0.1"
 GEMINI_KEY = "gemini_key"
@@ -71,11 +114,28 @@ RETRY_MAX_S = 1800
 # El ciclo periódico se fija cada tanto si una corrida pedida desde la interfaz
 # dejó programado un reintento.
 POLL_S = 60
+# Con respuestas nuevas o material procesado, el plan se rehace como mucho cada 10 minutos.
+PLAN_REFRESH_KEY = "plan_refreshed_at"
+PLAN_REFRESH_EVERY_S = 600
+STUDY_START_KEY = "study_start_min"
+# Puerta de edad: "adult" | "minor"; sin valor, todavía no respondió.
+AGE_KEY = "age_gate"
+AGES = ("adult", "minor")
+MINOR_AI_TEXT = "Estudia no usa la IA con menores de 18 años. La agenda, el plan y los recordatorios siguen andando."
+AGE_PENDING_TEXT = "Antes de conectar la IA, contestá si tenés 18 años o más."
+# Motivos de corte que vuelven solos a una hora conocida (kv "ai_quota_resets_at").
+RESETTING_REASONS = ("quota", YOUTUBE_CAP)
+NOT_ENOUGH_TEXT = "Todavía no hay suficientes preguntas para un simulacro"
 
 log = logging.getLogger(__name__)
 
 MoodleFactory = Callable[[str, str], Any]
 ProviderFactory = Callable[[str], AIProvider]
+
+
+def ai_age(conn: sqlite3.Connection) -> str | None:
+    value = _kv_get(conn, AGE_KEY)
+    return value if value in AGES else None
 
 
 def moodle_token_name(site_id: str) -> str:
@@ -125,6 +185,32 @@ def _kv_set(conn: sqlite3.Connection, key: str, value: str) -> None:
 def _kv_delete(conn: sqlite3.Connection, key: str) -> None:
     conn.execute("DELETE FROM kv WHERE key=?", (key,))
     conn.commit()
+
+
+def replan_safely(conn: sqlite3.Connection, now: int) -> None:
+    """Rehace el plan; si falla, queda en el log y el pedido del usuario sigue."""
+    try:
+        replan(conn, now)
+    except Exception:  # noqa: BLE001 - el plan nunca hace fallar otra cosa
+        log.warning("No se pudo rehacer el plan", exc_info=True)
+
+
+def refresh_plan_throttled(conn: sqlite3.Connection, now: int) -> None:
+    """Marca hechas las sesiones según las respuestas y rehace el plan, como mucho cada 10 minutos."""
+    try:
+        last = _kv_get(conn, PLAN_REFRESH_KEY)
+        try:
+            last_at = int(last) if last is not None else None
+        except ValueError:
+            last_at = None  # un valor roto no frena el plan para siempre
+        if last_at is not None and 0 <= now - last_at < PLAN_REFRESH_EVERY_S:
+            return
+        _kv_set(conn, PLAN_REFRESH_KEY, str(now))
+        mark_done_from_answers(conn, now)
+    except Exception:  # noqa: BLE001
+        log.warning("No se pudo actualizar el plan con las respuestas", exc_info=True)
+        return
+    replan_safely(conn, now)
 
 
 class Jobs:
@@ -203,6 +289,16 @@ class Jobs:
         self.run_reserved(sync=False)
         return True
 
+    def ai_allowed(self) -> bool:
+        """Solo con la respuesta "adult": menor o sin responder, la IA no se usa."""
+        return age_is_adult(self.db_path, timeout_s=BUSY_TIMEOUT_MS / 1000)
+
+    def provider(self, key: str) -> AIProvider:
+        """El único camino hacia el proveedor: revisa la puerta de edad en cada llamada."""
+        if not self.ai_allowed():
+            raise AIBlocked("la IA no está habilitada")
+        return GatedProvider(self.ai_provider_factory(key), self.ai_allowed)  # type: ignore[return-value]
+
     def seconds_until_due(self) -> float:
         """Segundos hasta la próxima sincronización automática (0 si ya toca)."""
         conn = self.connect()
@@ -220,6 +316,8 @@ class Jobs:
             if sync:
                 self._sync(conn)
             self._process(conn)
+            # Material nuevo o exámenes del campus cambian el plan.
+            refresh_plan_throttled(conn, int(self.clock()))
         finally:
             conn.close()
 
@@ -250,12 +348,18 @@ class Jobs:
 
     def _process(self, conn: sqlite3.Connection) -> None:
         self.retry_at = None
+        # Menor o sin responder: la clave guardada ni se lee.
+        if ai_age(conn) != "adult":
+            return
         key = get_secret(GEMINI_KEY)
         # Con la clave rechazada se espera a que el usuario cargue otra.
         if not key or _kv_get(conn, STOP_KEY) == "auth":
             return
         try:
-            finished = process_pending(conn, self.ai_provider_factory(key))
+            finished = process_pending(conn, self.provider(key))
+        except AIBlocked:
+            # Pasó a "menor" a mitad de la corrida: lo que quedó sigue pendiente.
+            return
         except Exception as exc:  # noqa: BLE001
             log.warning("Falló el procesamiento (%s)", type(exc).__name__)
             return
@@ -267,6 +371,7 @@ class Jobs:
         - Gemini saturado: espera creciente (5, 10, 20 min, tope 30), que vuelve a
           empezar cuando sale bien un material.
         - Cuota del día: cuando vuelve el primer modelo (kv "ai_quota_resets_at").
+        - Tope de YouTube del día: a la medianoche del Pacífico, como la cuota (el mismo kv).
         - Cuota por minuto (sin hora de vuelta) o cualquier otro caso: nada; se espera
           a la próxima sincronización, como siempre.
         """
@@ -281,7 +386,7 @@ class Jobs:
             self.retry_at = now + wait
             return
         self._retries = 0
-        resets_at = _kv_get(conn, QUOTA_RESET_KEY) if reason == "quota" else None
+        resets_at = _kv_get(conn, QUOTA_RESET_KEY) if reason in RESETTING_REASONS else None
         if resets_at is not None:
             try:
                 # Con un piso: una hora de vuelta ya pasada no reintenta sin parar.
@@ -374,12 +479,27 @@ class AIKeyIn(BaseModel):
 
 class QuizIn(BaseModel):
     topic_id: int | None = None
+    topic_ids: list[int] | None = Field(None, max_length=50)   # varios temas mezclados
+    session_id: int | None = None        # sesión del plan: repaso mezclado y después foco
     weakest: bool = False
+    size: int = Field(10, ge=1, le=50)
+
+
+# Modos que se responden desde la práctica (el simulacro tiene su ruta; pretest y probe, la suya).
+PRACTICE_MODES = ("mcq", "mcq_think_first", "typed", "typed_then_mcq")
 
 
 class AnswerIn(BaseModel):
     question_id: int
-    chosen_index: int
+    chosen_index: StrictInt | None = None   # posición tocada en `shown_order`; None si es escrita
+    typed_text: str | None = Field(None, max_length=200)
+    # 0 adiviné, 1 me parece, 2 seguro. La forma vieja (sin confianza) se acepta durante una
+    # versión y cuenta como "Me parece".
+    confidence: StrictInt | None = None
+    mode: str = "mcq"
+    latency_ms: StrictInt | None = None
+    options_revealed_ms: StrictInt | None = None
+    shown_order: list[StrictInt] | None = None
 
 
 def _quiz_course(conn: sqlite3.Connection, topic_id: int | None, now: int) -> int | None:
@@ -397,6 +517,122 @@ def _quiz_course(conn: sqlite3.Connection, topic_id: int | None, now: int) -> in
         " WHERE q.verified = 1 AND q.retired = 0"
     ).fetchone()
     return row[0]
+
+
+class ExamIn(BaseModel):
+    course_id: int
+    name: str
+    at: int
+    topic_ids: list[int] = []
+    max_grade: float | None = None
+
+
+class ExamPatchIn(BaseModel):
+    """Solo cambian los campos que vienen en el pedido."""
+    name: str | None = None
+    at: int | None = None
+    max_grade: float | None = None
+    time_limit_s: int | None = None
+    topic_ids: list[int] | None = None
+
+
+class SlotIn(BaseModel):
+    course_id: int
+    weekday: int
+    start_min: int
+    end_min: int
+    place: str | None = None
+
+
+class PlanSettingsIn(BaseModel):
+    availability: list[int] | None = None  # minutos por día, de lunes (0) a domingo (6)
+    study_start_min: int | None = None
+
+
+class MockStartIn(BaseModel):
+    exam_id: int
+    predicted_grade: float | None = None
+
+
+class MockAnswerIn(BaseModel):
+    index: int | None = None
+    typed: str | None = Field(None, max_length=200)
+
+
+MAX_MOCK_ANSWERS = 50   # un simulacro tiene a lo sumo 20 preguntas
+
+
+class MockFinishIn(BaseModel):
+    # Cada respuesta: el índice de la opción (así era antes), {"index": n} o {"typed": "texto"}.
+    answers: dict[int, int | MockAnswerIn] = Field(default_factory=dict, max_length=MAX_MOCK_ANSWERS)
+
+
+class ExamResultIn(BaseModel):
+    grade: float
+    max_grade: float | None = None
+
+
+class SettingsIn(BaseModel):
+    reminders: bool | None = None
+    age: str | None = None
+    # Any: se valida a mano para responder 400 (no 422) si no es true/false.
+    allow_download: Any = None
+
+
+def _sort_key(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().casefold()
+
+
+def _local_midnight(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, tzinfo=TZ).timestamp())
+
+
+def week_monday(epoch: int) -> date:
+    """Lunes local de la semana que contiene `epoch`."""
+    day = datetime.fromtimestamp(epoch, TZ).date()
+    return day - timedelta(days=day.weekday())
+
+
+def agenda_week(conn: sqlite3.Connection, monday: date, now: int) -> dict:
+    """Los 7 días locales desde `monday` con clases, exámenes, entregas, eventos y sesiones por hora."""
+    start = _local_midnight(monday)
+    end = _local_midnight(monday + timedelta(days=7))
+    items: list[dict] = []
+    for o in occurrences(conn, start, end):
+        items.append({"kind": "class", "id": o.slot_id, "title": o.course or "Clase", "course": o.course,
+                      "starts_at": o.starts_at, "ends_at": o.ends_at, "place": o.place})
+    for e in conn.execute(
+        "SELECT e.id, e.name, e.opens_at, COALESCE(c.fullname, '') AS course FROM exam e "
+        "LEFT JOIN course c ON c.id = e.course_id WHERE e.opens_at >= ? AND e.opens_at < ?",
+        (start, end),
+    ):
+        items.append({"kind": "exam", "id": e["id"], "title": e["name"] or "", "course": e["course"],
+                      "starts_at": e["opens_at"], "ends_at": e["opens_at"] + EXAM_MIN * 60})
+    for d in conn.execute(
+        "SELECT d.id, d.kind, d.name, d.due_at, d.url, COALESCE(c.fullname, '') AS course "
+        "FROM deadline d LEFT JOIN course c ON c.id = d.course_id WHERE d.due_at >= ? AND d.due_at < ?",
+        (start, end),
+    ):
+        items.append({"kind": "event" if d["kind"] == "event" else "deadline", "id": d["id"],
+                      "title": d["name"] or "", "course": d["course"], "starts_at": d["due_at"], "url": d["url"]})
+    for p in sessions(conn, start, end):
+        # `title` dice qué se hace en la sesión; `session_kind` y `topic_ids`, con qué temas.
+        items.append({"kind": "session", "id": p.id, "title": p.label, "course": p.course,
+                      "starts_at": p.starts_at, "ends_at": p.starts_at + p.minutes * 60,
+                      "topic_id": p.topic_id, "topic": p.topic, "done": p.done,
+                      "session_kind": p.kind, "topic_ids": p.topic_ids, "exam_id": p.exam_id,
+                      "review_minutes": p.review_minutes, "focus_minutes": p.focus_minutes})
+
+    days = [{"date": (monday + timedelta(days=i)).isoformat(), "items": []} for i in range(7)]
+    for item in sorted(items, key=lambda i: i["starts_at"]):
+        # Día local: lo que pasa a las 22:00 en Buenos Aires ya es el día siguiente en UTC.
+        index = (datetime.fromtimestamp(item["starts_at"], TZ).date() - monday).days
+        days[index]["items"].append(item)
+
+    # ¿Llegás?: los exámenes de esta semana o, si no hay, el próximo.
+    health = plan_health(conn, now)
+    in_week = [h for h in health if start <= h.at < end]
+    return {"days": days, "health": in_week or health[:1]}
 
 
 def _campus_url(conn: sqlite3.Connection) -> str | None:
@@ -466,12 +702,17 @@ def create_app(
     @app.get("/api/state")
     def state(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
         site_id = _kv_get(conn, SITE_KEY)
-        stop_reason = _kv_get(conn, STOP_KEY)
+        age = ai_age(conn)
+        # Un menor no usa la IA: su clave (si había) no cuenta ni se muestra.
+        stop_reason = None if age == "minor" else _kv_get(conn, STOP_KEY)
+        needs_key = not get_secret(GEMINI_KEY) or stop_reason == "auth"
         if not site_id:
             step = "facultad"
         elif not get_secret(moodle_token_name(site_id)):
             step = "login"
-        elif not get_secret(GEMINI_KEY) or stop_reason == "auth":
+        elif age is None and needs_key:
+            step = "edad"
+        elif age == "adult" and needs_key:
             step = "ia"
         else:
             step = "listo"
@@ -479,10 +720,11 @@ def create_app(
         resets_at = _kv_get(conn, QUOTA_RESET_KEY)
         return {
             "step": step,
+            "age": age,
             "site_id": site_id,
             "ai_stop_reason": stop_reason,
             # Con cuota agotada: cuándo vuelve el primer modelo (epoch), si se sabe.
-            "ai_quota_resets_at": int(resets_at) if resets_at and stop_reason == "quota" else None,
+            "ai_quota_resets_at": int(resets_at) if resets_at and stop_reason in RESETTING_REASONS else None,
             "syncing": jobs.running,
             "last_sync_at": int(last) if last else None,
             "last_sync_error": _kv_get(conn, SYNC_ERROR_KEY),
@@ -555,13 +797,21 @@ def create_app(
     @app.post("/api/ai")
     def set_ai_key(body: AIKeyIn, background: BackgroundTasks,
                    conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        age = ai_age(conn)
+        if age == "minor":
+            raise HTTPException(403, MINOR_AI_TEXT)
+        if age is None:
+            raise HTTPException(403, AGE_PENDING_TEXT)
         if body.provider != "gemini":
             raise HTTPException(400, "proveedor no soportado")
         key = body.key.strip()
         if not key:
             raise HTTPException(400, "falta la clave")
         try:
-            jobs.ai_provider_factory(key).check_key()
+            jobs.provider(key).check_key()
+        except AIBlocked:
+            # La edad cambió a "menor" justo después de la revisión de arriba.
+            raise HTTPException(403, MINOR_AI_TEXT) from None
         except (AIAuthError, AIFormatError):
             # Un pedido inválido tampoco prueba que la clave sirva.
             raise HTTPException(400, "la clave fue rechazada") from None
@@ -607,6 +857,16 @@ def create_app(
             " JOIN material m ON m.section_id = s.id"
             " WHERE s.visible = 1 ORDER BY s.course_id, s.num, m.id"
         )
+        # Temas de cada clase y cuántas preguntas se pueden practicar de ellos ("Practicar esta clase").
+        topics_of: dict[int, list[int]] = {}
+        for r in conn.execute("SELECT material_id, topic_id FROM material_topic ORDER BY topic_id"):
+            topics_of.setdefault(r["material_id"], []).append(r["topic_id"])
+        questions_in = {
+            r["topic_id"]: r["n"]
+            for r in conn.execute(
+                "SELECT topic_id, COUNT(*) AS n FROM question WHERE verified = 1 AND retired = 0 GROUP BY topic_id"
+            )
+        }
         for r in rows:
             section = sections.setdefault(r["section_id"], {
                 "id": r["section_id"], "course_id": r["course_id"], "course": r["course"],
@@ -618,6 +878,8 @@ def create_app(
                 "youtube_id": r["ref"] if r["kind"] == "youtube" else None,
                 "campus_url": (f"{site_url}/mod/page/view.php?id={r['cmid']}"
                                if site_url and r["cmid"] else None),
+                "topic_ids": topics_of.get(r["id"], []),
+                "questions": sum(questions_in.get(t, 0) for t in topics_of.get(r["id"], [])),
             })
         return list(sections.values())
 
@@ -632,19 +894,47 @@ def create_app(
     @app.post("/api/quiz")
     def quiz(body: QuizIn, conn: sqlite3.Connection = Depends(get_conn)):
         now = int(time.time())
-        course_id = _quiz_course(conn, body.topic_id, now)
+        if body.session_id is not None:
+            try:
+                return build_session_quiz(conn, body.session_id, size=body.size, now=now)
+            except LookupError:
+                raise HTTPException(404, "sesión inexistente") from None
+        topic_ids = [body.topic_id] if body.topic_id is not None else body.topic_ids or None
+        if topic_ids is not None and len(topic_ids) > 1:
+            marks = ",".join("?" * len(set(topic_ids)))
+            rows = conn.execute(f"SELECT DISTINCT id, course_id FROM topic WHERE id IN ({marks})",
+                                sorted(set(topic_ids))).fetchall()
+            if len(rows) < len(set(topic_ids)):
+                raise HTTPException(404, "tema inexistente")
+            if len({r["course_id"] for r in rows}) > 1:
+                raise HTTPException(400, "Elegí temas de una sola materia")
+        course_id = _quiz_course(conn, topic_ids[0] if topic_ids else None, now)
         if course_id is None:
             return []
-        return build_quiz(conn, course_id, topic_id=body.topic_id, weakest=body.weakest, now=now)
+        return build_quiz(conn, course_id, topic_ids=topic_ids, weakest=body.weakest, size=body.size, now=now)
 
     @app.post("/api/answer")
     def answer(body: AnswerIn, conn: sqlite3.Connection = Depends(get_conn)):
+        now = int(time.time())
+        if body.mode not in PRACTICE_MODES:
+            raise HTTPException(400, f"Modo de respuesta desconocido: {body.mode}")
         try:
-            return record_answer(conn, body.question_id, body.chosen_index, int(time.time()))
+            feedback = record_answer(
+                conn, body.question_id, body.chosen_index, now,
+                confidence=UNSURE if body.confidence is None else body.confidence,
+                mode=body.mode, latency_ms=body.latency_ms, option_order=body.shown_order,
+                typed_text=body.typed_text, options_revealed_ms=body.options_revealed_ms,
+            )
         except LookupError:
             raise HTTPException(404, "pregunta no disponible") from None
-        except ValueError:
-            raise HTTPException(400, "opción fuera de rango") from None
+        except GradingUnavailable:
+            # Worker caído o lento: no es culpa de lo escrito y no se registró nada.
+            raise HTTPException(503, "No pude corregir ahora, probá de nuevo") from None
+        except ValueError as exc:
+            # Incluye la respuesta escrita ilegible ("No pude leer la expresión"): no se registró nada.
+            raise HTTPException(400, str(exc)) from None
+        refresh_plan_throttled(conn, now)
+        return feedback
 
     @app.post("/api/question/{question_id}/retire")
     def retire(question_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
@@ -658,6 +948,263 @@ def create_app(
         if conn.execute("SELECT 1 FROM question WHERE id=?", (question_id,)).fetchone() is None:
             raise HTTPException(404, "pregunta inexistente")
         unretire_question(conn, question_id)
+        return {"ok": True}
+
+    # --- Agenda, exámenes, horarios, plan, simulacro y calendario (datos locales) ----------------
+
+    @app.get("/api/agenda")
+    def agenda(week_start: int | None = None, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        now = int(time.time())
+        try:
+            # Cualquier momento de la semana se lleva a su lunes 00:00 local.
+            monday = week_monday(now if week_start is None else week_start)
+        except (OverflowError, OSError, ValueError):
+            raise HTTPException(400, "Semana inválida") from None
+        return agenda_week(conn, monday, now)
+
+    @app.get("/api/plan/health")
+    def health(conn: sqlite3.Connection = Depends(get_conn)):
+        return plan_health(conn, int(time.time()))
+
+    @app.get("/api/courses")
+    def courses(conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
+        rows = [{"id": r["id"], "name": r["name"] or ""}
+                for r in conn.execute("SELECT id, MIN(fullname) AS name FROM course GROUP BY id")]
+        # Orden alfabético sin que los acentos manden ("Álgebra" antes que "Física").
+        return sorted(rows, key=lambda c: (_sort_key(c["name"]), c["id"]))
+
+    def exam_exists(conn: sqlite3.Connection, exam_id: int) -> None:
+        if conn.execute("SELECT 1 FROM exam WHERE id = ?", (exam_id,)).fetchone() is None:
+            raise HTTPException(404, "El examen no existe")
+
+    @app.get("/api/exams")
+    def exams(conn: sqlite3.Connection = Depends(get_conn)):
+        return list_exams(conn, int(time.time()))
+
+    @app.post("/api/exams")
+    def create_exam(body: ExamIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            exam_id = create_manual_exam(conn, body.course_id, body.name, body.at, body.topic_ids,
+                                         body.max_grade)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        replan_safely(conn, int(time.time()))
+        return {"id": exam_id}
+
+    @app.put("/api/exams/{exam_id}")
+    def edit_exam(exam_id: int, body: ExamPatchIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        exam_exists(conn, exam_id)
+        fields = body.model_dump(exclude_unset=True)
+        if "topic_ids" in fields and fields["topic_ids"] is None:
+            fields["topic_ids"] = []  # sin lista: todos los temas del curso
+        try:
+            update_manual_exam(conn, exam_id, **fields)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        replan_safely(conn, int(time.time()))
+        return {"ok": True}
+
+    @app.post("/api/exams/{exam_id}/result")
+    def exam_result(exam_id: int, body: ExamResultIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            return set_exam_result(conn, exam_id, body.grade, int(time.time()), body.max_grade)
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/api/exams/{exam_id}/result/skip")
+    def exam_result_skip(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            skip_exam_result(conn, exam_id, int(time.time()))
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"ok": True}
+
+    @app.delete("/api/exams/{exam_id}")
+    def remove_exam(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        exam_exists(conn, exam_id)
+        try:
+            delete_manual_exam(conn, exam_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        replan_safely(conn, int(time.time()))
+        return {"ok": True}
+
+    @app.get("/api/exams/{exam_id}/topics")
+    def topics_of_exam(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
+        exam_exists(conn, exam_id)
+        ids = exam_topics(conn, exam_id)
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        names = {r["id"]: r["name"] for r in conn.execute(f"SELECT id, name FROM topic WHERE id IN ({marks})", ids)}
+        return [{"id": tid, "name": names[tid]} for tid in ids if tid in names]
+
+    def slot_exists(conn: sqlite3.Connection, slot_id: int) -> None:
+        if conn.execute("SELECT 1 FROM class_slot WHERE id = ?", (slot_id,)).fetchone() is None:
+            raise HTTPException(404, "El horario no existe")
+
+    @app.get("/api/schedule")
+    def schedule(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        return {"slots": list_slots(conn), "suggestions": suggestions(conn)}
+
+    @app.post("/api/schedule")
+    def create_slot(body: SlotIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            slot_id = add_slot(conn, body.course_id, body.weekday, body.start_min, body.end_min, body.place)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        replan_safely(conn, int(time.time()))
+        return {"id": slot_id}
+
+    @app.post("/api/schedule/suggestions/{course_id}/dismiss")
+    def dismiss_schedule_suggestion(course_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        if conn.execute("SELECT 1 FROM course WHERE id = ?", (course_id,)).fetchone() is None:
+            raise HTTPException(404, "El curso no existe")
+        dismiss_suggestion(conn, course_id)
+        return {"ok": True}
+
+    @app.put("/api/schedule/{slot_id}")
+    def edit_slot(slot_id: int, body: SlotIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        slot_exists(conn, slot_id)
+        try:
+            update_slot(conn, slot_id, body.course_id, body.weekday, body.start_min, body.end_min, body.place)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        replan_safely(conn, int(time.time()))
+        return {"ok": True}
+
+    @app.delete("/api/schedule/{slot_id}")
+    def remove_slot(slot_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        slot_exists(conn, slot_id)
+        delete_slot(conn, slot_id)
+        replan_safely(conn, int(time.time()))
+        return {"ok": True}
+
+    @app.get("/api/plan/settings")
+    def plan_settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        availability = get_availability(conn)
+        return {"availability": [availability[d] for d in range(7)],
+                "study_start_min": preferred_start_min(conn)}
+
+    @app.put("/api/plan/settings")
+    def save_plan_settings(body: PlanSettingsIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        # Todo se valida antes de escribir: un pedido inválido no deja nada a medias.
+        if body.availability is not None and len(body.availability) != 7:
+            raise HTTPException(400, "La disponibilidad tiene que traer los 7 días")
+        if body.study_start_min is not None and not 0 <= body.study_start_min < 1440:
+            raise HTTPException(400, "La hora preferida tiene que estar entre 0 y 1439 minutos")
+        if body.availability is not None:
+            try:
+                set_availability(conn, dict(enumerate(body.availability)))
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from None
+        if body.study_start_min is not None:
+            _kv_set(conn, STUDY_START_KEY, str(body.study_start_min))
+        replan_safely(conn, int(time.time()))
+        return {"ok": True}
+
+    @app.post("/api/mock/start")
+    def mock_start(body: MockStartIn, conn: sqlite3.Connection = Depends(get_conn)):
+        # NotEnoughQuestions hereda de ValueError: va primero.
+        try:
+            return start_mock(conn, body.exam_id, int(time.time()), body.predicted_grade)
+        except NotEnoughQuestions:
+            raise HTTPException(409, NOT_ENOUGH_TEXT) from None
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/api/mock/{attempt_id}/finish")
+    def mock_finish(attempt_id: int, body: MockFinishIn, conn: sqlite3.Connection = Depends(get_conn)):
+        now = int(time.time())
+        try:
+            answers = {
+                qid: ans.model_dump(exclude_none=True) if isinstance(ans, MockAnswerIn) else ans
+                for qid, ans in body.answers.items()
+            }
+            result = finish_mock(conn, attempt_id, answers, now)
+        except NotEnoughQuestions:
+            raise HTTPException(409, NOT_ENOUGH_TEXT) from None
+        except LookupError:
+            raise HTTPException(404, "El simulacro no existe") from None
+        except GradingUnavailable:
+            # Worker caído o lento: no se entregó nada, se puede reintentar.
+            raise HTTPException(503, "No pude corregir ahora, probá de nuevo") from None
+        except ValueError as exc:
+            # finish_mock deshace todo al fallar: si quedó entregado, es porque ya lo estaba.
+            row = conn.execute("SELECT finished_at FROM mock_attempt WHERE id = ?", (attempt_id,)).fetchone()
+            if row is not None and row["finished_at"] is not None:
+                raise HTTPException(409, "Este simulacro ya terminó") from None
+            raise HTTPException(400, str(exc)) from None
+        refresh_plan_throttled(conn, now)
+        return result
+
+    @app.get("/api/mock/{attempt_id}")
+    def mock_read(attempt_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+        """El resultado de un simulacro ya entregado (si una entrega se repite, se lee de acá)."""
+        try:
+            return mock_result(conn, attempt_id)
+        except LookupError:
+            raise HTTPException(404, "El simulacro no existe") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @app.get("/api/calendar.ics")
+    def calendar(conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+        return Response(
+            build_ics(conn, int(time.time())),
+            media_type="text/calendar; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="estudia.ics"'},
+        )
+
+    @app.get("/api/export/anki.apkg")
+    def export_anki(course_id: int | None = None, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+        try:
+            data = build_apkg(conn, course_id)
+        except LookupError:
+            raise HTTPException(404, "No hay preguntas para exportar") from None
+        name = None
+        if course_id is not None:
+            row = conn.execute("SELECT MIN(fullname) AS n FROM course WHERE id = ?", (course_id,)).fetchone()
+            name = row["n"]
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="estudia-{course_slug(name or "todo")}.apkg"'},
+        )
+
+    @app.get("/api/settings")
+    def settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        return {"reminders": reminders_enabled(conn), "age": ai_age(conn),
+                "allow_download": download_allowed(conn)}
+
+    @app.put("/api/settings")
+    def save_settings(body: SettingsIn, background: BackgroundTasks,
+                      conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        if body.reminders is None and body.age is None and body.allow_download is None:
+            raise HTTPException(400, "no hay nada que guardar")
+        if body.age is not None and body.age not in AGES:
+            raise HTTPException(400, "la edad tiene que ser adult o minor")
+        if body.allow_download is not None and not isinstance(body.allow_download, bool):
+            raise HTTPException(400, "allow_download tiene que ser true o false")
+        if body.allow_download is not None:
+            _kv_set(conn, ALLOW_DOWNLOAD_KEY, "1" if body.allow_download else "0")
+            # Con la descarga prendida, los videos que pedían un enlace público se
+            # pueden preparar: vuelven a la cola.
+            if body.allow_download and retry_needs_link(conn):
+                start_jobs(background)
+        if body.reminders is not None:
+            _kv_set(conn, REMINDERS_KEY, "1" if body.reminders else "0")
+        if body.age is not None:
+            _kv_set(conn, AGE_KEY, body.age)
+            if body.age == "adult":
+                # Responder reanuda el procesamiento que estaba en pausa.
+                start_jobs(background)
         return {"ok": True}
 
     dist = web_dist if web_dist is not None else web_dist_dir()

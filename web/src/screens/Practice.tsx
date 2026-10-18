@@ -1,24 +1,51 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, type Feedback, type QuizItem, type QuizParams } from "../api";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  ApiError,
+  api,
+  type AnswerMode,
+  type Confidence,
+  type Feedback,
+  type QuizItem,
+  type QuizParams,
+  type SessionInfo,
+} from "../api";
 import { formatTimestamp, keepMath, plural, tidy } from "../format";
-import { Button, Label, Notice } from "../ui";
+import { Button, Label, Notice, TypedField } from "../ui";
 
 const UNDO_MS = 5000;
+/** Enter no saltea la corrección antes de este tiempo: primero hay que leerla. */
+export const FEEDBACK_MIN_MS = 1500;
+
+const RELEARN_NOTE = "La sabés cuando la acertás en tres días distintos.";
+const MIX_NOTE =
+  "Mezclamos temas a propósito: se siente más difícil, pero en el parcial vas a tener que reconocer qué método va.";
 
 interface Props {
   params: QuizParams;
+  /** Si la práctica es una sesión del plan: para el encabezado de cada fase. */
+  session?: SessionInfo;
   onExit: () => void;
 }
 
 /** Pregunta con sus opciones en el orden en que se muestran (`order[i]` = índice original). */
 interface Shown extends QuizItem {
   order: number[];
+  /** Distingue la misma pregunta cuando vuelve al final de la sesión. */
+  key: number;
 }
 
 interface Result {
   item: Shown;
   correct: boolean;
 }
+
+const CONFIDENCE: { value: Confidence; label: string; key: string }[] = [
+  { value: 2, label: "Seguro", key: "S" },
+  { value: 1, label: "Me parece", key: "M" },
+  { value: 0, label: "Adiviné", key: "A" },
+];
+
+let nextKey = 0;
 
 function shuffled(length: number): number[] {
   const order = Array.from({ length }, (_, i) => i);
@@ -31,30 +58,70 @@ function shuffled(length: number): number[] {
 
 /** Cada intento mezcla las opciones de nuevo, también al repetir lo fallado. */
 function withShuffledOptions(quiz: QuizItem[]): Shown[] {
-  return quiz.map((q) => ({ ...q, order: shuffled(q.options.length) }));
+  return quiz.map((q) => ({ ...q, order: shuffled(q.options.length), key: nextKey++ }));
 }
 
-export default function Practice({ params, onExit }: Props) {
+/** Avisos que se explican una sola vez. Sin almacenamiento, se muestran cada vez. */
+function firstTime(name: string): boolean {
+  try {
+    return window.localStorage.getItem(`estudia.seen.${name}`) === null;
+  } catch {
+    return true;
+  }
+}
+
+function markSeen(name: string) {
+  try {
+    window.localStorage.setItem(`estudia.seen.${name}`, "1");
+  } catch {
+    // sin almacenamiento: no pasa nada
+  }
+}
+
+export default function Practice({ params, session, onExit }: Props) {
   const [items, setItems] = useState<Shown[] | null>(null);
   const [index, setIndex] = useState(0);
-  /** Índice original de la opción elegida. */
+  /** Las opciones están a la vista (en "pensalo primero" y en las escritas, recién al pedirlas). */
+  const [revealed, setRevealed] = useState(true);
+  /** Índice original de la opción marcada, esperando la confianza. */
   const [chosen, setChosen] = useState<number | null>(null);
+  const [typed, setTyped] = useState("");
+  /** "Corregir" ya se tocó: falta la confianza. */
+  const [typedReady, setTypedReady] = useState(false);
+  const [typedError, setTypedError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [answeredText, setAnsweredText] = useState<string | null>(null);
+  const [canSkip, setCanSkip] = useState(false);
+  const [relearnNote, setRelearnNote] = useState(false);
+  const [mixNote, setMixNote] = useState(false);
   const [results, setResults] = useState<Result[]>([]);
   const [reported, setReported] = useState<number[]>([]);
   const [undo, setUndo] = useState<Shown | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [classTitles, setClassTitles] = useState<Map<string, string>>(new Map());
+  const shownAt = useRef(Date.now());
+  const revealedMs = useRef<number | null>(null);
+  const feedbackRef = useRef<HTMLElement>(null);
+  const confidenceRef = useRef<HTMLDivElement>(null);
+  const typedRef = useRef<HTMLInputElement>(null);
+
+  const item = items?.[index];
+  const finished = items !== null && index >= items.length;
+  const typedMode = item?.format === "typed" && !revealed;
 
   const start = useCallback((quiz: QuizItem[]) => {
-    setItems(withShuffledOptions(quiz));
+    const shown = withShuffledOptions(quiz);
+    setItems(shown);
     setIndex(0);
-    setChosen(null);
     setFeedback(null);
     setResults([]);
     setReported([]);
     setUndo(null);
+    if (shown.some((q) => q.phase === "review") && firstTime("mix")) {
+      setMixNote(true);
+      markSeen("mix");
+    }
   }, []);
 
   useEffect(() => {
@@ -88,6 +155,24 @@ export default function Practice({ params, onExit }: Props) {
     };
   }, []);
 
+  // Cada pregunta nueva empieza de cero (en el mismo render, para que no se vean las opciones
+  // de "pensalo primero" ni un instante): opciones según el formato, nada marcado, reloj en cero.
+  const [stateFor, setStateFor] = useState<number | undefined>(undefined);
+  if (item?.key !== stateFor) {
+    setStateFor(item?.key);
+    setRevealed(item?.format !== "think_first" && item?.format !== "typed");
+    setChosen(null);
+    setTyped("");
+    setTypedReady(false);
+    setTypedError(null);
+    setAnsweredText(null);
+  }
+  const itemKey = item?.key;
+  useEffect(() => {
+    shownAt.current = Date.now();
+    revealedMs.current = null;
+  }, [itemKey]);
+
   // El aviso de "Deshacer" dura unos segundos.
   useEffect(() => {
     if (!undo) return;
@@ -95,33 +180,100 @@ export default function Practice({ params, onExit }: Props) {
     return () => window.clearTimeout(timer);
   }, [undo]);
 
-  const item = items?.[index];
-  const finished = items !== null && index >= items.length;
+  // La corrección se lee antes de seguir: Enter recién vale pasado un momento.
+  useEffect(() => {
+    setCanSkip(false);
+    if (!feedback) return;
+    feedbackRef.current?.focus();
+    const timer = window.setTimeout(() => setCanSkip(true), FEEDBACK_MIN_MS);
+    return () => window.clearTimeout(timer);
+  }, [feedback]);
 
-  const choose = useCallback(
-    async (original: number) => {
-      if (!item || feedback || busy) return;
-      setBusy(true);
+  const reveal = useCallback(() => {
+    if (!item || revealed) return;
+    revealedMs.current = Date.now() - shownAt.current;
+    setRevealed(true);
+    setTypedReady(false);
+    setTypedError(null);
+  }, [item, revealed]);
+
+  const pick = useCallback(
+    (original: number) => {
+      if (!item || feedback || busy || !revealed) return;
       setChosen(original);
       setError(null);
+    },
+    [item, feedback, busy, revealed],
+  );
+
+  const checkTyped = useCallback(() => {
+    if (!typed.trim()) return;
+    setTypedError(null);
+    setTypedReady(true);
+    // El foco va a la confianza: así S, M o A responden desde el teclado.
+    window.setTimeout(() => confidenceRef.current?.focus(), 0);
+  }, [typed]);
+
+  const send = useCallback(
+    async (confidence: Confidence) => {
+      if (!item || feedback || busy) return;
+      const typing = item.format === "typed" && !revealed;
+      if (typing ? !typedReady : chosen === null) return;
+      let mode: AnswerMode = "mcq";
+      if (item.format === "typed") mode = typing ? "typed" : "typed_then_mcq";
+      else if (item.format === "think_first") mode = "mcq_think_first";
+      setBusy(true);
+      setError(null);
       try {
-        const fb = await api.answer(item.question_id, original);
+        const fb = await api.answer({
+          question_id: item.question_id,
+          chosen_index: typing ? null : item.order.indexOf(chosen!),
+          typed_text: typing ? typed : null,
+          confidence,
+          mode,
+          latency_ms: Date.now() - shownAt.current,
+          options_revealed_ms: mode === "mcq_think_first" ? revealedMs.current : null,
+          shown_order: typing ? [] : item.order,
+        });
         setFeedback(fb);
-        setResults((r) => [...r, { item, correct: fb.correct }]);
-      } catch {
-        setChosen(null);
-        setError("No se pudo guardar la respuesta. Probá de nuevo.");
+        setAnsweredText(typing ? typed : null);
+        setResults((r) => (r.some((x) => x.item.question_id === item.question_id) ? r : [...r, { item, correct: fb.correct }]));
+        if (fb.requeue) {
+          // Vuelve al final de la sesión, con las opciones mezcladas de nuevo.
+          setItems((list) => [...list!, ...withShuffledOptions([item])]);
+        }
+        if (fb.relearn_progress && firstTime("relearn")) {
+          setRelearnNote(true);
+          markSeen("relearn");
+        } else {
+          setRelearnNote(false);
+        }
+      } catch (err) {
+        if (typing && err instanceof ApiError && (err.status === 400 || err.status === 503)) {
+          // No se registró: se corrige el texto y se vuelve a intentar, sin gastar el intento.
+          setTypedReady(false);
+          setTypedError(
+            err.status === 503
+              ? "No pude corregir ahora, probá de nuevo."
+              : err.detail.startsWith("No pude leer")
+                ? `${err.detail}. Probá escribirlo de otra forma.`
+                : `${err.detail}.`,
+          );
+          window.setTimeout(() => typedRef.current?.focus(), 0);
+        } else {
+          setError("No se pudo guardar la respuesta. Probá de nuevo.");
+        }
       } finally {
         setBusy(false);
       }
     },
-    [item, feedback, busy],
+    [item, feedback, busy, revealed, typedReady, chosen, typed],
   );
 
   const next = useCallback(() => {
-    setChosen(null);
     setFeedback(null);
     setError(null);
+    setRelearnNote(false);
     setIndex((i) => i + 1);
   }, []);
 
@@ -135,7 +287,6 @@ export default function Practice({ params, onExit }: Props) {
       setItems((list) => list!.filter((q) => q.question_id !== item.question_id));
       setResults((r) => r.filter((x) => x.item.question_id !== item.question_id));
       setReported((r) => [...r, item.question_id]);
-      setChosen(null);
       setFeedback(null);
       setUndo(item);
     } catch {
@@ -163,23 +314,33 @@ export default function Practice({ params, onExit }: Props) {
     }
   }
 
-  // Teclado: 1–4 en el orden en que se ven las opciones, Enter para seguir.
+  // Teclado: 1–4 en el orden en que se ven las opciones, S, M o A para la confianza, Enter para seguir.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (!item || event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.target instanceof HTMLElement && event.target.closest("input, textarea, select")) return;
-      const n = Number(event.key);
-      if (!feedback && n >= 1 && n <= item.order.length) {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest("input, textarea, select")) return;
+      if (!feedback) {
+        const n = Number(event.key);
+        if (revealed && n >= 1 && n <= item.order.length) {
+          event.preventDefault();
+          pick(item.order[n - 1]);
+          return;
+        }
+        const confidence = CONFIDENCE.find((c) => c.key === event.key.toUpperCase());
+        const waiting = item.format === "typed" && !revealed ? typedReady : chosen !== null;
+        if (confidence && waiting) {
+          event.preventDefault();
+          send(confidence.value);
+        }
+      } else if (event.key === "Enter" && !target?.closest("button, a, summary")) {
         event.preventDefault();
-        choose(item.order[n - 1]);
-      } else if (feedback && event.key === "Enter" && !(event.target instanceof HTMLButtonElement)) {
-        event.preventDefault();
-        next();
+        if (canSkip) next();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [item, feedback, choose, next]);
+  }, [item, feedback, revealed, typedReady, chosen, canSkip, pick, send, next]);
 
   if (items === null) return error ? <Notice>{error}</Notice> : null;
 
@@ -232,7 +393,7 @@ export default function Practice({ params, onExit }: Props) {
         )}
         <p className="mt-6 mb-8 text-muted">
           {failed.length
-            ? "Lo que fallaste vuelve en las próximas prácticas hasta que te salga dos veces seguidas."
+            ? "Lo que fallaste vuelve en los próximos días hasta que la aciertes en tres días distintos."
             : results.length
               ? "Todas bien."
               : ""}
@@ -249,37 +410,93 @@ export default function Practice({ params, onExit }: Props) {
 
   const current = item!;
   const number = `pregunta ${index + 1} de ${items.length}`;
+  const phase = phaseTitle(current, session);
+  const waitingConfidence = !feedback && (typedMode ? typedReady : chosen !== null);
 
   return (
     <div className="max-w-2xl">
-      <div className="mb-1 flex min-h-7 flex-wrap items-baseline justify-between gap-x-6 gap-y-1 sm:mb-4">
-        <Label className="whitespace-nowrap">
-          <span className="max-sm:hidden">{current.topic} · </span>
-          {number}
-        </Label>
-        {undoLine ?? (
-          <Button variant="quiet" className="shrink-0 text-sm" onClick={report} disabled={busy}>
-            Reportar error en la pregunta
-          </Button>
-        )}
-      </div>
-      <p className="mb-4 text-sm text-muted sm:hidden">{current.topic}</p>
+      {phase && <p className="mb-2 text-sm font-medium">{phase}</p>}
+      {mixNote && current.phase === "review" && <p className="mb-5 max-w-xl text-sm text-muted">{MIX_NOTE}</p>}
+      <Label className="mb-4">
+        {current.topic} · <span className="whitespace-nowrap">{number}</span>
+      </Label>
 
       <h1 className="math mb-7 text-[1.45rem] leading-snug tracking-[-0.01em]">{keepMath(current.stem)}</h1>
 
-      <ol className="space-y-2">
-        {current.order.map((original, shownAt) => (
-          <li key={original}>
-            <OptionButton
-              text={keepMath(current.options[original])}
-              number={shownAt + 1}
-              state={optionState(original, chosen, feedback)}
-              disabled={feedback !== null || busy}
-              onClick={() => choose(original)}
-            />
-          </li>
-        ))}
-      </ol>
+      {!revealed && current.format === "think_first" && (
+        <div>
+          <p className="mb-3 text-sm text-muted">Pensá la respuesta antes de ver las opciones.</p>
+          <Button variant="secondary" onClick={reveal}>
+            Ver opciones
+          </Button>
+        </div>
+      )}
+
+      {typedMode && !feedback && (
+        <div className="max-w-xl">
+          <TypedField
+            value={typed}
+            onChange={(value) => {
+              setTyped(value);
+              setTypedReady(false);
+              setTypedError(null);
+            }}
+            onSubmit={checkTyped}
+            // Con la confianza a la vista, "Corregir" ya se usó; vuelve si cambia lo escrito.
+            submitLabel={typedReady ? undefined : "Corregir"}
+            error={typedError}
+            disabled={busy}
+            inputRef={typedRef}
+          />
+          <Button variant="quiet" className="mt-4 text-sm" onClick={reveal} disabled={busy}>
+            Mostrame opciones
+          </Button>
+        </div>
+      )}
+
+      {revealed && (
+        <ol className="space-y-2">
+          {current.order.map((original, shownAt) => (
+            <li key={original}>
+              <OptionButton
+                text={keepMath(current.options[original])}
+                number={shownAt + 1}
+                state={optionState(original, chosen, feedback)}
+                disabled={feedback !== null || busy}
+                onClick={() => pick(original)}
+              />
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {waitingConfidence && (
+        <div
+          ref={confidenceRef}
+          tabIndex={-1}
+          role="group"
+          aria-label="¿Qué tan seguro estás?"
+          className="mt-6 outline-none"
+        >
+          <p className="mb-2 text-sm text-muted">¿Qué tan seguro estás?</p>
+          <div className="flex flex-wrap gap-2">
+            {CONFIDENCE.map((c) => (
+              <Button
+                key={c.value}
+                variant="secondary"
+                onClick={() => send(c.value)}
+                disabled={busy}
+                className="flex items-baseline gap-2"
+              >
+                {c.label}
+                <kbd className="font-sans text-xs font-normal text-faint [@media(pointer:coarse)]:hidden" aria-hidden>
+                  {c.key}
+                </kbd>
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {error && (
         <p role="alert" className="mt-4 text-sm text-bad">
@@ -287,36 +504,152 @@ export default function Practice({ params, onExit }: Props) {
         </p>
       )}
 
-      {feedback && (
-        <section className="reveal mt-8 border-t border-line pt-6">
-          <h2 className="math mb-2 text-[1.0625rem] font-semibold">Por qué es {keepMath(current.options[feedback.correct_index])}</h2>
-          <p className="math whitespace-pre-line text-[1.0625rem] leading-relaxed">{keepMath(feedback.explanation)}</p>
-          {feedback.common_error && (
-            <p className="math mt-4 text-[1.0625rem] leading-relaxed">
-              <span className="font-semibold">Error común:</span> {keepMath(feedback.common_error)}
-            </p>
-          )}
-          {feedback.youtube_id && (
-            <p className="mt-4 text-sm">
-              <a
-                href={sourceUrl(feedback.youtube_id, feedback.source_seconds)}
-                target="_blank"
-                rel="noreferrer"
-                className="underline decoration-line underline-offset-4 hover:decoration-ink"
-              >
-                {sourceText(classTitles.get(feedback.youtube_id), feedback.source_seconds)}
-              </a>
-            </p>
-          )}
-          <div className="mt-8">
-            <Button onClick={next} autoFocus>
-              {index + 1 < items.length ? "Siguiente" : "Ver resultado"}
+      {!feedback && (
+        <div className="mt-6 text-sm">
+          {undoLine ?? (
+            <Button variant="quiet" onClick={report} disabled={busy}>
+              Reportar un error
             </Button>
+          )}
+        </div>
+      )}
+
+      {feedback && (
+        <section ref={feedbackRef} tabIndex={-1} className="reveal mt-8 border-t border-line pt-6 outline-none">
+          {answeredText !== null && (
+            <p className="math mb-4">
+              Escribiste {keepMath(answeredText)}:{" "}
+              <span className={`font-semibold ${feedback.correct ? "text-ok" : "text-bad"}`}>
+                {feedback.correct ? "es correcta" : "no es correcta"}
+              </span>
+            </p>
+          )}
+          <FeedbackBody
+            feedback={feedback}
+            typed={answeredText !== null}
+            correctText={current.options[feedback.correct_index]}
+            source={
+              feedback.youtube_id && (
+                <p className="mt-4 text-sm">
+                  <a
+                    href={sourceUrl(feedback.youtube_id, feedback.source_seconds)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline decoration-line underline-offset-4 hover:decoration-ink"
+                  >
+                    {sourceText(classTitles.get(feedback.youtube_id), feedback.source_seconds)}
+                  </a>
+                </p>
+              )
+            }
+          />
+          {(feedback.next_label || feedback.relearn_progress) && (
+            <p className="mt-6 text-sm text-muted">
+              {[feedback.next_label, feedback.relearn_progress].filter(Boolean).join(" · ")}
+            </p>
+          )}
+          {relearnNote && <p className="mt-1 text-sm text-muted">{RELEARN_NOTE}</p>}
+          <div className="mt-8 flex flex-wrap items-baseline gap-x-6 gap-y-3">
+            <Button onClick={next}>{index + 1 < items.length ? "Siguiente" : "Ver resultado"}</Button>
+            {undoLine ?? (
+              <Button variant="quiet" className="text-sm" onClick={report} disabled={busy}>
+                Reportar un error
+              </Button>
+            )}
           </div>
         </section>
       )}
     </div>
   );
+}
+
+/** "Repaso mezclado · 10 min" y después "Foco: Límites · 40 min"; sin sesión, solo si hay mezcla. */
+function phaseTitle(item: Shown, session?: SessionInfo): string | null {
+  if (session) {
+    if (item.phase === "review") return `Repaso mezclado · ${session.review_minutes} min`;
+    return `Foco: ${session.topic} · ${session.focus_minutes} min`;
+  }
+  return item.phase === "review" ? "Repaso mezclado" : null;
+}
+
+/** La corrección según el resultado y la confianza. */
+function FeedbackBody({
+  feedback,
+  correctText,
+  typed,
+  source,
+}: {
+  feedback: Feedback;
+  correctText: string;
+  /** Respuesta escrita: la línea "Escribiste …" ya dice si es correcta. */
+  typed: boolean;
+  source: ReactNode;
+}) {
+  const why = (
+    <>
+      <h2 className="math mb-2 text-[1.0625rem] font-semibold">
+        {typed ? "Respuesta correcta: " : "Por qué es "}
+        {keepMath(correctText)}
+      </h2>
+      <p className="math whitespace-pre-line text-[1.0625rem] leading-relaxed">{keepMath(feedback.explanation)}</p>
+    </>
+  );
+  const commonError = feedback.common_error && (
+    <p className="math text-[1.0625rem] leading-relaxed">
+      <span className="font-semibold">Error común:</span> {keepMath(feedback.common_error)}
+    </p>
+  );
+
+  switch (feedback.feedback_style) {
+    case "alarm":
+      return (
+        <>
+          <p className="mb-4 font-semibold text-bad">Estabas seguro y era otra. Fijate bien por qué.</p>
+          {commonError && <div className="mb-5">{commonError}</div>}
+          {why}
+          {source}
+        </>
+      );
+    case "doubt":
+      return (
+        <>
+          <p className="mb-4 font-semibold text-ok">Bien, pero dudaste: leé por qué.</p>
+          {why}
+          {commonError && <div className="mt-4">{commonError}</div>}
+          {source}
+        </>
+      );
+    case "short":
+      return (
+        <>
+          <p className="mb-3 font-semibold text-ok">Correcto</p>
+          <details className="group">
+            <summary className="w-fit cursor-pointer list-none text-sm text-muted underline decoration-line underline-offset-4 hover:text-ink [&::-webkit-details-marker]:hidden">
+              <span className="group-open:hidden">Ver por qué</span>
+              <span className="hidden group-open:inline">Ocultar</span>
+            </summary>
+            <div className="mt-4">
+              {why}
+              {commonError && <div className="mt-4">{commonError}</div>}
+              {source}
+            </div>
+          </details>
+        </>
+      );
+    default:
+      return (
+        <>
+          {!typed && (
+            <p className={`mb-4 font-semibold ${feedback.correct ? "text-ok" : "text-bad"}`}>
+              {feedback.correct ? "Correcta, aunque adivinaste" : "No es correcta"}
+            </p>
+          )}
+          {why}
+          {commonError && <div className="mt-4">{commonError}</div>}
+          {source}
+        </>
+      );
+  }
 }
 
 type OptionState = "idle" | "picked" | "right" | "rightPicked" | "wrongPicked" | "faded";
@@ -330,7 +663,7 @@ function optionState(original: number, chosen: number | null, feedback: Feedback
 
 const OPTION_STYLES: Record<OptionState, string> = {
   idle: "border-line hover:bg-hover cursor-pointer",
-  picked: "border-ink",
+  picked: "border-ink cursor-pointer",
   right: "border-ok",
   rightPicked: "border-ok",
   wrongPicked: "border-bad",
@@ -340,10 +673,10 @@ const OPTION_STYLES: Record<OptionState, string> = {
 const OPTION_TAGS: Partial<Record<OptionState, [string, string]>> = {
   right: ["Correcta", "text-ok"],
   rightPicked: ["Tu respuesta, correcta", "text-ok"],
-  wrongPicked: ["Tu respuesta", "text-bad"],
+  wrongPicked: ["Tu respuesta, incorrecta", "text-bad"],
 };
 
-function OptionButton(props: {
+export function OptionButton(props: {
   text: string;
   number: number;
   state: OptionState;
@@ -356,6 +689,7 @@ function OptionButton(props: {
       type="button"
       onClick={props.onClick}
       disabled={props.disabled}
+      aria-pressed={props.state === "picked" ? true : props.state === "idle" ? false : undefined}
       className={`press flex w-full items-baseline gap-4 rounded-lg border px-4 py-3 text-left text-[1.0625rem] ${OPTION_STYLES[props.state]}`}
     >
       <span className="math min-w-0 flex-1">{props.text}</span>

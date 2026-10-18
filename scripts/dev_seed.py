@@ -9,6 +9,11 @@ Uso:
 La base va a una carpeta temporal y los secretos a un keyring en memoria. El
 campus y Gemini son dobles: "Actualizar" no sale a internet, y procesar una
 clase pendiente termina en el aviso de límite de Gemini.
+
+Con examen (lo normal) también siembra la agenda y el plan, para ver todas las pantallas:
+horarios de cursada (y una sugerencia de horario), entregas y un evento, un examen cargado a
+mano en 5 días (sesiones de repaso mezclado), un examen pasado sin nota ("¿Cómo te fue?"),
+disponibilidad, sesiones del plan (de foco y mezcladas) y un simulacro terminado.
 """
 from __future__ import annotations
 
@@ -16,7 +21,9 @@ import argparse
 import json
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import keyring
 import uvicorn
@@ -26,8 +33,13 @@ from estudia.ai.base import AIQuotaError
 from estudia.db import connect
 from estudia.secrets import set_secret
 from estudia.server.app import GEMINI_KEY, HOST, SITE_KEY, create_app, moodle_token_name
+from estudia.study.exams import create_manual_exam
+from estudia.study.mock_exam import finish_mock, start_mock
+from estudia.study.planner import replan, set_availability
+from estudia.study.schedule import add_slot
 
 SITE_ID = "utn-frba"
+TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 DAY = 86400
 
 
@@ -112,34 +124,37 @@ def seed(db_path: Path, *, with_exam: bool) -> None:
     conn = connect(db_path)
     conn.execute("INSERT INTO site VALUES (?, ?, 1, 'Estudiante de prueba')",
                  (SITE_ID, "https://aulasvirtuales.frba.utn.edu.ar"))
-    conn.execute("INSERT INTO course VALUES (4242, ?, 'Matemática - Ejemplo', 'MAT-EJ')", (SITE_ID,))
-    conn.executemany("INSERT INTO section VALUES (?, 4242, ?, ?, ?)", [
-        (10, 2, "UNIDAD 1: RECTAS Y FUNCIONES", 1),
-        (11, 3, "UNIDAD 2: POLINOMIOS", 1),
-        (12, 4, "UNIDAD 3: TRIGONOMETRÍA", 0),
+    conn.execute("INSERT INTO course VALUES (101, ?, 'Matemática', 'AM1')", (SITE_ID,))
+    conn.executemany("INSERT INTO section VALUES (?, 101, ?, ?, ?)", [
+        (10, 2, "NÚMEROS REALES, FUNCIÓN LINEAL Y CUADRÁTICA", 1),
+        (11, 3, "POLINOMIOS Y SISTEMAS DE ECUACIONES LINEALES", 1),
+        (12, 4, "TRIGONOMETRÍA", 0),
     ])
     conn.executemany(
         "INSERT INTO material(id, section_id, cmid, kind, title, ref, status, summary_md, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (1, 10, 501, "youtube", "Clase 1: Rectas.", "aaaaaaaaaa1", "done", SUMMARY_1, now),
-            (2, 10, 502, "youtube", "Clase 2: Paralelismo y perpendicularidad de rectas.", "aaaaaaaaaa2", "done", SUMMARY_2, now),
-            (3, 10, 503, "youtube", "Clase 3: Funciones cuadráticas.", "aaaaaaaaaa3", "pending", None, now),
+            (1, 10, 501, "youtube", "Video-clase 1: Rectas.", "dQw4w9WgXcQ", "done", SUMMARY_1, now),
+            (2, 10, 502, "youtube", "Video-clase 2: Paralelismo y perpendicularidad de rectas.", "M7lc1UVf-VE", "done", SUMMARY_2, now),
+            (3, 10, 503, "youtube", "Video-clase 3: Funciones cuadráticas.", "aqz-KE-bpKQ", "pending", None, now),
             (4, 11, 504, "page", "Guía de ejercicios: polinomios", None, "unsupported", None, now),
         ],
     )
-    conn.executemany("INSERT INTO topic VALUES (?, 4242, ?, ?)", [
+    conn.executemany("INSERT INTO topic VALUES (?, 101, ?, ?)", [
         (1, "funciones-lineales", "Funciones lineales y pendiente"),
         (2, "paralelismo", "Paralelismo y perpendicularidad"),
         (3, "cuadraticas", "Funciones cuadráticas"),
     ])
     conn.executemany("INSERT INTO material_topic VALUES (?, ?)", [(1, 1), (2, 2), (3, 3)])
+    # Con check_expr se pueden responder escribiendo (la 2 ya se acertó: sale como escrita).
+    checks = {2: "3", 3: "-2"}
     for i, (mat, topic, stem, options, correct, expl, err, sec) in enumerate(QUESTIONS, start=1):
         conn.execute(
             "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
-            " explanation, common_error, source_seconds, verified, dedupe_key)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-            (i, mat, topic, stem, json.dumps(options, ensure_ascii=False), correct, expl, err, sec, f"q{i}"),
+            " explanation, common_error, source_seconds, check_expr, verified, dedupe_key)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (i, mat, topic, stem, json.dumps(options, ensure_ascii=False), correct, expl, err, sec,
+             checks.get(i), f"q{i}"),
         )
     # Algo de práctica previa: tema 1 bastante bien, tema 2 flojo.
     conn.executemany("INSERT INTO answer(question_id, chosen_index, correct, at) VALUES (?, ?, ?, ?)", [
@@ -148,10 +163,51 @@ def seed(db_path: Path, *, with_exam: bool) -> None:
     ])
     if with_exam:
         opens = now + 21 * DAY
-        conn.execute("INSERT INTO exam VALUES (1, 4242, 600, 'PRIMER CUESTIONARIO', ?, ?, 1, 7200, 12)",
+        conn.execute("INSERT INTO exam(id, course_id, cmid, name, opens_at, closes_at, attempts, time_limit_s, "
+                     "max_grade) VALUES (1, 101, 600, 'PRIMER CUESTIONARIO', ?, ?, 1, 7200, 12)",
                      (opens, opens + 7 * DAY))
     conn.execute("INSERT INTO kv VALUES ('last_sync_at', ?)", (str(now - 2 * 3600),))
     conn.commit()
+    conn.close()
+    if with_exam:
+        seed_agenda(db_path, now)
+
+
+def seed_agenda(db_path: Path, now: int) -> None:
+    """Horarios, entregas, exámenes manuales, disponibilidad, plan y un simulacro terminado."""
+    conn = connect(db_path)
+    # Una materia más, sin horarios y con la hora en el nombre: aparece como sugerencia en Ajustes.
+    conn.execute("INSERT INTO course VALUES (30146, ?, 'Física I - 14:00 a 16:00 hs', 'FIS')", (SITE_ID,))
+    conn.commit()
+    add_slot(conn, 101, 0, 510, 630, "Aula 204")          # lunes 8:30 a 10:30
+    add_slot(conn, 101, 3, 1080, 1200, "Aula 112")        # jueves 18:00 a 20:00
+    add_slot(conn, 101, datetime.fromtimestamp(now, TZ).weekday(), 1290, 1380, "Zoom")  # hoy, 21:30 a 23
+    conn.executemany(
+        "INSERT INTO deadline(course_id, kind, ext_id, name, due_at, url) VALUES (101, ?, ?, ?, ?, ?)",
+        [
+            ("assign", 1, "Trabajo práctico 1: rectas", now + 2 * DAY,
+             "https://aulasvirtuales.frba.utn.edu.ar/mod/assign/view.php?id=901"),
+            ("event", 2, "Clase de consulta", now + 4 * DAY, None),
+        ],
+    )
+    conn.commit()
+    set_availability(conn, {0: 90, 1: 90, 2: 90, 3: 50, 4: 90, 5: 120, 6: 0})
+    # Examen a mano en 5 días: sus sesiones son de repaso mezclado. Y uno ya rendido, sin nota.
+    create_manual_exam(conn, 101, "Parcialito de rectas", now + 5 * DAY, [1, 2], 10)
+    create_manual_exam(conn, 101, "Evaluación diagnóstica", now - 3 * DAY, [], 10)
+    # Dos sesiones de foco hechas por tema: las próximas de esos temas ya van mezcladas.
+    for days_ago, topic in ((6, 1), (5, 2), (4, 1), (3, 2)):
+        conn.execute(
+            "INSERT INTO plan_session(course_id, topic_id, exam_id, starts_at, minutes, done, kind, topics_json) "
+            "VALUES (101, ?, 1, ?, 50, 1, 'focus', ?)",
+            (topic, now - days_ago * DAY, json.dumps([topic])),
+        )
+    conn.commit()
+    replan(conn, now)
+    # Un simulacro terminado: 2 de 6 bien (nota 4 de 12), con una predicción de 9.
+    attempt = start_mock(conn, 1, now - DAY, predicted_grade=9)
+    answers = {item.question_id: (0 if item.question_id % 3 else 1) for item in attempt.items}
+    finish_mock(conn, attempt.attempt_id, answers, now - DAY + 600)
     conn.close()
 
 
@@ -169,6 +225,9 @@ def main() -> None:
     conn = connect(db_path)
     if args.step != "facultad":
         conn.execute("INSERT INTO kv VALUES (?, ?)", (SITE_KEY, SITE_ID))
+    if args.step in ("ia", "listo", "vencida"):
+        # Ya contestó la pregunta de edad (adulto), así que Ajustes muestra la sección "Edad".
+        conn.execute("INSERT OR REPLACE INTO kv VALUES ('age_gate', 'adult')")
     if args.step in ("facultad", "login"):
         # Instalación nueva: todavía no sincronizó nunca.
         conn.execute("DELETE FROM kv WHERE key='last_sync_at'")

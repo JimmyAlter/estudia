@@ -1,3 +1,16 @@
+## Novedades de la 0.2.0
+
+- **Agenda:** tu semana con clases, entregas, exámenes y sesiones de estudio. Exportala a Google Calendar o al celular.
+- **Plan de estudio y "¿Llegás?":** reparte sesiones en el tiempo que le das y te dice qué estudiar hoy.
+- **Simulacro:** con el reloj y la escala del examen; al final, tu nota al lado de la que creías que te sacabas.
+- **Práctica nueva:** "¿qué tan seguro estás?", "pensalo primero", respuestas escritas corregidas al instante y repaso en días distintos.
+- **Probabilidad de saber cada tema el día del parcial**, en vez de un porcentaje de dominio.
+- **Exportar a Anki** y **recordatorios** en la PC.
+- **Pregunta de edad:** con menos de 18 años, Estudia funciona sin mandar nada a Gemini.
+- **YouTube por enlace:** bajar los videos pasa a ser opcional (Ajustes).
+
+Si ya tenías Estudia, instalá encima: tus materias y tu progreso se mantienen.
+
 ## Cómo instalar Estudia en Windows
 
 1. Bajá `EstudiaSetup-<versión>.exe` de la lista de abajo (Assets).

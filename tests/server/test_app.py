@@ -19,8 +19,8 @@ from fakes import DeniedYoutubeUrlClient, FakeProvider
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "moodle"
 SITE_ID = "utn-frba"
 SITE_URL = "https://aulasvirtuales.frba.utn.edu.ar"
-CONTENTS = json.loads((FIXTURES / "core_course_get_contents_4242.json").read_text("utf-8"))
-QUIZZES = json.loads((FIXTURES / "mod_quiz_get_quizzes_by_courses_4242.json").read_text("utf-8"))
+CONTENTS = json.loads((FIXTURES / "core_course_get_contents_101.json").read_text("utf-8"))
+QUIZZES = json.loads((FIXTURES / "mod_quiz_get_quizzes_by_courses_101.json").read_text("utf-8"))
 PAGE = (FIXTURES / "page_video_clase_1.html").read_text("utf-8")
 GOOD_KEY = "clave-buena-123"
 PORT = 8123
@@ -29,7 +29,7 @@ BAD_KEY = "clave-mala-456"
 
 
 class FakeMoodle:
-    """MoodleClient falso con respuestas sintéticas con la forma de las de FRBA."""
+    """MoodleClient falso con las respuestas reales de FRBA."""
 
     def __init__(self, site_url, token, fail_with=None):
         self.site_url = site_url
@@ -42,11 +42,15 @@ class FakeMoodle:
         if fn == "core_webservice_get_site_info":
             return {"userid": 7, "fullname": "Ana Alumna"}
         if fn == "core_enrol_get_users_courses":
-            return [{"id": 4242, "fullname": "Matemática - Ejemplo", "shortname": "MAT-EJ"}]
+            return [{"id": 101, "fullname": "AM1", "shortname": "AM1"}]
         if fn == "core_course_get_contents":
             return CONTENTS
         if fn == "mod_quiz_get_quizzes_by_courses":
             return QUIZZES
+        if fn == "mod_assign_get_assignments":
+            return {"courses": []}
+        if fn == "core_calendar_get_action_events_by_timesort":
+            return {"events": []}
         raise AssertionError(f"función inesperada: {fn}")
 
     def fetch_file(self, fileurl):
@@ -97,6 +101,11 @@ def env(tmp_path):
     state["app"] = app
     state["client"] = TestClient(app, base_url=BASE)
     state["db_path"] = tmp_path / "estudia.db"
+    # Estos tests son de un adulto (la puerta de edad se prueba en test_age_gate.py).
+    conn = connect(state["db_path"])
+    conn.execute("INSERT INTO kv(key, value) VALUES ('age_gate', 'adult')")
+    conn.commit()
+    conn.close()
     return state
 
 
@@ -264,7 +273,8 @@ def test_video_403_after_saving_the_key_does_not_send_back_to_ia(env, tmp_path):
     state = c.get("/api/state").json()
     assert state["ai_stop_reason"] is None
     assert state["step"] == "listo"
-    assert material_row(env["db_path"])[0] == "failed"
+    # Con la descarga apagada (por defecto) pide un enlace público; nunca vuelve a la clave.
+    assert material_row(env["db_path"])[0] == "needs_public_link"
 
 
 def test_new_ai_key_clears_the_youtube_url_denial(env):
@@ -307,7 +317,8 @@ def test_answer_flow(env):
     r = c.post("/api/quiz", json={})
     assert r.status_code == 200
     items = r.json()
-    assert items == [{"question_id": 1, "stem": "¿Pendiente?", "options": ["1", "2", "3", "4"], "topic": "Rectas"}]
+    assert items == [{"question_id": 1, "stem": "¿Pendiente?", "options": ["1", "2", "3", "4"], "topic": "Rectas",
+                      "format": "mcq", "phase": "focus", "relearning": None}]
 
     r = c.post("/api/answer", json={"question_id": 1, "chosen_index": 0})
     assert r.status_code == 200
@@ -337,7 +348,11 @@ def test_home_and_materials(env):
         "id": 1, "title": "Video 1", "kind": "youtube", "status": "done",
         "summary_md": "# Resumen", "error": None, "youtube_id": "abcdefghijk",
         "campus_url": f"{SITE_URL}/mod/page/view.php?id=1001",
+        "topic_ids": [1], "questions": 1,
     }
+    # "Practicar esta clase" solo cuenta preguntas que se pueden mostrar.
+    c.post("/api/question/1/retire")
+    assert c.get("/api/materials").json()[0]["materials"][0]["questions"] == 0
 
 
 def test_root_placeholder_without_web_build(env):
@@ -654,3 +669,95 @@ def test_api_version_without_internet(tmp_path):
         r = TestClient(app, base_url=BASE).get("/api/version")
     assert r.status_code == 200
     assert r.json()["latest"] is None
+
+
+# --- D2: descarga opcional desde Ajustes y videos que piden un enlace público ------
+
+NEEDS_LINK_COPY = ("Este video no es público. Pedile a la cátedra el archivo en el campus,"
+                   " o activá la descarga en Ajustes")
+
+
+def kv_value(db_path, key):
+    conn = connect(db_path)
+    try:
+        row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def test_allow_download_setting(env):
+    c = env["client"]
+    assert c.get("/api/settings").json()["allow_download"] is False
+    assert c.put("/api/settings", json={"allow_download": True}).status_code == 200
+    assert c.get("/api/settings").json()["allow_download"] is True
+    assert kv_value(env["db_path"], "allow_download") == "1"
+    assert c.put("/api/settings", json={"allow_download": False}).status_code == 200
+    assert c.get("/api/settings").json()["allow_download"] is False
+    assert kv_value(env["db_path"], "allow_download") == "0"
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, "si", [], {}])
+def test_allow_download_must_be_a_bool(env, value):
+    r = env["client"].put("/api/settings", json={"allow_download": value})
+    assert r.status_code == 400
+    assert env["client"].get("/api/settings").json()["allow_download"] is False
+
+
+def test_materials_show_needs_public_link(env):
+    add_failed_material(env["db_path"], 1, status="needs_public_link", fail_kind=None)
+    conn = connect(env["db_path"])
+    conn.execute("UPDATE material SET error=? WHERE id=1", (NEEDS_LINK_COPY,))
+    conn.commit()
+    conn.close()
+    material = env["client"].get("/api/materials").json()[0]["materials"][0]
+    assert (material["status"], material["error"]) == ("needs_public_link", NEEDS_LINK_COPY)
+
+
+def test_retry_failed_includes_needs_public_link(env):
+    c = env["client"]
+    add_failed_material(env["db_path"], 1, status="needs_public_link", fail_kind=None)
+    jobs = env["app"].state.jobs
+    assert jobs.try_start()
+    try:
+        r = c.post("/api/materials/retry-failed")
+    finally:
+        jobs.finish_all()
+    assert r.json() == {"reset": 1}
+    assert material_row(env["db_path"], 1) == ("pending", None)
+
+
+def test_turning_download_on_requeues_needs_public_link(env):
+    c = env["client"]
+    add_failed_material(env["db_path"], 1, status="needs_public_link", fail_kind=None)
+    add_failed_material(env["db_path"], 2, fail_kind="video")
+    jobs = env["app"].state.jobs
+    assert jobs.try_start()  # que no corra el procesamiento en el test
+    try:
+        assert c.put("/api/settings", json={"allow_download": True}).status_code == 200
+    finally:
+        jobs.finish_all()
+    assert material_row(env["db_path"], 1) == ("pending", None)
+    assert material_row(env["db_path"], 2)[0] == "failed"
+
+
+def test_turning_download_off_keeps_materials(env):
+    add_failed_material(env["db_path"], 1, status="needs_public_link", fail_kind=None)
+    assert env["client"].put("/api/settings", json={"allow_download": False}).status_code == 200
+    assert material_row(env["db_path"], 1)[0] == "needs_public_link"
+
+
+def test_home_counts_needs_public_link_as_not_prepared(env):
+    add_failed_material(env["db_path"], 1, status="needs_public_link", fail_kind=None)
+    assert env["client"].get("/api/home").json()["processing"]["failed"] == 1
+
+
+def test_state_exposes_youtube_cap_with_its_reset(env):
+    conn = connect(env["db_path"])
+    conn.execute("INSERT INTO kv(key, value) VALUES ('ai_stop_reason', 'youtube_cap')")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('ai_quota_resets_at', '1792292400')")
+    conn.commit()
+    conn.close()
+    state = env["client"].get("/api/state").json()
+    assert state["ai_stop_reason"] == "youtube_cap"
+    assert state["ai_quota_resets_at"] == 1792292400

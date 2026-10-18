@@ -1,12 +1,23 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { ChevronRight } from "lucide-react";
-import { api, type AppState, type Material, type Section } from "../api";
+import { useEffect, useId, useState, type ReactNode } from "react";
+import { api, type Age, type AppState, type Material, type QuizParams, type Section } from "../api";
 import { keepMath, tidy } from "../format";
 import { Button, Label, Notice } from "../ui";
 
-type StopReason = AppState["ai_stop_reason"];
+const quietLink = "text-muted underline decoration-line underline-offset-4 hover:text-ink";
 
-export default function Materials({ aiStopReason }: { aiStopReason: StopReason }) {
+type StopReason = AppState["ai_stop_reason"];
+/** Sin IA (menor o sin responder) lo pendiente no se va a procesar. */
+const noAi = (age?: Age | null) => age === "minor" || age === null;
+
+export default function Materials({
+  aiStopReason,
+  age,
+  onPractice,
+}: {
+  aiStopReason: StopReason;
+  age?: Age | null;
+  onPractice?: (params: QuizParams) => void;
+}) {
   const [sections, setSections] = useState<Section[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [reload, setReload] = useState(0);
@@ -48,7 +59,9 @@ export default function Materials({ aiStopReason }: { aiStopReason: StopReason }
   }
 
   const courses = [...new Set(sections.map((s) => s.course ?? ""))];
-  const anyFailed = sections.some((s) => s.materials.some((m) => m.status === "failed"));
+  const courseIds = new Map(sections.map((s) => [s.course ?? "", s.course_id]));
+  // Lo que pide un enlace público también se reintenta (con la descarga prendida o pasados 7 días).
+  const anyFailed = sections.some((s) => s.materials.some((m) => m.status === "failed" || m.status === "needs_public_link"));
 
   return (
     <div className="max-w-3xl">
@@ -69,7 +82,14 @@ export default function Materials({ aiStopReason }: { aiStopReason: StopReason }
       )}
       {courses.map((course) => (
         <div key={course} className="mb-14">
-          {courses.length > 1 && course && <Label className="mb-6">{tidy(course)}</Label>}
+          {courses.length > 1 && course && (
+            <div className="mb-6 flex items-baseline justify-between gap-6">
+              <Label>{tidy(course)}</Label>
+              <a href={api.ankiUrl(courseIds.get(course))} download className={`text-sm ${quietLink}`}>
+                Exportar a Anki
+              </a>
+            </div>
+          )}
           {sections
             .filter((s) => (s.course ?? "") === course)
             .map((section) => (
@@ -77,19 +97,25 @@ export default function Materials({ aiStopReason }: { aiStopReason: StopReason }
                 <h2 className="mb-2 font-semibold">{tidy(section.name)}</h2>
                 <ul>
                   {section.materials.map((m) => (
-                    <MaterialRow key={m.id} material={m} stopReason={aiStopReason} />
+                    <MaterialRow key={m.id} material={m} stopReason={aiStopReason} age={age} onPractice={onPractice} />
                   ))}
                 </ul>
               </section>
             ))}
         </div>
       ))}
+      <p className="border-t border-line pt-4 text-sm">
+        <a href={api.ankiUrl()} download className={quietLink}>
+          Exportar a Anki
+        </a>
+        <span className="text-muted"> · todas las preguntas verificadas, para repasar en Anki</span>
+      </p>
     </div>
   );
 }
 
 /** Estado de la clase; nada si ya está lista (es lo normal). */
-function Status({ material, stopReason }: { material: Material; stopReason: StopReason }) {
+function Status({ material, stopReason, age }: { material: Material; stopReason: StopReason; age?: Age | null }) {
   const linkClass = "shrink-0 text-sm text-muted underline decoration-line underline-offset-4 hover:text-ink";
   switch (material.status) {
     case "done":
@@ -100,47 +126,86 @@ function Status({ material, stopReason }: { material: Material; stopReason: Stop
           Abrir en el campus
         </a>
       ) : (
-        <span className="shrink-0 text-sm text-muted">solo en el campus</span>
+        <span className="shrink-0 text-sm text-muted">Solo en el campus</span>
       );
+    case "needs_public_link":
+      // Sin IA no se va a preparar igual: la pista de la descarga no aplica.
+      if (noAi(age)) return <span className="shrink-0 text-sm text-muted">Sin preparar</span>;
+      return null; // la explicación va debajo del título
     case "pending":
+      if (noAi(age)) return <span className="shrink-0 text-sm text-muted">Sin preparar</span>;
       return (
-        <span className="shrink-0 text-sm text-muted">{stopReason === "quota" ? "se prepara mañana" : "en preparación"}</span>
+        <span className="shrink-0 text-sm text-muted">
+          {stopReason === "quota" || stopReason === "youtube_cap" ? "Se prepara mañana" : "En preparación"}
+        </span>
       );
     default:
-      return <span className="shrink-0 text-sm text-muted">no se pudo preparar</span>;
+      return <span className="shrink-0 text-sm text-muted">No se pudo preparar</span>;
   }
 }
 
-function MaterialRow({ material, stopReason }: { material: Material; stopReason: StopReason }) {
-  const status = <Status material={material} stopReason={stopReason} />;
-
-  if (!material.summary_md) {
-    return (
-      <li className="flex items-baseline justify-between gap-6 border-b border-line py-3 pl-6">
-        <span className={material.status === "done" ? "" : "text-muted"}>{tidy(material.title)}</span>
-        {status}
-      </li>
-    );
-  }
+function MaterialRow({
+  material,
+  stopReason,
+  age,
+  onPractice,
+}: {
+  material: Material;
+  stopReason: StopReason;
+  age?: Age | null;
+  onPractice?: (params: QuizParams) => void;
+}) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const status = <Status material={material} stopReason={stopReason} age={age} />;
+  const canPractice = Boolean(onPractice && material.questions && material.topic_ids?.length);
+  // Apagado solo lo que no se puede abrir ahora: lo que falta preparar o falló.
+  const unavailable = material.status === "pending" || material.status === "failed" || material.status === "needs_public_link";
 
   return (
-    <li className="border-b border-line">
-      <details className="group">
-        <summary className="flex cursor-pointer list-none items-baseline justify-between gap-6 py-3 [&::-webkit-details-marker]:hidden">
-          <span className="flex items-baseline gap-2">
-            <ChevronRight
-              size={14}
-              strokeWidth={1.75}
-              aria-hidden
-              className="relative top-[2px] shrink-0 text-muted transition-transform duration-150 group-open:rotate-90"
-            />
-            <span className="group-hover:underline group-hover:decoration-line group-hover:underline-offset-4">
-              {tidy(material.title)}
-            </span>
+    <li className="border-b border-line py-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+        <span className={`min-w-0 ${unavailable ? "text-muted" : ""}`}>{tidy(material.title)}</span>
+        {(canPractice || material.summary_md || material.status !== "done") && (
+          <span className="flex shrink-0 items-baseline gap-5 text-sm">
+            {status}
+            {canPractice && (
+              <button
+                type="button"
+                onClick={() =>
+                  onPractice!(
+                    material.topic_ids.length === 1 ? { topic_id: material.topic_ids[0] } : { topic_ids: material.topic_ids },
+                  )
+                }
+                className="press cursor-pointer font-medium underline decoration-ink/40 underline-offset-4 hover:decoration-ink"
+              >
+                Practicar esta clase
+              </button>
+            )}
+            {material.summary_md && (
+              <button
+                type="button"
+                onClick={() => setOpen((o) => !o)}
+                aria-expanded={open}
+                aria-controls={`${id}-summary`}
+                className="press cursor-pointer text-muted underline decoration-line underline-offset-4 hover:text-ink"
+              >
+                {open ? "Ocultar resumen" : "Ver resumen"}
+              </button>
+            )}
           </span>
-          {status}
-        </summary>
-        <div className="reveal pb-6 pl-6">
+        )}
+      </div>
+      {material.status === "needs_public_link" && !noAi(age) && (
+        <p className="mt-1 text-sm text-muted">
+          Este video no es público. Pedile a la cátedra el archivo en el campus, o activá la descarga en{" "}
+          <a href="#/ajustes" className="underline decoration-line underline-offset-4 hover:text-ink">
+            Ajustes
+          </a>
+        </p>
+      )}
+      {material.summary_md && open && (
+        <div id={`${id}-summary`} className="reveal pt-4 pb-3">
           <Summary markdown={material.summary_md} title={material.title} />
           {material.youtube_id && (
             <a
@@ -153,7 +218,7 @@ function MaterialRow({ material, stopReason }: { material: Material; stopReason:
             </a>
           )}
         </div>
-      </details>
+      )}
     </li>
   );
 }

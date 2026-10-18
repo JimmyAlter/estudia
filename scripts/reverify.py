@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 
+from estudia.ai.gate import age_is_adult
 from estudia.ai.gemini import GeminiProvider
 from estudia.db import connect
 from estudia.generation.reverify import reverify_all
@@ -24,6 +25,9 @@ def main() -> int:
         return 2
     conn = connect()
     try:
+        if not age_is_adult():
+            print("la IA no está habilitada (falta la respuesta de edad o es menor)", file=sys.stderr)
+            return 3
         result = reverify_all(conn, GeminiProvider(key))
     finally:
         conn.close()

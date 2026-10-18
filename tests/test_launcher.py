@@ -187,8 +187,16 @@ def serving(tmp_path, monkeypatch):
     monkeypatch.setattr(entry, "data_dir", lambda: tmp_path)
     monkeypatch.setattr(entry, "running_instance", lambda *_: None)
     monkeypatch.setattr(entry, "acquire_lock", lambda path: lock)
-    monkeypatch.setattr(entry, "create_app", lambda port: SimpleNamespace(state=SimpleNamespace(jobs=None)))
     monkeypatch.setattr(entry, "periodic_sync", lambda jobs, stop: None)
+    reminders = []
+    monkeypatch.setattr(entry, "run_reminders", lambda stop, connect: reminders.append(connect))
+    apps = []
+
+    def fake_create_app(db_path, port):
+        apps.append(db_path)
+        return SimpleNamespace(state=SimpleNamespace(jobs=None))
+
+    monkeypatch.setattr(entry, "create_app", fake_create_app)
     monkeypatch.setattr(entry.uvicorn, "Server", lambda config: server)
     monkeypatch.setattr(entry.signal, "signal", lambda *a: None)
     monkeypatch.setattr(entry.webbrowser, "open", lambda url: None)
@@ -196,7 +204,8 @@ def serving(tmp_path, monkeypatch):
     monkeypatch.delenv("ESTUDIA_NO_BROWSER", raising=False)
     exits = []
     monkeypatch.setattr(entry.os, "_exit", exits.append)
-    return SimpleNamespace(lock=lock, server=server, port_file=tmp_path / "port", exits=exits)
+    return SimpleNamespace(lock=lock, server=server, port_file=tmp_path / "port", exits=exits,
+                           reminders=reminders, apps=apps, data_dir=tmp_path)
 
 
 def test_main_runs_server_in_thread_and_tray_in_main(serving, monkeypatch):
@@ -309,7 +318,7 @@ def test_quit_does_not_hang_on_endless_background_task(tmp_path, monkeypatch):
     monkeypatch.setattr(entry, "data_dir", lambda: tmp_path)
     monkeypatch.setattr(entry, "running_instance", lambda *_: None)
     monkeypatch.setattr(entry, "acquire_lock", lambda path: lock)
-    monkeypatch.setattr(entry, "create_app", lambda port: app)
+    monkeypatch.setattr(entry, "create_app", lambda db_path, port: app)
     monkeypatch.setattr(entry, "periodic_sync", lambda jobs, stop: None)
     monkeypatch.setattr(entry.signal, "signal", lambda *a: None)
     monkeypatch.setattr(entry.webbrowser, "open", lambda url: None)
@@ -386,3 +395,22 @@ def test_main_reuse_no_browser_does_not_open_browser(isolated, monkeypatch):
     monkeypatch.setattr(entry.webbrowser, "open", opened.append)
     entry.main()
     assert opened == []
+
+
+def test_reminders_use_the_same_database_as_the_app(serving, monkeypatch):
+    """Los recordatorios abren la base que usa el servidor, nunca la de por defecto."""
+    monkeypatch.setattr(entry, "tray_available", lambda: False)
+    serving.server.should_exit = True
+    entry.main()
+    for _ in range(100):
+        if serving.reminders:
+            break
+        time.sleep(0.01)
+    assert serving.apps == [serving.data_dir / "estudia.db"]
+    assert len(serving.reminders) == 1
+    conn = serving.reminders[0]()
+    try:
+        file = conn.execute("PRAGMA database_list").fetchone()[2]
+    finally:
+        conn.close()
+    assert file == str(serving.data_dir / "estudia.db")

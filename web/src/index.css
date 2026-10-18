@@ -82,6 +82,11 @@ body {
   }
 }
 
+/* Títulos y secciones que reciben el foco por programa (al cambiar de pantalla): sin anillo. */
+[tabindex="-1"]:focus {
+  outline: none;
+}
+
 /* Todo lo que se aprieta responde al apretarlo. */
 .press {
   transition: transform 140ms var(--ease-out-strong), background-color 150ms ease, opacity 150ms ease;

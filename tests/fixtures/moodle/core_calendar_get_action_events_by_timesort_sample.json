@@ -1,0 +1,18 @@
+{
+  "events": [
+    {"id": 7001, "name": "PRIMER CUESTIONARIO closes", "modulename": "quiz", "instance": 12,
+     "eventtype": "close", "timesort": 1806000000, "timestart": 1806000000,
+     "course": {"id": 101}, "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/quiz/view.php?id=5001"},
+    {"id": 7002, "name": "TP 1: Rectas y planos is due", "modulename": "assign", "instance": 501,
+     "eventtype": "due", "timesort": 1807000000, "timestart": 1807000000,
+     "course": {"id": 101}, "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/assign/view.php?id=91001"},
+    {"id": 7003, "name": "Foro: consultas del parcial", "modulename": "forum", "instance": 4,
+     "eventtype": "due", "timesort": 1806500000, "timestart": 1806400000,
+     "course": {"id": 101}, "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/forum/view.php?id=91050"},
+    {"id": 7004, "name": "Clase de consulta", "modulename": "", "eventtype": "course",
+     "timesort": 1806700000, "timestart": 1806700000,
+     "course": {"id": 101}, "url": "https://otro-sitio.example.com/evento/7004"}
+  ],
+  "firstid": 7001,
+  "lastid": 7004
+}

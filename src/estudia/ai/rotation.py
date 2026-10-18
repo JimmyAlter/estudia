@@ -15,11 +15,16 @@ from estudia.ai.base import AIFormatError, AIQuotaError, AIUnavailableError
 from estudia.config import MAX_EXHAUSTED_S
 
 # Por qué se deja un modelo y se prueba el siguiente de la cadena.
-DAILY, QUOTA, TRANSIENT, UNSUPPORTED, UNREADABLE = (
-    "daily", "quota", "transient", "unsupported", "unreadable")
+# DENIED: 403 con el enlace de YouTube (otro modelo puede aceptarlo).
+DAILY, QUOTA, TRANSIENT, UNSUPPORTED, UNREADABLE, DENIED = (
+    "daily", "quota", "transient", "unsupported", "unreadable", "denied")
 
 
 log = logging.getLogger(__name__)
+
+
+class LinkDenied(Exception):
+    """Ningún modelo de la cadena aceptó el enlace de YouTube (todos dieron 403)."""
 
 
 class NextModel(Exception):
@@ -147,6 +152,7 @@ class ModelRotation:
         - AIUnavailableError si alguno estaba saturado (vuelve en minutos);
         - AIQuotaError si alguno se quedó sin cuota, o si no hay ningún candidato:
           el material queda pendiente y conserva el análisis ya pagado;
+        - LinkDenied si los que respondieron rechazaron el enlace de YouTube (403);
         - AIFormatError si todos respondieron algo inservible.
         """
         reasons = set()
@@ -163,4 +169,6 @@ class ModelRotation:
         if not reasons or reasons & {DAILY, QUOTA}:
             resets = [self.exhausted_until[m] for m in candidates if self.is_exhausted(m)]
             raise AIQuotaError("cuota de Gemini agotada", resets_at=min(resets) if resets else None)
+        if DENIED in reasons:
+            raise LinkDenied()
         raise AIFormatError("ningún modelo de Gemini pudo responder este pedido")

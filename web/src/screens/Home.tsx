@@ -1,25 +1,66 @@
-import { useEffect, useState } from "react";
-import { ApiError, api, type AppState, type HomeData, type QuizParams, type Topic } from "../api";
-import { formatDate, formatDuration, plural, tidy } from "../format";
-import { Button, Label, Notice } from "../ui";
+import { useEffect, useId, useState } from "react";
+import {
+  ApiError,
+  api,
+  type AgendaItem,
+  type Age,
+  type AppState,
+  type ExamHealth,
+  type ExamInfo,
+  type HomeData,
+  type QuizParams,
+  type SessionInfo,
+  type Topic,
+} from "../api";
+import { clock, dayKey, formatDate, formatDuration, grade, plural, shortDate, tidy } from "../format";
+import { Button, FIELD, Label, Notice } from "../ui";
+import { HealthLine } from "./Health";
 
-export type Screen = "inicio" | "practica" | "materiales";
+export type Screen = "inicio" | "agenda" | "practica" | "materiales" | "ajustes" | "simulacro";
+
+/** Con menos preguntas vistas, la probabilidad todavía dice poco: se aclara cuántas se vieron. */
+const FEW_SEEN = 8;
+/** Pasado este tiempo, ya no se pregunta cómo fue un examen. */
+const ASK_RESULT_DAYS = 30;
 
 interface Props {
   /** Cambia cuando hay datos nuevos (terminó una sincronización). */
   refreshKey: number;
   /** Por qué se frenó el procesamiento con Gemini, si se frenó. */
   aiStopReason: AppState["ai_stop_reason"];
+  /** La respuesta de edad: sin IA (menor o sin responder) no se promete preparar clases. */
+  age?: Age | null;
   /** Hay una sincronización/preparación corriendo ahora. */
   working: boolean;
-  onPractice: (params: QuizParams) => void;
+  onPractice: (params: QuizParams, session?: SessionInfo) => void;
   onNavigate: (screen: Screen) => void;
   onSessionExpired: () => void;
 }
 
-export default function Home({ refreshKey, aiStopReason, working, onPractice, onNavigate, onSessionExpired }: Props) {
+export default function Home({ refreshKey, aiStopReason, age, working, onPractice, onNavigate, onSessionExpired }: Props) {
   const [data, setData] = useState<HomeData | null>(null);
   const [failed, setFailed] = useState(false);
+  const [health, setHealth] = useState<ExamHealth[]>([]);
+  const [today, setToday] = useState<AgendaItem[]>([]);
+  const [exams, setExams] = useState<ExamInfo[]>([]);
+
+  // Lo que suma el plan: si algo falla, el inicio sigue sin esa parte.
+  useEffect(() => {
+    let alive = true;
+    api.health().then((h) => alive && setHealth(h)).catch(() => {});
+    api.exams().then((list) => alive && setExams(list)).catch(() => {});
+    api
+      .agenda()
+      .then((week) => {
+        if (!alive) return;
+        const key = dayKey(Date.now() / 1000);
+        setToday(week.days.find((d) => d.date === key)?.items ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [refreshKey]);
 
   useEffect(() => {
     let alive = true;
@@ -40,9 +81,27 @@ export default function Home({ refreshKey, aiStopReason, working, onPractice, on
   if (!data) return null;
 
   const { exam, topics, suggestion } = data;
+  const now = Date.now() / 1000;
+  const askResult = exams
+    .filter(
+      (e) =>
+        e.at != null &&
+        (e.closes_at ?? e.at) <= now &&
+        now - e.at < ASK_RESULT_DAYS * 86400 &&
+        !e.result &&
+        !e.result_skipped,
+    )
+    .sort((a, b) => b.at! - a.at!)[0];
 
   return (
     <div>
+      {askResult && (
+        <ResultPrompt
+          key={askResult.id}
+          exam={askResult}
+          onDone={(change) => setExams((list) => list.map((e) => (e.id === askResult.id ? { ...e, ...change } : e)))}
+        />
+      )}
       <section className="mb-14">
         {exam ? (
           <>
@@ -52,8 +111,13 @@ export default function Home({ refreshKey, aiStopReason, working, onPractice, on
               {[
                 tidy(exam.course),
                 `abre el ${formatDate(exam.opens_at)}`,
-                `${plural(exam.attempts, "intento", "intentos")}, ${formatDuration(exam.time_limit_s)}`,
-              ].join(" · ")}
+                // Los cargados a mano no traen intentos ni límite: no se inventan.
+                exam.attempts != null && exam.time_limit_s
+                  ? `${plural(exam.attempts, "intento", "intentos")}, ${formatDuration(exam.time_limit_s)}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
             </p>
             <p className="mt-1 font-medium">{daysLeft(exam.days_left)}</p>
           </>
@@ -63,15 +127,36 @@ export default function Home({ refreshKey, aiStopReason, working, onPractice, on
             <p className="mt-3 text-muted">Cuando el campus publique uno, aparece acá.</p>
           </>
         )}
+        {health.length > 0 && (
+          <div className="mt-6 max-w-2xl space-y-2">
+            {health.map((h) => (
+              <HealthLine
+                key={h.exam_id}
+                health={h}
+                onPractice={onPractice}
+                // El examen del título no se repite en su propia línea.
+                withExamName={!(exam && h.at === exam.opens_at && h.exam === exam.name)}
+              />
+            ))}
+          </div>
+        )}
       </section>
 
       <div className="grid gap-x-16 gap-y-12 md:grid-cols-[minmax(0,1fr)_15rem]">
         <section>
-          <h2 className="mb-3 font-semibold">{exam ? "Temas que entran" : "Temas"}</h2>
+          <h2 className="font-semibold">{exam ? "Temas que entran" : "Temas"}</h2>
+          {topics.some((t) => t.total) && (
+            <p className="mt-1 mb-3 text-sm text-muted">{probabilityTitle(exam?.opens_at ?? null)}</p>
+          )}
           {topics.length ? (
-            <ul>
+            <ul className="mt-3">
               {topics.map((topic) => (
-                <TopicRow key={topic.id} topic={topic} onClick={() => onPractice({ topic_id: topic.id })} />
+                <TopicRow
+                  key={topic.id}
+                  topic={topic}
+                  headerAt={exam?.opens_at ?? null}
+                  onClick={() => onPractice({ topic_id: topic.id })}
+                />
               ))}
             </ul>
           ) : (
@@ -80,6 +165,7 @@ export default function Home({ refreshKey, aiStopReason, working, onPractice, on
         </section>
 
         <aside className="max-md:order-first">
+          <Today items={today} now={now} onPractice={onPractice} />
           <h2 className="mb-3 font-semibold">Seguir estudiando</h2>
           {suggestion ? (
             <>
@@ -88,12 +174,16 @@ export default function Home({ refreshKey, aiStopReason, working, onPractice, on
                 <span className="text-ink">{suggestion.name}</span>.
               </p>
               <div className="flex flex-col items-start gap-3">
-                <Button onClick={() => onPractice({ topic_id: suggestion.id })}>Practicar ese tema</Button>
-                <Button variant="secondary" onClick={() => onPractice({})}>
+                <div className="flex flex-wrap gap-3">
+                  <Button onClick={() => onPractice({ topic_id: suggestion.id })}>Practicar ese tema</Button>
+                  {exam && (
+                    <Button variant="secondary" onClick={() => onNavigate("simulacro")}>
+                      Hacer un simulacro
+                    </Button>
+                  )}
+                </div>
+                <Button variant="quiet" className="mt-1" onClick={() => onPractice({})}>
                   Práctica de todo
-                </Button>
-                <Button variant="quiet" className="mt-1" onClick={() => onNavigate("materiales")}>
-                  Leer los resúmenes
                 </Button>
               </div>
             </>
@@ -102,7 +192,7 @@ export default function Home({ refreshKey, aiStopReason, working, onPractice, on
               Ver materiales
             </Button>
           )}
-          <Processing processing={data.processing} stopReason={aiStopReason} working={working} />
+          <Processing processing={data.processing} stopReason={aiStopReason} working={working} age={age} />
         </aside>
       </div>
     </div>
@@ -115,34 +205,189 @@ function daysLeft(days: number): string {
   return `Faltan ${days} días`;
 }
 
-function TopicRow({ topic, onClick }: { topic: Topic; onClick: () => void }) {
+/**
+ * Una sola vez, bajo el título, con la fecha del examen que muestra la pantalla:
+ * "Probabilidad de que lo sepas el día del parcial (14/3)". Sin examen, "hoy".
+ */
+function probabilityTitle(at: number | null): string {
+  return `Probabilidad de que lo sepas ${at == null ? "hoy" : `el día del parcial (${shortDate(at)})`}`;
+}
+
+/**
+ * Cada número es la probabilidad al día del examen más próximo de ese tema (`topic.at`). Si no es
+ * el del encabezado (el tema entra antes en otro examen, o en ninguno), lleva su propia fecha.
+ */
+function TopicRow({ topic, headerAt, onClick }: { topic: Topic; headerAt: number | null; onClick: () => void }) {
   const percent = Math.round(topic.mastery * 100);
+  const ownDate = topic.at === headerAt ? "" : ` · ${topic.at == null ? "hoy" : shortDate(topic.at)}`;
   return (
     <li className="border-b border-line">
       <button
         type="button"
         onClick={onClick}
         title={`Practicar ${topic.name}`}
-        className="group -mx-2 grid w-[calc(100%+1rem)] cursor-pointer grid-cols-[minmax(0,1fr)_6.5rem] items-baseline gap-6 px-2 py-3 text-left"
+        className="group -mx-2 block w-[calc(100%+1rem)] cursor-pointer px-2 py-3 text-left"
       >
-        <span>
-          <span className="block group-hover:underline group-hover:decoration-line group-hover:underline-offset-4">
+        <span className="flex items-baseline justify-between gap-6">
+          <span className="min-w-0 group-hover:underline group-hover:decoration-line group-hover:underline-offset-4">
             {topic.name}
           </span>
-          <span className="mt-2 block h-1 overflow-hidden rounded-full bg-track" aria-hidden>
-            <span
-              data-testid="mastery-bar"
-              className="block h-full rounded-full bg-ink/75"
-              // Mismo número que el texto: la barra llega justo al porcentaje que se muestra.
-              style={{ width: `${percent}%` }}
-            />
-          </span>
+          {topic.total > 0 && <span className="shrink-0 text-sm tabular-nums text-muted">{`${percent} %${ownDate}`}</span>}
         </span>
-        <span className="text-right text-sm tabular-nums text-muted">
-          {topic.practiced ? `${percent}% bien` : "sin practicar"}
-        </span>
+        {topic.total > 0 ? (
+          <>
+            <span className="mt-2 block h-1 overflow-hidden rounded-full bg-track" aria-hidden>
+              <span
+                data-testid="mastery-bar"
+                className="block h-full rounded-full bg-ink/75"
+                // Mismo número que el texto: la barra llega justo al porcentaje que se muestra.
+                style={{ width: `${percent}%` }}
+              />
+            </span>
+            {topic.seen < Math.min(FEW_SEEN, topic.total) && (
+              <span className="mt-1.5 block text-sm tabular-nums text-muted">{`Viste ${topic.seen} de ${topic.total} preguntas`}</span>
+            )}
+          </>
+        ) : (
+          <span className="mt-1 block text-sm text-muted">Todavía no tiene preguntas</span>
+        )}
       </button>
     </li>
+  );
+}
+
+/** Lo de hoy: la próxima clase y la sesión del plan. */
+function Today({
+  items,
+  now,
+  onPractice,
+}: {
+  items: AgendaItem[];
+  now: number;
+  onPractice: (params: QuizParams, session?: SessionInfo) => void;
+}) {
+  const nextClass = items.find((i) => i.kind === "class" && (i.ends_at ?? i.starts_at) > now);
+  const session = items.find((i) => i.kind === "session" && !i.done && (i.ends_at ?? i.starts_at) > now);
+  if (!nextClass && !session) return null;
+  const classRow = nextClass && (
+    <li key="class" className="text-muted">
+      <span className="tabular-nums text-ink">{clock(nextClass.starts_at)}</span>
+      {" · "}
+      {[tidy(nextClass.course ?? nextClass.title), nextClass.place].filter(Boolean).join(" · ")}
+    </li>
+  );
+  const sessionRow = session && (
+    <li key="session" className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+      <span className="text-muted">
+        <span className="tabular-nums text-ink">{clock(session.starts_at)}</span> · {session.title}
+      </span>
+      <Button
+        variant="quiet"
+        aria-label={`Practicar ${session.title}`}
+        onClick={() =>
+          onPractice(
+            { session_id: session.id },
+            {
+              kind: session.session_kind ?? "focus",
+              topic: session.topic ?? "",
+              review_minutes: session.review_minutes ?? 0,
+              focus_minutes: session.focus_minutes ?? 0,
+            },
+          )
+        }
+      >
+        Practicar
+      </Button>
+    </li>
+  );
+  // En el orden en que pasan.
+  const classFirst = !session || (nextClass != null && nextClass.starts_at <= session.starts_at);
+  return (
+    <section className="mb-10">
+      <h2 className="mb-3 font-semibold">Hoy</h2>
+      <ul className="space-y-2">{classFirst ? [classRow, sessionRow] : [sessionRow, classRow]}</ul>
+    </section>
+  );
+}
+
+/** Después de un examen: "¿Cómo te fue?", con la nota o "Prefiero no decir". */
+function ResultPrompt({ exam, onDone }: { exam: ExamInfo; onDone: (change: Partial<ExamInfo>) => void }) {
+  const id = useId();
+  const scale = exam.max_grade ?? 10;
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    const number = Number(value.replace(",", ".").trim());
+    if (!value.trim() || !Number.isFinite(number) || number < 0 || number > scale) {
+      setError(`La nota tiene que estar entre 0 y ${grade(scale)}.`);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      onDone({ result: await api.examResult(exam.id, number) });
+    } catch {
+      setError("No se pudo guardar. Probá de nuevo.");
+      setBusy(false);
+    }
+  }
+
+  async function skip() {
+    setBusy(true);
+    try {
+      await api.skipExamResult(exam.id);
+      onDone({ result_skipped: true });
+    } catch {
+      setError("No se pudo guardar. Probá de nuevo.");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="mb-12 border-b border-line pb-8">
+      <h2 className="mb-1 font-semibold">¿Cómo te fue en {tidy(exam.name)}?</h2>
+      <p className="mb-4 text-sm text-muted">Con tu nota real, Estudia aprende cuánto se parecen sus simulacros al examen.</p>
+      <form
+        className="flex flex-wrap items-end gap-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          save();
+        }}
+      >
+        <div>
+          <label htmlFor={id} className="mb-1.5 block text-sm font-medium">
+            Nota, de 0 a {grade(scale)}
+          </label>
+          <input
+            id={id}
+            type="text"
+            inputMode="decimal"
+            autoComplete="off"
+            value={value}
+            onChange={(e) => {
+              setValue(e.target.value);
+              setError(null);
+            }}
+            aria-invalid={error ? true : undefined}
+            aria-describedby={error ? `${id}-err` : undefined}
+            className={`w-28 tabular-nums ${FIELD}`}
+          />
+        </div>
+        <Button type="submit" variant="secondary" disabled={busy}>
+          Guardar nota
+        </Button>
+        <Button variant="quiet" className="mb-2" onClick={skip} disabled={busy}>
+          Prefiero no decir
+        </Button>
+      </form>
+      {error && (
+        <p id={`${id}-err`} role="alert" className="mt-2 text-sm text-bad">
+          {error}
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -150,17 +395,28 @@ function Processing({
   processing,
   stopReason,
   working,
+  age,
 }: {
   processing: HomeData["processing"];
   stopReason: AppState["ai_stop_reason"];
   working: boolean;
+  age?: Age | null;
 }) {
   const { pending, done, failed } = processing;
+  if (age === "minor") {
+    return (
+      <p className="mt-10 text-sm text-muted">
+        Sin IA no se preparan clases nuevas. Podés practicar con las preguntas que ya hay.
+      </p>
+    );
+  }
   if (!pending && !done && !failed) return null;
   let line: string | null = null;
-  if (!pending) line = done ? plural(done, "clase lista", "clases listas") : null;
+  // Sin responder la edad no se prepara nada: el aviso de arriba ya lo explica.
+  if (age === null && pending) line = null;
+  else if (!pending) line = done ? plural(done, "clase lista", "clases listas") : null;
   // Con la cuota agotada, el aviso de arriba ya lo dice.
-  else if (stopReason === "quota") line = null;
+  else if (stopReason === "quota" || stopReason === "youtube_cap") line = null;
   else if (stopReason === "unavailable") line = `${plural(pending, "clase", "clases")} en espera`;
   // "Preparando" solo si de verdad hay algo corriendo; si no, no se promete avance.
   else if (working) line = `Preparando ${plural(pending, "clase", "clases")}`;
