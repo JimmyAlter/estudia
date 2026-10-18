@@ -195,7 +195,7 @@ describe("Agenda", () => {
           headers: { "Content-Disposition": 'attachment; filename="estudia-semana-2026-10-13.apkg"' },
         }),
     });
-    const createObjectURL = vi.fn(() => "blob:mazo");
+    const createObjectURL = vi.fn((_file: Blob) => "blob:mazo");
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("URL", Object.assign(URL, { createObjectURL, revokeObjectURL }));
     const clicked: { href: string; download: string }[] = [];
@@ -212,7 +212,12 @@ describe("Agenda", () => {
 
     await userEvent.click(within(section).getByRole("button", { name: "Bajá el mazo de la semana para el celular" }));
     await waitFor(() => expect(clicked).toEqual([{ href: "blob:mazo", download: "estudia-semana-2026-10-13.apkg" }]));
-    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    // Sin `expect.any(Blob)`: según la versión de Node, el Blob de `fetch` y el de jsdom son
+    // clases distintas. Alcanza con que sea un archivo con tamaño y contenido legible.
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    const file = createObjectURL.mock.calls[0][0];
+    expect(typeof file.size).toBe("number");
+    expect(typeof file.arrayBuffer).toBe("function");
     await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:mazo"));
     // El enlace temporal no queda en la página.
     expect(document.querySelector('a[href="blob:mazo"]')).toBeNull();
