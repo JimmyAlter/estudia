@@ -307,9 +307,13 @@ jobs:
             Write-Host ("Segunda apertura: código {0} en {1:N1} s" -f $second.ExitCode, $watch.Elapsed.TotalSeconds)
             if ($second.ExitCode -ne 0) { throw "La segunda apertura terminó con código $($second.ExitCode)" }
             if ($proc.HasExited) { throw "La primera instancia se cerró al abrir la segunda" }
-            $count = @(Get-Process -Name Estudia -ErrorAction SilentlyContinue).Count
-            Write-Host "Procesos Estudia.exe: $count"
-            if ($count -ne 1) { throw "Se esperaba un solo Estudia.exe y hay $count" }
+            # Los procesos de trabajo (SymPy) también son Estudia.exe, lanzados por
+            # multiprocessing con "--multiprocessing-fork": no cuentan como instancias.
+            $all = @(Get-CimInstance Win32_Process -Filter "Name='Estudia.exe'")
+            $all | ForEach-Object { Write-Host "Estudia.exe $($_.ProcessId): $($_.CommandLine)" }
+            $count = @($all | Where-Object { $_.CommandLine -notmatch 'multiprocessing-fork|resource_tracker' }).Count
+            Write-Host "Instancias de Estudia: $count"
+            if ($count -ne 1) { throw "Se esperaba una sola instancia de Estudia y hay $count" }
             Write-Host "Una sola instancia: bien"
           } finally {
             Write-Host "Cerrando Estudia"
