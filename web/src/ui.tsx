@@ -11,6 +11,11 @@ const VARIANTS: Record<Variant, string> = {
     "text-muted underline underline-offset-4 decoration-line hover:text-ink disabled:text-faint focus-visible:outline-offset-[3px]",
 };
 
+/** Las clases de un botón, para lo que se ve como botón sin serlo (la etiqueta de un selector de archivo). */
+export function buttonClass(variant: Variant = "primary"): string {
+  return `press cursor-pointer ${VARIANTS[variant]}`;
+}
+
 export function Button({
   variant = "primary",
   className = "",
@@ -108,5 +113,35 @@ export function TypedField({
         {TYPED_HELP}
       </p>
     </form>
+  );
+}
+
+/**
+ * La página del campus, si es http(s). Nunca la URL de un archivo (`pluginfile.php`): solo sirve
+ * con el token y no se muestra.
+ */
+export function campusHref(url: string | null | undefined): string | null {
+  if (!url || !/^https?:\/\//i.test(url) || /\/pluginfile\.php/i.test(url)) return null;
+  return url;
+}
+
+/** Cita de un documento ("Apunte 3, pág. 14"), enlazada a su página del campus si la hay. */
+export function DocumentSource({ label, url, className = "" }: { label: string; url?: string | null; className?: string }) {
+  const href = campusHref(url);
+  return (
+    <p className={`text-sm ${className}`}>
+      {href ? (
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline decoration-line underline-offset-4 hover:decoration-ink"
+        >
+          {label}
+        </a>
+      ) : (
+        <span className="text-muted">{label}</span>
+      )}
+    </p>
   );
 }

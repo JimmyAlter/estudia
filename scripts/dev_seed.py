@@ -29,7 +29,25 @@ corto sugerido para hoy, y un final en 20 días (menos de 4 semanas). "Armar el 
 aparece en el parcial ya rendido con nota, en la semana anterior de la Agenda. El tema
 "Ecuación de la recta" está firme (P ≥ 0,7 el día del recuperatorio): el recuperatorio no lo programa.
 
-Con la app lista, el curso tiene 10 preguntas verificadas y una clase pendiente ("Ya hay 10
+Para la etapa 3b (Materiales, en "POLINOMIOS Y SISTEMAS DE ECUACIONES LINEALES"): un apunte en
+PDF partido en tres tramos (el primero preparado, con resumen y la página en cada título), unas
+diapositivas preparadas, y archivos del campus en cada estado: uno bajándose, uno demasiado
+grande, uno que no se pudo leer, uno que no se pudo bajar ("Reintentar") y un .docx que
+no se puede leer todavía. Dos preguntas de esos documentos citan la página ("Apunte 3,
+pág. 14", enlazada a la página del campus): salen con "Practicar esta clase" y en la revisión
+del simulacro de siempre de "Final de Matemática".
+
+Para el simulacro con el formato de la cátedra (Simulacro, con examen): "Parcialito de rectas" tiene
+dos parciales viejos cargados (uno leído y otro que se está leyendo) y su formato guardado, con
+las preguntas listas (cada una muestra sus puntos). "Final de Matemática" tiene cuatro parciales:
+dos leídos (el formato propuesto es su promedio, con un tema que no está en la materia), uno
+leyéndose y uno que no se pudo leer; y un formato guardado al que le faltan 2 preguntas de
+desarrollo: ofrece el simulacro de siempre. Con un formato guardado, los parciales y el editor
+van plegados en "Cambiar el formato o cargar parciales".
+
+La carpeta de datos (parciales y apuntes) también es temporal: nada se escribe en la de verdad.
+
+Con la app lista, el curso tiene 12 preguntas verificadas y una clase pendiente ("Ya hay 12
 preguntas…"), y el procesamiento quedó frenado por el tope del día (`ai_stop_reason = "budget"`).
 La pantalla de cada cosa está en el informe de la Tarea 19 (`.superpowers/sdd/2026-10-18-etapa3a/`).
 """
@@ -37,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -48,6 +67,7 @@ import uvicorn
 from keyring.backend import KeyringBackend
 
 from estudia.ai.base import AIQuotaError
+from estudia.config import DATA_DIR_ENV, data_dir
 from estudia.db import connect
 from estudia.generation.pipeline import BUDGET, STOP_KEY
 from estudia.moodle.calendar_feed import export_url, feed_secret_name, feed_status_key
@@ -55,6 +75,7 @@ from estudia.secrets import set_secret
 from estudia.server.app import GEMINI_KEY, HOST, SITE_KEY, create_app, moodle_token_name
 from estudia.study.exams import ENROLLMENT, FINAL, RETAKE, create_manual_exam, set_exam_result
 from estudia.study.mock_exam import finish_mock, start_mock
+from estudia.study.past_exams import file_path as past_exam_file
 from estudia.study.planner import replan, set_availability
 from estudia.study.schedule import add_slot
 
@@ -102,8 +123,29 @@ class QuotaProvider:
     """Gemini de mentira: acepta cualquier clave y siempre está sin cuota para procesar."""
 
     youtube_url_denied = False
+    youtube_url_denied_until = 0.0
+    allow_download = False
+    key_id = "dev"
+    last_analysis_model = None
+    last_video_seconds = None
+
+    def __init__(self):
+        # Lo que la cola lee y escribe en cada corrida (cuota, modelos agotados, videos sin enlace).
+        self.requests: dict[str, int] = {}
+        self.exhausted_until: dict[str, float] = {}
+        self.url_denied_videos: set[str] = set()
 
     def analyze_video(self, youtube_id, title):
+        raise AIQuotaError("cuota agotada (simulado)")
+
+    # Documentos, parciales y preguntas con el formato: también sin cuota (el parcial sigue "Leyendo").
+    def analyze_document(self, doc):
+        raise AIQuotaError("cuota agotada (simulado)")
+
+    def extract_exam_style(self, exam, course_topics):
+        raise AIQuotaError("cuota agotada (simulado)")
+
+    def generate_style_questions(self, request):
         raise AIQuotaError("cuota agotada (simulado)")
 
     def answer_blind(self, stem, options):
@@ -256,8 +298,130 @@ def seed(db_path: Path, *, with_exam: bool) -> None:
     conn.close()
     if with_exam:
         seed_agenda(db_path, now)
+        seed_exam_styles(db_path, now)
     # Después del plan y los simulacros, para que ninguno use sus preguntas (la oferta pide cero respuestas).
     seed_pretest(db_path, now)
+    seed_documents(db_path, now)
+
+
+def _style(groups, minutes, topic_ids, *, formula_sheet=False, unmatched=()):
+    return json.dumps({
+        "groups": [{"kind": k, "count": c, "points_each": p} for k, c, p in groups],
+        "minutes": minutes, "max_grade": 10, "topic_ids": list(topic_ids),
+        "topics_unmatched": list(unmatched), "formula_sheet": formula_sheet,
+    }, ensure_ascii=False)
+
+
+def seed_exam_styles(db_path: Path, now: int) -> None:
+    """Parciales viejos y formatos de la cátedra (ver el docstring del módulo)."""
+    conn = connect(db_path)
+    exam_id = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM exam")}
+    rectas, final = exam_id["Parcialito de rectas"], exam_id["Final de Matemática"]
+    ready = _style([("opcion_multiple", 5, 2)], 60, [1, 2])
+    past = [
+        # (id, examen, nombre, tipo, estado, formato leído)
+        (1, rectas, "Parcialito 2024, primer cuatrimestre.pdf", "pdf", "done", ready),
+        (2, rectas, "Foto parcialito 2023.jpg", "jpeg", "pending", None),
+        (3, final, "Final diciembre 2024.pdf", "pdf", "done",
+         _style([("opcion_multiple", 4, 1), ("desarrollo", 2, 3)], 120, [1, 2], formula_sheet=True)),
+        (4, final, "Final julio 2025.png", "png", "done",
+         _style([("opcion_multiple", 6, 1), ("desarrollo", 2, 2)], 150, [1, 2, 5], unmatched=["Cónicas"])),
+        (5, final, "Final febrero 2025.pdf", "pdf", "pending", None),
+        (6, final, "Foto final marzo 2024.jpg", "jpeg", "failed", None),
+    ]
+    for pid, exam, name, kind, status, style in past:
+        path = past_exam_file(data_dir(), pid, kind)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = f"parcial de prueba {pid}".encode()
+        path.write_bytes((b"%PDF-1.4\n" if kind == "pdf" else b"") + content)
+        conn.execute(
+            "INSERT INTO past_exam(id, exam_id, name, kind, path, size, sha256, status, style_json, error,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (pid, exam, name, kind, f"parciales/{path.name}", len(content), f"sha-{pid}", status, style,
+             "No se pudo leer" if status == "failed" else None, now - (7 - pid) * 3600),
+        )
+    # Guardados: el del parcialito tiene sus preguntas; al del final le faltan las de desarrollo.
+    conn.execute("UPDATE exam SET style_json = ? WHERE id = ?", (ready, rectas))
+    conn.execute("UPDATE exam SET style_json = ? WHERE id = ?", (
+        _style([("opcion_multiple", 5, 1), ("desarrollo", 2, 2.5)], 135, [1, 2], formula_sheet=True,
+               unmatched=["Cónicas"]), final))
+    conn.commit()
+    conn.close()
+
+
+SUMMARY_PART_1 = """# Polinomios y raíces
+## Grado y coeficiente principal (pág. 3)
+El grado es el mayor exponente de x con coeficiente distinto de cero; ese coeficiente es el principal.
+## Teorema del resto (pág. 14)
+El resto de dividir P(x) por (x − a) es P(a). Si P(a) = 0, entonces a es raíz y (x − a) divide a P.
+## Regla de Ruffini (pág. 22)
+- Divide por (x − a) usando solo los coeficientes.
+- El último número que queda es el resto.
+"""
+
+# (id, material, enunciado, opciones, correcta, explicación, error común, página)
+DOCUMENT_QUESTIONS = [
+    (11, 21, "¿Cuál es el resto de dividir P(x) = x³ − 2x + 1 por (x − 2)?", ["5", "1", "−3", "0"], 0,
+     "Por el teorema del resto, el resto es P(2) = 8 − 4 + 1 = 5.",
+     "Evaluar en −2 en lugar de 2.", 14),
+    (12, 24, "¿Cuántas soluciones tiene un sistema lineal con dos rectas paralelas distintas?",
+     ["Ninguna", "Una", "Dos", "Infinitas"], 0,
+     "Dos rectas paralelas distintas no se cortan: el sistema es incompatible.",
+     "Confundir paralelas distintas con la misma recta (infinitas soluciones).", 5),
+]
+
+
+def seed_documents(db_path: Path, now: int) -> None:
+    """Archivos del campus en Materiales: un PDF en tramos, diapositivas y cada estado de un archivo.
+
+    Preparados hace 10 días, así no compiten con la clase de "3 preguntas para arrancar".
+    """
+    from estudia.material.files import (DOWNLOAD_FAILED_TEXT, FAIL_DOWNLOAD, NOT_READABLE_YET,
+                                        TOO_LARGE_TEXT, UNREADABLE_TEXT)
+
+    at = now - 10 * DAY
+    pluginfile = f"{SITE_URL}/webservice/pluginfile.php"
+    conn = connect(db_path)
+    rows = [
+        # (id, kind, title, status, summary, error, module_id, parent, from, to, pages, fail_kind, remote_url)
+        (20, "pdf", "Apunte 3", "split", None, None, 701, None, None, None, 96, None,
+         f"{pluginfile}/31/mod_resource/content/1/apunte3.pdf"),
+        (21, "pdf", "Capítulo 1: Polinomios y raíces", "done", SUMMARY_PART_1, None, None, 20, 1, 40, None, None, None),
+        (22, "pdf", "Apunte 3, págs. 41–80", "pending", None, None, None, 20, 41, 80, None, None, None),
+        (23, "pdf", "Apunte 3, págs. 81–96", "pending", None, None, None, 20, 81, 96, None, None, None),
+        (24, "slides", "Clase 5: Sistemas de ecuaciones", "done", None, None, 702, None, None, None, 18, None, None),
+        (25, "pdf", "Guía de ejercicios 2", "downloading", None, None, 703, None, None, None, None, None,
+         f"{pluginfile}/33/mod_resource/content/1/guia2.pdf"),
+        (26, "pdf", "Apunte completo escaneado", "too_large", None, TOO_LARGE_TEXT, 704, None, None, None, None,
+         None, None),
+        (27, "slides", "Presentación de la cátedra", "unreadable", None, UNREADABLE_TEXT, 705, None, None, None,
+         None, None, None),
+        (28, "pdf", "Apunte 4: Sistemas lineales", "failed", None, DOWNLOAD_FAILED_TEXT, 706, None, None, None,
+         None, FAIL_DOWNLOAD, f"{pluginfile}/36/mod_resource/content/1/apunte4.pdf"),
+        (29, "file", "Programa de la materia.docx", "unsupported", None, NOT_READABLE_YET, 707, None, None, None, None,
+         None, None),
+    ]
+    for (mid, kind, title, status, summary, error, module_id, parent, page_from, page_to, pages, fail_kind,
+         remote_url) in rows:
+        conn.execute(
+            "INSERT INTO material(id, section_id, kind, title, status, summary_md, error, updated_at,"
+            " file_key, module_id, module_kind, parent_id, page_from, page_to, pages, fail_kind, remote_url)"
+            " VALUES (?, 11, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mid, kind, title, status, summary, error, at,
+             f"{module_id}:/{mid}" if module_id else None, module_id, "resource" if module_id else None,
+             parent, page_from, page_to, pages, fail_kind, remote_url),
+        )
+    conn.execute("INSERT INTO topic VALUES (6, 101, 'polinomios', 'Polinomios y sistemas')")
+    conn.executemany("INSERT INTO material_topic VALUES (?, 6)", [(21,), (24,)])
+    for qid, mat, stem, options, correct, expl, err, page in DOCUMENT_QUESTIONS:
+        conn.execute(
+            "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
+            " explanation, common_error, source_page, verified, dedupe_key)"
+            " VALUES (?, ?, 6, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (qid, mat, stem, json.dumps(options, ensure_ascii=False), correct, expl, err, page, f"q{qid}"),
+        )
+    conn.commit()
+    conn.close()
 
 
 def seed_pretest(db_path: Path, now: int) -> None:
@@ -342,7 +506,10 @@ def main() -> None:
     args = parser.parse_args()
 
     keyring.set_keyring(MemoryKeyring())
-    db_path = Path(tempfile.mkdtemp(prefix="estudia-dev-")) / "estudia.db"
+    folder = Path(tempfile.mkdtemp(prefix="estudia-dev-"))
+    # Parciales y apuntes van a la carpeta temporal, nunca a la de datos de verdad.
+    os.environ[DATA_DIR_ENV] = str(folder)
+    db_path = folder / "estudia.db"
     seed(db_path, with_exam=not args.no_exam)
 
     conn = connect(db_path)

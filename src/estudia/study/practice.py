@@ -9,7 +9,8 @@ from datetime import date, timedelta
 from fsrs import Rating
 
 from estudia.generation.verify import UncheckableExpr, grade_typed, typed_accepts_option, typed_checkable
-from estudia.study.mastery import topic_probability_at_exam
+from estudia.study.citation import DOCUMENT_KINDS, SOURCE_COLUMNS, SOURCE_JOIN, citation, site_url
+from estudia.study.mastery import REGULAR, topic_probability_at_exam
 from estudia.study.sessions import MIXED_ONLY, session_topics, split_minutes
 from estudia.study.srs import (
     RELEARN_DAYS,
@@ -50,6 +51,7 @@ class QuizItem:
     format: str = MCQ                # mcq | think_first | typed
     phase: str = FOCUS               # review | focus
     relearning: dict | None = None   # {"day": 1..3} si está en reaprendizaje
+    points: float | None = None      # en el simulacro con el formato de la cátedra: lo que vale
 
 
 @dataclass
@@ -69,6 +71,9 @@ class AnswerFeedback:
     question_id: int | None = None   # de qué pregunta es (la revisión del simulacro se arma por id)
     answer_id: int | None = None     # fila de `answer` recién guardada
     explain_prompt: bool = False     # pedir "Explicá por qué" (se responde con `record_explain_match`)
+    source_page: int | None = None   # documento: página (o diapositiva) del archivo entero
+    source_label: str | None = None  # documento: "Apunte 3, pág. 14"; None en un video
+    source_url: str | None = None    # documento: la página del módulo en el campus (nunca el archivo)
 
 
 class UnreadableAnswer(ValueError):
@@ -88,7 +93,7 @@ def _weakest_topic(conn: sqlite3.Connection, course_id: int, now: int) -> int | 
     """El tema con menor probabilidad de saberlo el día de su examen (o hoy, si no tiene)."""
     rows = conn.execute(
         "SELECT DISTINCT t.id FROM topic t JOIN question q ON q.topic_id = t.id "
-        "WHERE t.course_id = ? AND q.verified = 1 AND q.retired = 0 ORDER BY t.id",
+        f"WHERE t.course_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR} ORDER BY t.id",
         (course_id,),
     ).fetchall()
     if not rows:
@@ -109,7 +114,7 @@ def _ranked(
         "LEFT JOIN review_state rs ON rs.card_key = 'q:' || q.id "
         "LEFT JOIN (SELECT DISTINCT question_id FROM answer "
         "WHERE correct = 1 AND COALESCE(mode, '') != 'pretest') hit ON hit.question_id = q.id "
-        "WHERE t.course_id = ? AND q.verified = 1 AND q.retired = 0"
+        f"WHERE t.course_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}"
     )
     params: list = [course_id]
     if topic_ids is not None:
@@ -375,11 +380,12 @@ def _insert_answer(
     confidence: int | None = None, mode: str = "mcq", latency_ms: int | None = None,
     option_order: list[int] | None = None, typed_text: str | None = None,
     options_revealed_ms: int | None = None, unreadable_as_wrong: bool = False,
-    typed_ok: bool | None = None, unanswered: bool = False,
+    typed_ok: bool | None = None, unanswered: bool = False, style_mock: bool = False,
 ) -> AnswerFeedback:
     """Como `record_answer` pero sin commit: el que llama maneja la transacción.
 
-    `LookupError` si la pregunta no existe, no está verificada o está retirada;
+    `LookupError` si la pregunta no existe, no está verificada o está retirada, o si es de estilo
+    (`origin='parcial_propio'`) y no viene de un simulacro con el estilo (`style_mock`);
     `NotTypeable` si es escrita y la pregunta no tiene un `check_expr` que sirva para corregir; `UnreadableAnswer`
     si la respuesta escrita no se puede leer; `verify.GradingUnavailable` si no se pudo corregir
     ahora (worker caído o lento); `ValueError` si `chosen_index` está fuera de rango o
@@ -389,10 +395,11 @@ def _insert_answer(
     option_order_json = validate_answer_extras(
         confidence, mode, latency_ms, option_order, typed_text, options_revealed_ms)
     q = conn.execute(
-        "SELECT q.*, m.ref AS youtube_id FROM question q "
-        "LEFT JOIN material m ON m.id = q.material_id "
-        "WHERE q.id = ? AND q.verified = 1 AND q.retired = 0",
-        (question_id,),
+        "SELECT q.*, CASE WHEN COALESCE(m.kind,'youtube')='youtube' THEN m.ref END AS youtube_id, "
+        f"{SOURCE_COLUMNS} FROM question q "
+        f"LEFT JOIN material m ON m.id = q.material_id {SOURCE_JOIN} "
+        f"WHERE q.id = ? AND q.verified = 1 AND q.retired = 0 AND ({REGULAR} OR ?)",
+        (question_id, style_mock),
     ).fetchone()
     if q is None:
         raise LookupError(f"pregunta {question_id} no disponible")
@@ -452,6 +459,8 @@ def _insert_answer(
         next_label = _next_label(review, rating, now)
         if review["state"] == STATE_RELEARNING:
             relearn_progress = f"{review['relearn_days']} de {RELEARN_DAYS} días"
+    # El campus se lee solo para un documento: un video no lleva enlace al campus.
+    label, url = citation(site_url(conn) if q["source_kind"] in DOCUMENT_KINDS else None, q)
     return AnswerFeedback(
         correct=correct,
         correct_index=q["correct_index"],
@@ -468,6 +477,9 @@ def _insert_answer(
         question_id=question_id,
         answer_id=answer_id,
         explain_prompt=explain_prompt,
+        source_page=q["source_page"],
+        source_label=label,
+        source_url=url,
     )
 
 
@@ -477,7 +489,26 @@ def retire_question(conn: sqlite3.Connection, question_id: int) -> None:
     conn.commit()
 
 
+QUESTION_SUPERSEDED_TEXT = ("Esta pregunta era de una versión anterior del material,"
+                            " así que ya no vuelve a la práctica.")
+
+
+class QuestionSuperseded(Exception):
+    """La pregunta es de un material que ya no vale: no se puede volver a mostrar."""
+
+
 def unretire_question(conn: sqlite3.Connection, question_id: int) -> None:
-    """Deshacer el reporte de error: la pregunta vuelve a mostrarse."""
+    """Deshacer el reporte de error: la pregunta vuelve a mostrarse.
+
+    `QuestionSuperseded` si es de un material que ya no vale: un tramo de una versión vieja del
+    archivo (`replaced`), un documento que después se partió (`split`), o un archivo que el campus
+    reemplazó (`moodle.sync._requeue_replaced` deja la clave de sus preguntas en NULL).
+    """
+    row = conn.execute(
+        "SELECT m.status, q.origin, q.dedupe_key FROM question q"
+        " LEFT JOIN material m ON m.id = q.material_id WHERE q.id = ?", (question_id,)).fetchone()
+    if row is not None and (row["status"] in ("replaced", "split")
+                            or (row["origin"] is None and row["dedupe_key"] is None)):
+        raise QuestionSuperseded(QUESTION_SUPERSEDED_TEXT)
     conn.execute("UPDATE question SET retired = 0 WHERE id = ?", (question_id,))
     conn.commit()

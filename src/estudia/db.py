@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS review_state(
     due INTEGER, last_review INTEGER,   -- epoch UTC
     relearn_days INTEGER DEFAULT 0,     -- días locales distintos con acierto desde el último error
     relearn_last_day TEXT);             -- el último de esos días, AAAA-MM-DD en Buenos Aires
+CREATE TABLE IF NOT EXISTS past_exam(
+    id INTEGER PRIMARY KEY, exam_id INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'parcial_propio',   -- nunca sale de la compu
+    name TEXT, kind TEXT,               -- pdf | jpeg | png (por los bytes)
+    path TEXT, size INTEGER, sha256 TEXT,   -- path relativa a la carpeta de datos
+    status TEXT DEFAULT 'pending',      -- pending | done | failed
+    style_json TEXT, error TEXT, created_at INTEGER,
+    UNIQUE(exam_id, sha256));
 """
 
 # Columnas agregadas después de la primera versión: las bases viejas las reciben
@@ -96,6 +104,40 @@ ADDED_COLUMNS = (
     # ¿Se puede ofrecer escrita? 1 sí; 0 no (la regla escrita aceptaría un distractor, "1.41" por √2);
     # NULL todavía no se sabe: se calcula en el worker la primera vez que haría falta (practice.typed_safe_ids).
     ("question", "typed_safe", "INTEGER"),
+    # Página del documento entero (desde 1) o número de diapositiva; NULL en los videos o sin cita.
+    ("question", "source_page", "INTEGER"),
+    # Archivos del campus (`resource` y `folder`). NULL en los videos y en las pages.
+    ("material", "file_key", "TEXT"),              # "{module_id}:{filepath}{filename}"
+    ("material", "module_id", "INTEGER"),          # id del módulo del campus
+    ("material", "module_kind", "TEXT"),           # resource | folder
+    ("material", "remote_url", "TEXT"),            # la `fileurl` del campus, sin token
+    ("material", "remote_size", "INTEGER"),        # bytes según el campus
+    ("material", "remote_modified", "INTEGER"),    # `timemodified` según el campus; si cambia, se baja de nuevo
+    ("material", "parent_id", "INTEGER"),          # en una parte: el documento que se partió
+    ("material", "page_from", "INTEGER"),          # en una parte: desde qué página (desde 1)
+    ("material", "page_to", "INTEGER"),            # en una parte: hasta qué página (inclusivo)
+    ("material", "pages", "INTEGER"),              # páginas, o diapositivas
+    ("material", "has_text", "INTEGER"),           # 0 si es escaneado (casi sin texto)
+    ("material", "file_sha256", "TEXT"),           # del archivo bajado
+    ("material", "download_attempts", "INTEGER"),  # descargas que fallaron; NULL = ninguna
+    ("exam", "style_json", "TEXT"),                # estilo del examen (ExamStyle) que eligió el estudiante; NULL = ninguno
+    # Preguntas generadas con el estilo de un examen: nunca salen de la compu (ni Anki, ni exportaciones).
+    ("question", "origin", "TEXT"),                # NULL = del campus; 'parcial_propio' = generada con el estilo
+    ("question", "style_exam_id", "INTEGER"),      # el examen de cuyo estilo salió
+    ("question", "style_kind", "TEXT"),            # opcion_multiple | verdadero_falso | desarrollo
+    # Sube cada vez que se borra el estilo (y se retiran sus preguntas): va en la clave de las
+    # preguntas de estilo, así un estilo guardado de nuevo puede volver a generar el mismo enunciado.
+    ("exam", "style_revision", "INTEGER"),         # NULL = 0
+    # Simulacro con el formato de la cátedra: puntos de cada pregunta (alineados con
+    # question_ids_json) y 1 si se armó con el estilo. NULL en los de siempre.
+    ("mock_attempt", "points_json", "TEXT"),
+    ("mock_attempt", "style", "INTEGER"),
+)
+
+# Índices sobre columnas de ADDED_COLUMNS: corren después de agregarlas. Un índice único
+# de SQLite admite muchos NULL, así que los materiales de antes (sin archivo) no chocan.
+ADDED_INDEXES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS material_file_key ON material(file_key)",
 )
 
 
@@ -113,6 +155,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             # Otra conexión pudo agregarla recién; si sigue faltando, es un error de verdad.
             if column not in _columns(conn, table):
                 raise
+    for statement in ADDED_INDEXES:
+        conn.execute(statement)
     conn.commit()
 
 

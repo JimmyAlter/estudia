@@ -23,6 +23,8 @@ Gratis, de código abierto y corre en tu PC. Hecho por un estudiante del ingreso
 - **Sabés si llegás al examen.** Para cada tema ves la probabilidad de que lo sepas el día del parcial, y "¿Llegás?" te dice por qué y qué estudiar hoy.
 - **Tu semana, ordenada.** La agenda junta tus horarios de cursada, entregas y exámenes del campus, y un plan reparte sesiones de estudio en el tiempo que le das, sin pisarse con tus clases. Se exporta a Google Calendar o al celular con un archivo `.ics`.
 - **Un simulacro antes del parcial.** Mismos temas, reloj y escala de nota que el examen, sin ver las respuestas hasta el final. Antes te pregunta cuánto creés que te sacás, para que veas si te estás sobreestimando.
+- **También con apuntes en PDF.** Los PDF y las diapositivas del campus se leen como las clases en video, y cada pregunta te dice de qué apunte y de qué página sale.
+- **Simulacro con el formato de tu cátedra.** Cargás tus parciales viejos (PDF o foto) y Estudia copia la cantidad de ejercicios, el tiempo y la escala. Tus parciales quedan en tu compu.
 - **Para cada momento de la cursada.** Inscripciones con aviso antes del cierre, recuperatorio que repasa solo lo que no tenés firme, y final con un plan de 6 semanas. Te lo dice sin retar.
 - **Practicar como pide la ciencia del aprendizaje.** Te pregunta qué tan seguro estabas (una respuesta adivinada no cuenta como sabida), a veces te pide pensar antes de ver las opciones o escribir el resultado, y antes del parcial mezcla temas para que practiques reconocer qué método va.
 
@@ -238,7 +240,8 @@ Hoy el único login probado de punta a punta es `"browser"`. Las entradas nuevas
 - [x] **Etapa 1:** camino UTN-FRBA de punta a punta. Login por navegador, clases en video procesadas con Gemini, preguntas verificadas, práctica con repaso de errores, inicio centrado en el próximo examen y resúmenes.
 - [x] **Etapa 2:** agenda con horarios, entregas y exámenes (también cargados a mano), plan de estudio con "¿Llegás?", simulacro con el reloj y la escala del examen real, repaso espaciado por pregunta, confianza y respuestas escritas, exportar a calendario (`.ics`) y a Anki, y recordatorios en la PC.
 - [x] **Etapa 3a:** cola por fecha de examen y cuota de Gemini mejor aprovechada, 3 preguntas para arrancar, recuerdo libre, "Explicá por qué", "Cómo vengo", mazo de la semana y calendario del campus en el celular, inscripciones, recuperatorio y final.
-- [ ] **Etapa 3b y 3c:** PDF y apuntes (para UBA y el CBC), simulacro con tus parciales viejos, variantes numéricas de las preguntas y problemas en papel corregidos con una foto.
+- [x] **Etapa 3b:** PDF y diapositivas del campus (con la cita "Apunte 3, pág. 14"), y simulacro con el formato de tu cátedra a partir de tus parciales viejos.
+- [ ] **Etapa 3c:** probar con una materia de ejemplo sin campus ni clave, asistente para la clave de Gemini y variantes numéricas de las preguntas.
 - [ ] **Etapa 4:** Claude y ChatGPT además de Gemini, videos subidos a Moodle y PDFs.
 - [ ] **Etapa 5:** catálogo completo (todas las facultades de la tabla), login con usuario y contraseña y con Office 365, y materias sin cuentas con respuestas verificadas contra una cita del material.
 - [x] **Etapa 6:** instalador para Windows, enlace de vuelta del login registrado solo y actualizaciones por GitHub Releases.

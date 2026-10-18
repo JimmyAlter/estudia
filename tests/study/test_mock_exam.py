@@ -538,3 +538,51 @@ def test_mock_not_typeable_during_grading_counts_as_wrong(conn):
     assert r.correct == 0
     row = conn.execute("SELECT correct, typed_text FROM answer WHERE question_id = ?", (typed[0],)).fetchone()
     assert (row["correct"], row["typed_text"]) == (0, "2")
+
+
+def test_document_question_has_no_youtube_link_in_review(conn):
+    """Una pregunta de un PDF no tiene video: nunca un `youtube_id` armado con la ruta del archivo."""
+    from estudia.study.mock_exam import mock_result
+
+    conn.execute("UPDATE material SET kind='pdf', ref='documentos/1.pdf' WHERE id=1")
+    conn.commit()
+    add_exam(conn)
+    fill(conn, 10)
+    s = start_mock(conn, 1, NOW)
+    r = finish_mock(conn, s.attempt_id, {i.question_id: 0 for i in s.items}, NOW + 100)
+    assert r.review and all(f.youtube_id is None for f in r.review)
+    again = mock_result(conn, s.attempt_id)
+    assert again.review and all(f.youtube_id is None for f in again.review)
+
+
+def test_video_question_keeps_youtube_link_in_review(conn):
+    from estudia.study.mock_exam import mock_result
+
+    add_exam(conn)
+    fill(conn, 10)
+    s = start_mock(conn, 1, NOW)
+    r = finish_mock(conn, s.attempt_id, {i.question_id: 0 for i in s.items}, NOW + 100)
+    assert {f.youtube_id for f in r.review} == {"yt1"}
+    assert {f.youtube_id for f in mock_result(conn, s.attempt_id).review} == {"yt1"}
+
+
+def test_mock_review_carries_source_label(conn, monkeypatch):
+    from estudia.catalog import Site
+    from estudia.study import citation
+    from estudia.study.mock_exam import mock_result
+
+    conn.execute("INSERT INTO kv(key, value) VALUES ('site_id', 'x')")
+    monkeypatch.setattr(citation, "get_site",
+                        lambda sid: Site(sid, "X", "X", "https://campus.example.edu", "browser"))
+    conn.execute("UPDATE material SET kind='pdf', title='Apunte 3', ref='documentos/1.pdf',"
+                 " module_kind='resource', module_id=55 WHERE id=1")
+    conn.commit()
+    add_exam(conn)
+    fill(conn, 10)
+    conn.execute("UPDATE question SET source_seconds=NULL, source_page=14")
+    conn.commit()
+    s = start_mock(conn, 1, NOW)
+    r = finish_mock(conn, s.attempt_id, {i.question_id: 0 for i in s.items}, NOW + 100)
+    for review in (r.review, mock_result(conn, s.attempt_id).review):
+        assert {(f.source_label, f.source_page, f.source_url) for f in review} == {
+            ("Apunte 3, pág. 14", 14, "https://campus.example.edu/mod/resource/view.php?id=55")}

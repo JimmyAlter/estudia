@@ -3,6 +3,9 @@ import json
 import math
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+
+from estudia.config import data_dir
 
 EXAM_KINDS = ("parcial", "recuperatorio", "final", "inscripcion")
 FINAL = "final"             # abarca todos los temas de la materia, también los de secciones ocultas
@@ -30,6 +33,8 @@ class ExamOut:
     editable: bool
     result: dict | None = None   # nota real cargada: {"grade", "max_grade", "at"}
     result_skipped: bool = False  # "Prefiero no decir": no se vuelve a preguntar la nota
+    past_exams: int = 0           # parciales viejos cargados por el estudiante
+    has_style: bool = False       # tiene un estilo guardado (`exam.style_json`)
 
 
 def _visible_course_topics(conn: sqlite3.Connection, course_id: int) -> list[int]:
@@ -166,12 +171,22 @@ def update_manual_exam(conn: sqlite3.Connection, exam_id: int, **fields) -> None
         conn.commit()
 
 
-def delete_manual_exam(conn: sqlite3.Connection, exam_id: int) -> None:
+def delete_manual_exam(conn: sqlite3.Connection, exam_id: int, *, base_dir: Path | None = None) -> None:
+    """Borra el examen manual con sus sesiones, su nota y sus parciales viejos (filas y archivos,
+    que están en `base_dir`, por defecto la carpeta de datos), y retira las preguntas generadas con
+    su estilo."""
+    from estudia.study.exam_style import retire_style_questions  # exam_style importa este módulo
+    from estudia.study.past_exams import delete_rows_for_exam  # past_exams importa este módulo
+
     _manual_row(conn, exam_id)
+    retire_style_questions(conn, exam_id)
     conn.execute("DELETE FROM plan_session WHERE exam_id = ?", (exam_id,))
     conn.execute("DELETE FROM exam_result WHERE exam_id = ?", (exam_id,))
+    files = delete_rows_for_exam(conn, exam_id, data_dir() if base_dir is None else base_dir)
     conn.execute("DELETE FROM exam WHERE id = ?", (exam_id,))
     conn.commit()
+    for path in files:  # después del commit: si falla, no queda una fila sin su archivo
+        path.unlink(missing_ok=True)
 
 
 def exam_topics(conn: sqlite3.Connection, exam_id: int) -> list[int]:
@@ -203,6 +218,7 @@ def list_exams(conn: sqlite3.Connection, now: int) -> list[ExamOut]:
         for r in conn.execute("SELECT exam_id, grade, max_grade, at FROM exam_result")
     }
     skipped = _skipped(conn)
+    past_exams = dict(conn.execute("SELECT exam_id, COUNT(*) FROM past_exam GROUP BY exam_id").fetchall())
     upcoming = sorted((r for r in rows if live(r)), key=lambda r: (r["opens_at"] or 0, r["id"]))
     past = sorted((r for r in rows if not live(r)), key=lambda r: (-(r["opens_at"] or 0), r["id"]))
     return [
@@ -213,7 +229,8 @@ def list_exams(conn: sqlite3.Connection, now: int) -> list[ExamOut]:
             topic_ids=exam_topics(conn, r["id"]), max_grade=r["max_grade"],
             time_limit_s=r["time_limit_s"], attempts=r["attempts"],
             editable=r["source"] == "manual", result=results.get(r["id"]),
-            result_skipped=r["id"] in skipped,
+            result_skipped=r["id"] in skipped, past_exams=past_exams.get(r["id"], 0),
+            has_style=r["style_json"] is not None,
         )
         for r in upcoming + past
     ]

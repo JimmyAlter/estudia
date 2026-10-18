@@ -57,6 +57,20 @@ def test_quiz_excludes_unverified_and_retired(conn):
     assert ids(build_quiz(conn, 10, now=NOW)) == [1]
 
 
+def test_due_style_question_never_in_quiz(conn):
+    add_q(conn, 1)
+    add_q(conn, 2)
+    now = local(17, 15, 30)
+    record_answer(conn, 2, 1, now - 30 * DAY)   # queda vencida hace mucho ...
+    conn.execute("UPDATE question SET origin='parcial_propio', style_exam_id=NULL, style_kind='opcion_multiple'"
+                 " WHERE id=2")   # ... y después resulta ser de estilo
+    conn.commit()
+    due = conn.execute("SELECT due FROM review_state WHERE card_key = 'q:2'").fetchone()
+    assert due is not None and due[0] <= now
+    assert ids(build_quiz(conn, 10, now=now)) == [1]
+    assert ids(build_quiz(conn, 10, weakest=True, now=now)) == [1]
+
+
 def test_quiz_items_do_not_leak_answer(conn):
     add_q(conn, 1)
     item = build_quiz(conn, 10, now=NOW)[0]
@@ -567,3 +581,92 @@ def test_explain_spacing_ignores_non_qualified_answers(conn):
     # Calificadas (acierto + Me parece): posiciones 0, 3, 4, 6, 7, 8 -> piden la 1.ª y la 4.ª
     assert [g for g, (_, cf) in zip(got, seq) if cf == 1] == [True, False, False, True, False, False]
     assert not any(g for g, (_, cf) in zip(got, seq) if cf == 2)
+
+
+@pytest.mark.parametrize("kind", ["pdf", "slides"])
+def test_document_question_feedback_has_no_youtube_link(conn, kind):
+    conn.execute("UPDATE material SET kind=?, ref='documentos/1.pdf' WHERE id=1", (kind,))
+    conn.commit()
+    add_q(conn, 1)
+    assert record_answer(conn, 1, 1, NOW).youtube_id is None
+
+
+def test_legacy_material_without_kind_keeps_youtube_link(conn):
+    conn.execute("UPDATE material SET kind=NULL WHERE id=1")
+    conn.commit()
+    add_q(conn, 1)
+    assert record_answer(conn, 1, 1, NOW).youtube_id == "yt123"
+
+
+def _add_document(conn, mid=2, kind="pdf", title="Apunte 3", parent_id=None, module_id=55,
+                  module_kind="resource", page_from=None, page_to=None):
+    conn.execute(
+        "INSERT INTO material(id, section_id, kind, title, ref, status, parent_id, module_id,"
+        " module_kind, page_from, page_to, remote_url) VALUES (?, 1, ?, ?, ?, 'done', ?, ?, ?, ?, ?, ?)",
+        (mid, kind, title, f"documentos/{mid}.pdf", parent_id, module_id, module_kind, page_from,
+         page_to, "https://campus.example.edu/webservice/pluginfile.php/1/x.pdf"),
+    )
+
+
+def _add_doc_q(conn, qid, material_id, page):
+    conn.execute(
+        "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index, "
+        "explanation, common_error, source_seconds, source_page, verified, retired, dedupe_key) "
+        "VALUES (?, ?, 1, ?, ?, 1, 'porque sí', 'error típico', NULL, ?, 1, 0, ?)",
+        (qid, material_id, f"d{qid}", json.dumps(["a", "b", "c"]), page, f"d{qid}"),
+    )
+    conn.commit()
+
+
+def _choose_site(conn, monkeypatch, url="https://campus.example.edu"):
+    from estudia.catalog import Site
+    from estudia.study import citation
+
+    conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('site_id', 'x')")
+    conn.commit()
+    monkeypatch.setattr(citation, "get_site", lambda sid: Site(sid, "X", "X", url, "browser"))
+
+
+def test_pdf_feedback_has_page_not_youtube(conn, monkeypatch):
+    _choose_site(conn, monkeypatch)
+    _add_document(conn)
+    _add_doc_q(conn, 1, 2, 14)
+    fb = record_answer(conn, 1, 1, NOW)
+    assert fb.youtube_id is None
+    assert (fb.source_page, fb.source_label) == (14, "Apunte 3, pág. 14")
+    assert fb.source_url == "https://campus.example.edu/mod/resource/view.php?id=55"
+
+
+def test_part_cites_parent_file_name(conn, monkeypatch):
+    _choose_site(conn, monkeypatch)
+    _add_document(conn, mid=2, title="Libro de Análisis")
+    conn.execute("UPDATE material SET status='split' WHERE id=2")
+    _add_document(conn, mid=3, title="Capítulo 2: Límites", parent_id=2, module_id=None,
+                  module_kind=None, page_from=41, page_to=80)
+    _add_doc_q(conn, 1, 3, 43)
+    fb = record_answer(conn, 1, 1, NOW)
+    assert fb.source_label == "Libro de Análisis, pág. 43"
+    assert fb.source_url == "https://campus.example.edu/mod/resource/view.php?id=55"
+
+
+def test_slides_feedback_cites_slide(conn, monkeypatch):
+    _choose_site(conn, monkeypatch)
+    _add_document(conn, kind="slides", title="Clase 2", module_kind="folder", module_id=8)
+    _add_doc_q(conn, 1, 2, 5)
+    fb = record_answer(conn, 1, 1, NOW)
+    assert fb.source_label == "Clase 2, diap. 5"
+    assert fb.source_url == "https://campus.example.edu/mod/folder/view.php?id=8"
+
+
+def test_video_feedback_has_no_citation(conn, monkeypatch):
+    _choose_site(conn, monkeypatch)
+    add_q(conn, 1)
+    fb = record_answer(conn, 1, 1, NOW)
+    assert (fb.youtube_id, fb.source_label, fb.source_url, fb.source_page) == ("yt123", None, None, None)
+
+
+def test_document_feedback_without_site_has_no_url(conn):
+    _add_document(conn)
+    _add_doc_q(conn, 1, 2, 14)
+    fb = record_answer(conn, 1, 1, NOW)
+    assert fb.source_label == "Apunte 3, pág. 14" and fb.source_url is None

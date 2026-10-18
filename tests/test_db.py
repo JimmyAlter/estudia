@@ -6,6 +6,7 @@ TABLES = {
     "site", "course", "section", "material", "topic", "material_topic",
     "exam", "question", "answer", "kv",
     "class_slot", "deadline", "plan_session", "availability", "mock_attempt", "review_state", "exam_result",
+    "past_exam",
 }
 
 
@@ -160,3 +161,46 @@ def test_connect_drops_the_old_global_calendar_feed_status(tmp_path):
         keys = {r[0] for r in conn.execute("SELECT key FROM kv WHERE key LIKE 'calendar_feed_status%'")}
         assert keys == {"calendar_feed_status:utn-frba"}
         conn.close()
+
+
+FILE_COLUMNS = {"file_key", "module_id", "module_kind", "remote_url", "remote_size", "parent_id",
+                "page_from", "page_to", "pages", "has_text", "file_sha256", "download_attempts"}
+
+
+def test_old_db_gets_file_columns_and_index(tmp_path):
+    """Una base de antes de los archivos del campus, con varios videos: migra dos veces sin chocar."""
+    import sqlite3
+
+    path = tmp_path / "vieja.db"
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE material(id INTEGER PRIMARY KEY, section_id INTEGER, cmid INTEGER UNIQUE,"
+        " kind TEXT, title TEXT, ref TEXT, status TEXT DEFAULT 'pending', summary_md TEXT,"
+        " error TEXT, updated_at INTEGER, fail_kind TEXT, analysis_json TEXT, analysis_model TEXT,"
+        " segments_json TEXT)")
+    for i in range(1, 6):
+        old.execute("INSERT INTO material(id, cmid, kind, title, ref, status) VALUES (?, ?, 'youtube',"
+                    " ?, ?, 'done')", (i, 1000 + i, f"Clase {i}", f"vid{i:08d}"))
+    old.commit()
+    old.close()
+
+    connect(path).close()
+    conn = connect(path)
+    assert FILE_COLUMNS <= _material_columns(conn)
+    index = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='material_file_key'").fetchone()
+    assert index is not None and "UNIQUE" in index["sql"]
+    rows = conn.execute("SELECT kind, status, file_key, parent_id FROM material ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [("youtube", "done", None, None)] * 5
+    conn.execute("INSERT INTO material(kind, file_key) VALUES ('pdf', '7:/a.pdf')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO material(kind, file_key) VALUES ('pdf', '7:/a.pdf')")
+    conn.close()
+
+
+def test_new_database_has_the_file_columns(tmp_path):
+    conn = connect(tmp_path / "e.db")
+    assert FILE_COLUMNS <= _material_columns(conn)
+    conn.execute("INSERT INTO material(kind) VALUES ('youtube')")
+    conn.execute("INSERT INTO material(kind) VALUES ('youtube')")   # muchos NULL no chocan
+    conn.close()

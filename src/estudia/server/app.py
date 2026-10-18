@@ -25,6 +25,8 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, StrictInt
 
@@ -37,8 +39,10 @@ from estudia.ai.base import (
 )
 from estudia.ai.gate import AIBlocked, GatedProvider, age_is_adult
 from estudia.catalog import get_site, load_catalog
-from estudia.config import SYNC_EVERY_S, data_dir
+from estudia.config import DOCUMENTS_DIRNAME, SYNC_EVERY_S, data_dir
 from estudia.db import connect
+from estudia.generation.past_exams import extract_pending_styles
+from estudia.generation.style_questions import fill_style_gaps, style_material_text
 from estudia.generation.verify import GradingUnavailable
 from estudia.generation.pipeline import (
     ALLOW_DOWNLOAD_KEY,
@@ -51,9 +55,13 @@ from estudia.generation.pipeline import (
     download_allowed,
     forget_exhausted_models,
     process_pending,
+    record_stop,
     retry_failed,
     retry_needs_link,
+    stop_reason_for,
 )
+from estudia.material.fetch import fetch_documents
+from estudia.material.files import MAX_PAST_EXAM_BYTES, sweep_upload_copies
 from estudia.moodle.auth import AuthError, launch_url, parse_callback
 from estudia.moodle.calendar_feed import (
     FeedUnreachable,
@@ -80,12 +88,42 @@ from estudia.study.exams import (
     update_manual_exam,
 )
 from estudia.study.home import home_view, next_exam
+from estudia.study.exam_style import (
+    ExamStyle,
+    clear_style,
+    proposed_style,
+    save_style,
+    saved_style,
+    style_gaps,
+    style_topic_ids,
+)
+from estudia.study.past_exams import (
+    TOO_BIG_TEXT as PAST_EXAM_TOO_BIG_TEXT,
+    UPLOAD_FAILED_TEXT as PAST_EXAM_UPLOAD_FAILED_TEXT,
+    WRONG_TYPE_TEXT as PAST_EXAM_WRONG_TYPE_TEXT,
+    PastExamError,
+    add_past_exam,
+    check_can_add,
+    delete_past_exam,
+    list_past_exams,
+    sweep_uploads,
+)
 from estudia.study.progress import progress_view
 from estudia.study.pretest import build_pretest, close_pretest, record_pretest_answer
 from estudia.study.recall import recall_check
+from estudia.study.citation import campus_url as citation_campus_url
+from estudia.study.citation import SITE_KEY as CITATION_SITE_KEY
+from estudia.study.citation import site_url as citation_site_url
 from estudia.study.anki import build_apkg, course_slug, weekly_question_ids
 from estudia.study.ics import EXAM_MIN, build_ics
-from estudia.study.mock_exam import SHORT_NOT_ENOUGH_TEXT, NotEnoughQuestions, finish_mock, mock_result, start_mock
+from estudia.study.mock_exam import (
+    SHORT_NOT_ENOUGH_TEXT,
+    NotEnoughQuestions,
+    finish_mock,
+    mock_result,
+    start_mock,
+    style_not_ready_text,
+)
 from estudia.study.planner import (
     get_availability,
     mark_done_from_answers,
@@ -96,11 +134,13 @@ from estudia.study.planner import (
     set_availability,
 )
 from estudia.study.practice import (
+    REGULAR,
     build_quiz,
     build_session_quiz,
     record_answer,
     record_explain_match,
     retire_question,
+    QuestionSuperseded,
     unretire_question,
 )
 from estudia.study.schedule import (
@@ -117,7 +157,7 @@ from estudia.study.srs import UNSURE
 
 HOST = "127.0.0.1"
 GEMINI_KEY = "gemini_key"
-SITE_KEY = "site_id"
+SITE_KEY = CITATION_SITE_KEY   # kv del campus elegido; `citation.site_url` lee la misma
 SYNC_ERROR_KEY = "last_sync_error"
 # Las escrituras esperan a que termine la sincronización en curso en vez de fallar.
 BUSY_TIMEOUT_MS = 30000
@@ -344,6 +384,8 @@ class Jobs:
         try:
             client = self.moodle_client_factory(get_site(site_id).url, token)
             sync_all(conn, client, site_id)
+            # Los archivos nuevos se bajan después de guardar todo, de a pocos por vez.
+            fetch_documents(conn, client, data_dir() / DOCUMENTS_DIRNAME)
         except TokenInvalid:
             log.warning("Moodle rechazó el token: hay que volver a iniciar sesión")
             forget_moodle_session(site_id)
@@ -369,15 +411,80 @@ class Jobs:
         # Con la clave rechazada se espera a que el usuario cargue otra.
         if not key or _kv_get(conn, STOP_KEY) == "auth":
             return
+        styles_before = _pending_styles(conn)
         try:
-            finished = process_pending(conn, self.provider(key))
+            provider = self.provider(key)
+            style_stop = self._extract_styles(conn, provider)
+            if style_stop is not None and style_stop[0] == "auth":
+                return  # clave rechazada: tampoco se procesan las clases
+            finished = process_pending(conn, provider)
+            self._fill_style_gaps(conn, provider)
         except AIBlocked:
             # Pasó a "menor" a mitad de la corrida: lo que quedó sigue pendiente.
             return
         except Exception as exc:  # noqa: BLE001
             log.warning("Falló el procesamiento (%s)", type(exc).__name__)
             return
+        # `process_pending` empieza borrando el motivo de corte: el de los parciales vuelve si
+        # las clases no dejaron uno propio (así se reintenta a su hora).
+        if style_stop is not None and _kv_get(conn, STOP_KEY) is None:
+            record_stop(conn, *style_stop)
         self._plan_retry(conn, finished)
+        # Quedaron parciales por el tope por corrida y nada cortó: se siguen en un rato, sin
+        # esperar a la sincronización. Solo si esta corrida avanzó (cada vuelta saca al menos
+        # uno de `pending`), así que no puede girar sin fin.
+        styles_left = _pending_styles(conn)
+        if (self.retry_at is None and _kv_get(conn, STOP_KEY) is None
+                and 0 < styles_left < styles_before):
+            self.retry_at = self.clock() + POLL_S
+
+    def _extract_styles(self, conn: sqlite3.Connection, provider) -> tuple[str, float | None] | None:
+        """Lee el estilo de los parciales viejos pendientes, antes de las clases.
+
+        Devuelve el motivo de corte (y cuándo vuelve), o None. Un error de los parciales nunca
+        frena el procesamiento de las clases, salvo la clave rechazada (que vale para todo) y la
+        puerta de edad (que se propaga).
+        """
+        conn.execute("DELETE FROM kv WHERE key IN (?, ?)", (STOP_KEY, QUOTA_RESET_KEY))
+        conn.commit()
+        try:
+            extract_pending_styles(conn, provider, self.clock(), data_dir())
+        except (AIQuotaError, AIUnavailableError, AIAuthError) as exc:
+            reason = stop_reason_for(exc)
+            resets_at = getattr(exc, "resets_at", None)
+            record_stop(conn, reason, resets_at)
+            return reason, resets_at
+        except AIBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001 - las clases se procesan igual
+            log.warning("Falló la lectura de los parciales (%s)", type(exc).__name__)
+            return None
+        reason = _kv_get(conn, STOP_KEY)
+        if reason is None:
+            return None
+        resets_at = _kv_get(conn, QUOTA_RESET_KEY)
+        return reason, float(resets_at) if resets_at is not None else None
+
+    def _fill_style_gaps(self, conn: sqlite3.Connection, provider) -> None:
+        """Genera las preguntas que les faltan a los simulacros con el estilo de la cátedra,
+        después de las clases (que no esperan por esto).
+
+        Con la clave rechazada no se intenta. Un corte (cuota, Gemini caído) queda anotado si las
+        clases no dejaron uno propio; la clave rechazada se anota siempre. La puerta de edad se
+        propaga; cualquier otro error solo se registra.
+        """
+        if _kv_get(conn, STOP_KEY) == "auth":
+            return
+        try:
+            fill_style_gaps(conn, provider, self.clock())
+        except (AIQuotaError, AIUnavailableError, AIAuthError) as exc:
+            reason = stop_reason_for(exc)
+            if reason == "auth" or _kv_get(conn, STOP_KEY) is None:
+                record_stop(conn, reason, getattr(exc, "resets_at", None))
+        except AIBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001 - las clases ya quedaron procesadas
+            log.warning("Falló la generación con el estilo (%s)", type(exc).__name__)
 
     def _plan_retry(self, conn: sqlite3.Connection, finished: int) -> None:
         """Programa el próximo reintento según por qué se cortó el procesamiento.
@@ -407,6 +514,11 @@ class Jobs:
                 self.retry_at = max(float(resets_at), now + POLL_S)
             except ValueError:
                 pass
+
+
+def _pending_styles(conn: sqlite3.Connection) -> int:
+    """Parciales viejos que esperan que Gemini lea su estilo."""
+    return conn.execute("SELECT COUNT(*) FROM past_exam WHERE status = 'pending'").fetchone()[0]
 
 
 def forget_moodle_session(site_id: str) -> None:
@@ -480,6 +592,31 @@ class OriginGuard:
         await self.app(scope, receive, send)
 
 
+# Lo que puede sumar el formulario multipart (límites y encabezados) sobre el archivo.
+UPLOAD_OVERHEAD_BYTES = 1024 * 1024
+
+
+class BodyTooLarge(Exception):
+    """El cuerpo del pedido trajo más bytes de los que se aceptan (o de los que declaró)."""
+
+
+def capped_receive(receive, limit: int):
+    """Envuelve `receive` y corta en cuanto el cuerpo pasa de `limit` bytes, mientras llega:
+    un `Content-Length` mentiroso no hace leer de más."""
+    seen = 0
+
+    async def wrapped():
+        nonlocal seen
+        message = await receive()
+        if message["type"] == "http.request":
+            seen += len(message.get("body", b""))
+            if seen > limit:
+                raise BodyTooLarge
+        return message
+
+    return wrapped
+
+
 class SiteIn(BaseModel):
     site_id: str
 
@@ -544,7 +681,7 @@ def _quiz_course(conn: sqlite3.Connection, topic_id: int | None, now: int) -> in
         return exam["course_id"]
     row = conn.execute(
         "SELECT MIN(t.course_id) FROM topic t JOIN question q ON q.topic_id = t.id"
-        " WHERE q.verified = 1 AND q.retired = 0"
+        f" WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR}"
     ).fetchone()
     return row[0]
 
@@ -586,6 +723,7 @@ class MockStartIn(BaseModel):
     exam_id: int
     predicted_grade: float | None = None
     short: bool = False   # simulacro corto de 6 preguntas (el sugerido en un recuperatorio)
+    style: bool = False   # con el formato de la cátedra (el estilo guardado del examen)
 
 
 class MockAnswerIn(BaseModel):
@@ -679,14 +817,8 @@ def agenda_week(conn: sqlite3.Connection, monday: date, now: int) -> dict:
 
 def _campus_url(conn: sqlite3.Connection) -> str | None:
     """URL base del campus elegido, solo si es http(s)."""
-    site_id = _kv_get(conn, SITE_KEY)
-    if not site_id:
-        return None
-    try:
-        url = get_site(site_id).url.rstrip("/")
-    except KeyError:
-        return None
-    return url if url.startswith(("https://", "http://")) else None
+    # `get_site` se busca en este módulo al llamar: los tests lo reemplazan acá.
+    return citation_site_url(conn, lambda site_id: get_site(site_id))
 
 
 def create_app(
@@ -701,6 +833,10 @@ def create_app(
 ) -> FastAPI:
     if db_path is None:
         db_path = data_dir() / "estudia.db"
+    # Al arrancar ninguna carga ni subida está en curso: lo que quedó a medias de una corrida
+    # cortada (un parcial a medio cargar, la copia de un apunte para Gemini) se borra.
+    sweep_uploads(data_dir())
+    sweep_upload_copies(data_dir())
     if open_browser is None:
         import webbrowser
 
@@ -722,6 +858,9 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def _invalid(request: Request, exc: RequestValidationError) -> JSONResponse:
         # La respuesta por defecto repite la entrada (podría ser una clave o el callback).
+        if request.method == "POST" and request.url.path.endswith("/past-exams"):
+            # Esta la lee el estudiante tal cual, debajo de "Elegir archivo".
+            return JSONResponse({"detail": PAST_EXAM_UPLOAD_FAILED_TEXT}, status_code=422)
         return JSONResponse({"detail": "datos inválidos"}, status_code=422)
 
     def get_conn() -> Iterator[sqlite3.Connection]:
@@ -740,6 +879,11 @@ def create_app(
     def start_jobs(background: BackgroundTasks) -> None:
         if jobs.try_start(queue=True):
             background.add_task(jobs.run_reserved)
+
+    def start_processing(background: BackgroundTasks) -> None:
+        """Como `start_jobs`, pero la primera vuelta solo procesa (no sincroniza)."""
+        if jobs.try_start(queue=True):
+            background.add_task(jobs.run_reserved, sync=False)
 
     @app.get("/api/state")
     def state(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
@@ -901,11 +1045,18 @@ def create_app(
         sections: dict[int, dict] = {}
         rows = conn.execute(
             "SELECT s.id AS section_id, s.course_id, s.num, s.name AS section_name,"
-            " c.fullname AS course, m.id, m.cmid, m.title, m.kind, m.status, m.summary_md, m.error, m.ref"
+            " c.fullname AS course, m.id, m.cmid, m.title, m.kind, m.status, m.summary_md, m.error, m.ref, m.fail_kind,"
+            " m.pages, m.page_from, m.page_to, p.title AS parent_title,"
+            " COALESCE(p.module_kind, m.module_kind) AS module_kind,"
+            " COALESCE(p.module_id, m.module_id) AS module_id"
             " FROM section s"
             " LEFT JOIN course c ON c.id = s.course_id"
             " JOIN material m ON m.section_id = s.id"
-            " WHERE s.visible = 1 ORDER BY s.course_id, s.num, m.id"
+            " LEFT JOIN material p ON p.id = m.parent_id"
+            # Un documento partido no se lista: se listan sus tramos, en su lugar y en orden. Un
+            # tramo de una versión anterior del archivo (`replaced`) tampoco.
+            " WHERE s.visible = 1 AND m.status NOT IN ('split', 'replaced')"
+            " ORDER BY s.course_id, s.num, COALESCE(m.parent_id, m.id), m.page_from, m.id"
         )
         # Temas de cada clase y cuántas preguntas se pueden practicar de ellos ("Practicar esta clase").
         topics_of: dict[int, list[int]] = {}
@@ -914,10 +1065,14 @@ def create_app(
         questions_in = {
             r["topic_id"]: r["n"]
             for r in conn.execute(
-                "SELECT topic_id, COUNT(*) AS n FROM question WHERE verified = 1 AND retired = 0 GROUP BY topic_id"
+                "SELECT q.topic_id, COUNT(*) AS n FROM question q WHERE q.verified = 1 AND q.retired = 0"
+                f" AND {REGULAR} GROUP BY q.topic_id"
             )
         }
         for r in rows:
+            # `doc`: el nombre del documento entero ("Apunte 3"), para "Apunte 3, págs. 1–40".
+            part = ({"from": r["page_from"], "to": r["page_to"], "doc": r["parent_title"]}
+                    if r["page_from"] is not None and r["page_to"] is not None else None)
             section = sections.setdefault(r["section_id"], {
                 "id": r["section_id"], "course_id": r["course_id"], "course": r["course"],
                 "num": r["num"], "name": r["section_name"], "materials": [],
@@ -926,10 +1081,13 @@ def create_app(
                 "id": r["id"], "title": r["title"], "kind": r["kind"], "status": r["status"],
                 "summary_md": r["summary_md"], "error": r["error"],
                 "youtube_id": r["ref"] if r["kind"] == "youtube" else None,
-                "campus_url": (f"{site_url}/mod/page/view.php?id={r['cmid']}"
-                               if site_url and r["cmid"] else None),
+                "campus_url": citation_campus_url(site_url, r),
                 "topic_ids": topics_of.get(r["id"], []),
                 "questions": sum(questions_in.get(t, 0) for t in topics_of.get(r["id"], [])),
+                "part": part,
+                "pages": r["page_to"] - r["page_from"] + 1 if part else r["pages"],
+                # Por qué falló: "download" es un archivo del campus que no se pudo bajar.
+                "fail_kind": r["fail_kind"],
             })
         return list(sections.values())
 
@@ -1042,7 +1200,10 @@ def create_app(
     def unretire(question_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
         if conn.execute("SELECT 1 FROM question WHERE id=?", (question_id,)).fetchone() is None:
             raise HTTPException(404, "pregunta inexistente")
-        unretire_question(conn, question_id)
+        try:
+            unretire_question(conn, question_id)
+        except QuestionSuperseded as exc:
+            raise HTTPException(409, str(exc)) from None
         return {"ok": True}
 
     # --- Agenda, exámenes, horarios, plan, simulacro y calendario (datos locales) ----------------
@@ -1123,10 +1284,144 @@ def create_app(
     def remove_exam(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
         exam_exists(conn, exam_id)
         try:
-            delete_manual_exam(conn, exam_id)
+            delete_manual_exam(conn, exam_id, base_dir=data_dir())
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         replan_safely(conn, int(time.time()))
+        return {"ok": True}
+
+    @app.post("/api/exams/{exam_id}/past-exams", status_code=201)
+    async def upload_past_exam(exam_id: int, request: Request, background: BackgroundTasks) -> dict:
+        """Un parcial viejo desde la compu del estudiante (multipart, campo `file`).
+
+        Todo lo que se puede decidir por los encabezados se decide antes de leer el cuerpo; el
+        cuerpo se corta mientras llega si pasa de lo declarado. El trabajo sincrónico (base,
+        foto, revisión del PDF en el sandbox) corre en el threadpool, fuera del event loop.
+        """
+        declared = request.headers.get("content-length")
+        if declared is None:
+            raise HTTPException(411, PAST_EXAM_UPLOAD_FAILED_TEXT)
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(400, PAST_EXAM_UPLOAD_FAILED_TEXT) from None
+        if length < 0:
+            raise HTTPException(400, PAST_EXAM_UPLOAD_FAILED_TEXT)
+        if length > MAX_PAST_EXAM_BYTES + UPLOAD_OVERHEAD_BYTES:
+            raise HTTPException(413, PAST_EXAM_TOO_BIG_TEXT)
+        if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            raise HTTPException(415, PAST_EXAM_WRONG_TYPE_TEXT)
+
+        def precheck() -> None:
+            conn = jobs.connect()
+            try:
+                check_can_add(conn, exam_id)
+            finally:
+                conn.close()
+
+        # Examen inexistente, inscripción o tope lleno: se responde sin leer el cuerpo.
+        try:
+            await run_in_threadpool(precheck)
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
+        except PastExamError as exc:
+            raise HTTPException(exc.status, str(exc)) from None
+
+        capped = Request(request.scope, receive=capped_receive(request.receive, length))
+        try:
+            # Si falla a mitad, el parser de Starlette cierra (y así borra) sus temporales.
+            form = await capped.form(max_files=1, max_fields=1)
+        except BodyTooLarge:
+            raise HTTPException(413, PAST_EXAM_TOO_BIG_TEXT) from None
+        try:
+            upload = form.get("file")
+            if not isinstance(upload, UploadFile):
+                raise HTTPException(400, "Falta el archivo")
+            data = await upload.read(MAX_PAST_EXAM_BYTES + 1)
+            filename = upload.filename
+        finally:
+            await form.close()
+        if len(data) > MAX_PAST_EXAM_BYTES:
+            raise HTTPException(413, PAST_EXAM_TOO_BIG_TEXT)
+
+        def store() -> dict:
+            conn = jobs.connect()
+            try:
+                past_exam_id = add_past_exam(conn, exam_id, data, filename, int(time.time()), data_dir())
+                row = conn.execute("SELECT id, name, status FROM past_exam WHERE id = ?",
+                                   (past_exam_id,)).fetchone()
+                return dict(row)
+            finally:
+                conn.close()
+
+        try:
+            created = await run_in_threadpool(store)
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
+        except PastExamError as exc:
+            raise HTTPException(exc.status, str(exc)) from None
+        start_processing(background)
+        return created
+
+    @app.get("/api/exams/{exam_id}/past-exams")
+    def past_exams_of_exam(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
+        exam_exists(conn, exam_id)
+        return list_past_exams(conn, exam_id)
+
+    @app.delete("/api/exams/{exam_id}/past-exams/{past_exam_id}")
+    def remove_past_exam(exam_id: int, past_exam_id: int,
+                         conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            delete_past_exam(conn, exam_id, past_exam_id, data_dir())
+        except LookupError:
+            raise HTTPException(404, "El parcial no existe") from None
+        return {"ok": True}
+
+    @app.get("/api/exams/{exam_id}/style")
+    def exam_style_view(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        """El estilo guardado, el propuesto por los parciales (con de dónde salió) y los temas
+        del curso para elegir. `missing`: cuántas preguntas le faltan al simulacro con el estilo
+        guardado, y `missing_text`, el aviso que daría el 409 al empezar con él; `can_generate`: si
+        hay material de sus temas para generarlas."""
+        exam_exists(conn, exam_id)
+        saved = saved_style(conn, exam_id)
+        proposed, sources = proposed_style(conn, exam_id)
+        course_id = conn.execute("SELECT course_id FROM exam WHERE id = ?", (exam_id,)).fetchone()[0]
+        topics = [{"id": r["id"], "name": r["name"]} for r in conn.execute(
+            "SELECT id, name FROM topic WHERE course_id = ? ORDER BY name, id", (course_id,))]
+        missing = sum(style_gaps(conn, exam_id).values())
+        return {
+            "saved": saved.model_dump() if saved is not None else None,
+            "proposed": proposed.model_dump() if proposed is not None else None,
+            "sources": [asdict(s) for s in sources],
+            "topics": topics,
+            "missing": missing,
+            # El mismo texto del 409 al empezar con el formato: la pantalla lo muestra tal cual.
+            "missing_text": style_not_ready_text(missing) if missing else None,
+            "can_generate": saved is not None and bool(
+                style_material_text(conn, style_topic_ids(conn, exam_id, saved))),
+            "ai": ai_age(conn) == "adult" and bool(get_secret(GEMINI_KEY)),
+        }
+
+    @app.put("/api/exams/{exam_id}/style")
+    def put_exam_style(exam_id: int, body: ExamStyle, background: BackgroundTasks,
+                       conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        exam_exists(conn, exam_id)
+        try:
+            save_style(conn, exam_id, body)
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        start_processing(background)
+        return {"ok": True}
+
+    @app.delete("/api/exams/{exam_id}/style")
+    def delete_exam_style(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            clear_style(conn, exam_id)
+        except LookupError:
+            raise HTTPException(404, "El examen no existe") from None
         return {"ok": True}
 
     @app.get("/api/exams/{exam_id}/topics")
@@ -1207,8 +1502,11 @@ def create_app(
     def mock_start(body: MockStartIn, conn: sqlite3.Connection = Depends(get_conn)):
         # NotEnoughQuestions hereda de ValueError: va primero.
         try:
-            return start_mock(conn, body.exam_id, int(time.time()), body.predicted_grade, short=body.short)
-        except NotEnoughQuestions:
+            return start_mock(conn, body.exam_id, int(time.time()), body.predicted_grade,
+                              short=body.short, style=body.style)
+        except NotEnoughQuestions as exc:
+            if body.style:   # "Todavía faltan {n} preguntas…": se ofrece el de siempre
+                raise HTTPException(409, str(exc)) from None
             raise HTTPException(409, SHORT_NOT_ENOUGH_TEXT if body.short else NOT_ENOUGH_TEXT) from None
         except LookupError:
             raise HTTPException(404, "El examen no existe") from None

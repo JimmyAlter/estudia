@@ -265,6 +265,18 @@ def test_age_is_adult_with_a_bad_path_is_not_adult(bad_path):
     assert age_is_adult(bad_path) is False
 
 
+def test_minor_never_sends_document():
+    from estudia.ai.base import DocumentInput
+    from estudia.ai.gate import AIBlocked, GatedProvider
+
+    fake = FakeProvider({}, lambda s, o: 1)
+    doc = DocumentInput(kind="pdf", title="Apunte 3", pages=3, data=b"%PDF-1.4")
+    with pytest.raises(AIBlocked):
+        GatedProvider(fake, lambda: False).analyze_document(doc)
+    assert fake.analyzed_docs == []
+    assert fake.requests["pdf"] == 0
+
+
 def test_gated_provider_passes_link_settings_through():
     """El envoltorio deja leer y escribir la marca del enlace y la descarga del proveedor."""
     from estudia.ai.gate import GatedProvider

@@ -292,3 +292,216 @@ describe("Simulacro: ronda 2", () => {
     expect(line.textContent).toBe("90 segundos por pregunta");
   });
 });
+
+describe("Simulacro: cita de un apunte", () => {
+  it("la revisión del simulacro cita la página del apunte", async () => {
+    routes({
+      "POST /api/mock/9/finish": {
+        ...RESULT,
+        review: [
+          fb({ question_id: 1 }),
+          fb({
+            question_id: 2, correct: false, chosen_index: null, typed_ok: false, explanation: "Derivá bien.",
+            source_page: 14, source_label: "Apunte 3, pág. 14",
+            source_url: "https://campus.example/mod/resource/view.php?id=31",
+          }),
+        ],
+      },
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Empezar" }));
+    await screen.findByText("Pregunta 1");
+    await userEvent.click(screen.getByRole("button", { name: "Terminar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Sí, terminar" }));
+
+    const link = await screen.findByRole("link", { name: "Apunte 3, pág. 14" });
+    expect(link).toHaveAttribute("href", "https://campus.example/mod/resource/view.php?id=31");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+});
+
+describe("Simulacro con el formato de la cátedra", () => {
+  const SAVED = {
+    groups: [
+      { kind: "opcion_multiple", count: 6, points_each: 1 },
+      { kind: "desarrollo", count: 2, points_each: 2 },
+    ],
+    minutes: 90,
+    max_grade: 10,
+    topic_ids: [1, 2],
+    topics_unmatched: [],
+    formula_sheet: false,
+  };
+  const styleView = (over: Record<string, unknown> = {}) => ({
+    saved: SAVED,
+    proposed: null,
+    sources: [],
+    topics: [
+      { id: 1, name: "Límites" },
+      { id: 2, name: "Derivadas" },
+    ],
+    missing: 0,
+    missing_text: null,
+    can_generate: true,
+    ai: true,
+    ...over,
+  });
+  const NOT_READY = "Todavía faltan 3 preguntas con el formato de tu cátedra. Se preparan solas.";
+
+  it("el simulacro con formato muestra cantidad, tiempo y escala", async () => {
+    const fetchMock = routes({ "GET /api/exams/4/style": styleView(), "GET /api/exams/4/past-exams": [] });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByText("8 preguntas")).toBeInTheDocument();
+    const line = screen.getByText("8 preguntas").parentElement!;
+    expect(line).toHaveTextContent("8 preguntas · 1 h 30 min · sobre 10");
+    expect(screen.queryByText(/90 segundos por pregunta/)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Empezar" }));
+    expect(bodyOf(fetchMock, "/api/mock/start")).toEqual({ exam_id: 4, predicted_grade: null, style: true });
+  });
+
+  it("si faltan preguntas ofrece el simulacro de siempre", async () => {
+    const fetchMock = routes({
+      "GET /api/exams/4/style": styleView({ missing: 3, missing_text: NOT_READY }),
+      "GET /api/exams/4/past-exams": [],
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByText(NOT_READY)).toBeInTheDocument();
+    // Una sola salida principal: el de siempre. La línea de arriba describe ese, no el del formato.
+    expect(screen.queryByRole("button", { name: "Empezar" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hacer el simulacro de siempre" })).toHaveClass("bg-ink");
+    expect(screen.getByRole("button", { name: "Volver" })).toHaveClass("text-muted");
+    expect(screen.queryByText("8 preguntas")).not.toBeInTheDocument();
+    expect(screen.getByText("90 segundos por pregunta")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Hacer el simulacro de siempre" }));
+    expect(bodyOf(fetchMock, "/api/mock/start")).toEqual({ exam_id: 4, predicted_grade: null });
+    expect(await screen.findByText("Pregunta 1")).toBeInTheDocument();
+  });
+
+  it("el aviso de las que faltan es el texto del servidor, tal cual", async () => {
+    const fromServer = "Todavía falta 1 pregunta con el formato de tu cátedra. Texto del servidor.";
+    routes({ "GET /api/exams/4/style": styleView({ missing: 1, missing_text: fromServer }), "GET /api/exams/4/past-exams": [] });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByText(fromServer)).toHaveAttribute("role", "status");
+    expect(screen.queryByText(/Se preparan solas/)).not.toBeInTheDocument();
+  });
+
+  it("sin clases preparadas de esos temas lo dice y ofrece el de siempre", async () => {
+    routes({
+      "GET /api/exams/4/style": styleView({ missing: 3, missing_text: NOT_READY, can_generate: false }),
+      "GET /api/exams/4/past-exams": [],
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByText("Faltan clases preparadas de estos temas para armar las preguntas que faltan.")).toBeInTheDocument();
+    expect(screen.queryByText(NOT_READY)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hacer el simulacro de siempre" })).toBeInTheDocument();
+  });
+
+  it("si al empezar todavía faltan, lo dice tranquilo y ofrece el de siempre", async () => {
+    routes({
+      "GET /api/exams/4/style": styleView(),
+      "GET /api/exams/4/past-exams": [],
+      "POST /api/mock/start": (body: unknown) =>
+        (body as { style?: boolean }).style ? jsonResponse(409, { detail: NOT_READY }) : START,
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Empezar" }));
+    const notice = await screen.findByText(NOT_READY);
+    expect(notice).not.toHaveClass("text-bad");
+    expect(screen.queryByRole("button", { name: "Empezar" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Hacer el simulacro de siempre" }));
+    expect(await screen.findByText("Pregunta 1")).toBeInTheDocument();
+  });
+
+  it("la pantalla de antes muestra los parciales y el formato, pero no en el corto", async () => {
+    routes({ "GET /api/exams/4/style": styleView({ saved: null, proposed: SAVED }), "GET /api/exams/4/past-exams": [] });
+    const { unmount } = render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByRole("heading", { name: "Cargá tus parciales viejos" })).toBeVisible();
+    expect(screen.getByText("Si cambió la bibliografía, revisá que los temas sigan entrando.")).toBeVisible();
+    // Sin formato guardado no hay nada que plegar.
+    expect(screen.queryByText("Cambiar el formato o cargar parciales")).not.toBeInTheDocument();
+    unmount();
+
+    render(<Mock onPractice={() => {}} onExit={() => {}} start={{ examId: 4, short: true }} />);
+    expect(await screen.findByText("Simulacro corto")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Cargá tus parciales viejos" })).not.toBeInTheDocument();
+    expect(screen.queryByText("8 preguntas")).not.toBeInTheDocument();
+  });
+
+  it("con un formato guardado, los parciales y el editor van plegados", async () => {
+    routes({ "GET /api/exams/4/style": styleView(), "GET /api/exams/4/past-exams": [] });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    const summary = await screen.findByText("Cambiar el formato o cargar parciales");
+    const details = summary.closest("details")!;
+    expect(details.open).toBe(false);
+    // Lo principal sigue arriba, a la vista.
+    expect(screen.getByRole("button", { name: "Empezar" })).toBeVisible();
+
+    await userEvent.click(summary);
+    expect(details.open).toBe(true);
+    expect(await screen.findByRole("heading", { name: "Cargá tus parciales viejos" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Volver al de siempre" })).toBeInTheDocument();
+  });
+
+  it("sin IA no ofrece cargar parciales: solo cambiar el formato", async () => {
+    routes({ "GET /api/exams/4/style": styleView({ ai: false }), "GET /api/exams/4/past-exams": [] });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    const summary = await screen.findByText("Cambiar el formato");
+    await userEvent.click(summary);
+    expect(screen.getByRole("heading", { name: "Formato de tu cátedra" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Cargá tus parciales viejos" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Elegir archivo")).not.toBeInTheDocument();
+  });
+
+  it("sin IA y sin formato guardado tampoco aparece la carga de parciales", async () => {
+    routes({ "GET /api/exams/4/style": styleView({ ai: false, saved: null }), "GET /api/exams/4/past-exams": [] });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByRole("heading", { name: "Formato de tu cátedra" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Cargá tus parciales viejos" })).not.toBeInTheDocument();
+  });
+
+  it("si todas valen lo mismo, no se dicen los puntos", async () => {
+    routes({
+      "POST /api/mock/start": { ...START, items: [q(1, { points: 2 }), q(2, { points: 2 })] },
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Empezar" }));
+    await screen.findByText("Pregunta 1");
+    expect(screen.queryByText("2 puntos")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Terminar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Sí, terminar" }));
+    await screen.findByRole("heading", { name: "Revisión" });
+    expect(screen.queryByText(/puntos/)).not.toBeInTheDocument();
+  });
+
+  it("cada pregunta muestra sus puntos", async () => {
+    routes({
+      "POST /api/mock/start": { ...START, items: [q(1, { points: 1 }), q(2, { points: 2.5 })] },
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Empezar" }));
+    await screen.findByText("Pregunta 1");
+    expect(screen.getByText("1 punto")).toHaveClass("text-sm", "text-muted");
+    await userEvent.click(screen.getByRole("button", { name: "Siguiente" }));
+    expect(await screen.findByText("2,5 puntos")).toBeInTheDocument();
+  });
+
+  it("la revisión del simulacro con formato dice cuánto valía cada pregunta", async () => {
+    routes({
+      "POST /api/mock/start": { ...START, items: [q(1, { points: 1 }), q(2, { points: 2.5 })] },
+      "POST /api/mock/9/finish": {
+        ...RESULT,
+        review: [fb({ question_id: 1 }), fb({ question_id: 2, correct: false, chosen_index: null, typed_ok: false })],
+      },
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Empezar" }));
+    await screen.findByText("Pregunta 1");
+    await userEvent.click(screen.getByRole("button", { name: "Terminar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Sí, terminar" }));
+    await screen.findByRole("heading", { name: "Revisión" });
+    expect(screen.getByText(/^1 · .* · 1 punto$/)).toBeInTheDocument();
+    expect(screen.getByText(/^2 · .* · 2,5 puntos$/)).toBeInTheDocument();
+  });
+});

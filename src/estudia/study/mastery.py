@@ -11,6 +11,10 @@ from estudia.study.srs import STATE_RELEARNING, exam_dates_by_topic, retrievabil
 
 MIN_SEEN = 8            # preguntas vistas que hacen falta para poder llegar a 100 %
 RELEARNING_CAP = 0.5    # tope de lo que aporta una pregunta en reaprendizaje
+# Solo las del campus. Las generadas con el estilo de un examen (`origin='parcial_propio'`)
+# viven solo en el simulacro de ese examen: no entran en la práctica, el dominio, los conteos,
+# el plan ni la calibración. Se usa sobre la tabla `question` con el alias `q`.
+REGULAR = "q.origin IS NULL"
 
 
 def topic_probability(conn: sqlite3.Connection, topic_id: int, at: int) -> float:
@@ -19,13 +23,13 @@ def topic_probability(conn: sqlite3.Connection, topic_id: int, at: int) -> float
     Solo lee `review_state`, que `connect` y cada respuesta registrada mantienen al día.
     """
     total = conn.execute(
-        "SELECT COUNT(*) FROM question WHERE topic_id = ? AND verified = 1 AND retired = 0",
+        f"SELECT COUNT(*) FROM question q WHERE q.topic_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}",
         (topic_id,),
     ).fetchone()[0]
     rows = conn.execute(
         "SELECT rs.stability, rs.last_review, rs.state FROM review_state rs "
         "JOIN question q ON rs.card_key = 'q:' || q.id "
-        "WHERE q.topic_id = ? AND q.verified = 1 AND q.retired = 0",
+        f"WHERE q.topic_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}",
         (topic_id,),
     ).fetchall()
     denominator = max(len(rows), min(total, MIN_SEEN))

@@ -154,7 +154,7 @@ def test_requests_are_added_to_the_daily_usage(conn):
     prov = Counting({"A": [1], "B": [1], "C": AIQuotaError()})
     reverify_all(conn, prov)
     assert used_today(conn, "blind", time.time()) == 3
-    assert prov.requests == {"analysis": 0, "blind": 0}
+    assert prov.requests == {"analysis": 0, "blind": 0, "pdf": 0}
 
     boom = Counting({"A": RuntimeError("se rompió")})
     conn.execute("DELETE FROM kv WHERE key LIKE 'reverified:%'")

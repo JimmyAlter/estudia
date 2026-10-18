@@ -88,6 +88,27 @@ def test_predictions_use_latest_finished_mock_and_scale(conn):
     assert prediction_gap(rows) == 1.0  # |80 - 70| / 100 * 10
 
 
+def test_same_scale_mock_prediction_is_unchanged(conn):
+    """Simulacro y examen en la misma escala (de 10): la prevista y la nota pasan tal cual."""
+    exam(conn)
+    mock(conn, 1, predicted=7.5, grade=6.25, max_grade=10.0)
+    real(conn, 1, 5, 10.0)
+    r, = predictions(conn)
+    assert (r.predicted, r.mock_grade, r.real, r.max_grade) == (7.5, 6.25, 5.0, 10.0)
+    assert prediction_gap([r]) == 2.5
+
+
+def test_prediction_converted_when_mock_scale_differs(conn):
+    """Con el formato de la cátedra el simulacro puede ser sobre 100 y la nota real sobre 10:
+    la prevista y la nota del simulacro se llevan a la escala de la real antes de comparar."""
+    exam(conn)
+    mock(conn, 1, predicted=80, grade=60, max_grade=100.0)
+    real(conn, 1, 7, 10.0)
+    r, = predictions(conn)
+    assert (r.predicted, r.mock_grade, r.real, r.max_grade) == (8.0, 6.0, 7.0, 10.0)
+    assert prediction_gap([r]) == 1.0
+
+
 def test_gap_ignores_rows_without_prediction(conn):
     exam(conn, 1)
     exam(conn, 2, name="Final")

@@ -1,12 +1,9 @@
-## Novedades de la 0.3.0
+## Novedades de la 0.4.0
 
-- **Arrancás antes:** las clases del próximo examen se preparan primero, y apenas hay 10 preguntas ya podés practicar.
-- **Rinde más el plan gratis de Gemini:** la verificación de preguntas va de a 4 clases por pedido, con un presupuesto diario por función.
-- **3 preguntas para arrancar** cuando aparece una clase nueva. No cuentan: es para que la clase te rinda más.
-- **Contá lo que te acordás** antes de leer el resumen, y ves qué títulos no mencionaste. Sin IA.
-- **Explicá por qué** después de un acierto dudoso, y **Cómo vengo**: cuánto acertás cuando decís «Seguro» y qué tan cerca estuvo tu predicción.
-- **En el celular:** el mazo de la semana para Anki y una guía para ver el calendario del campus en Google Calendar.
-- **Inscripciones** con aviso 3 días antes del cierre, **recuperatorio** solo con los temas que no tenés firmes, y **final** con un plan de 6 semanas.
+- **Apuntes en PDF y diapositivas del campus:** se bajan, se leen y arman preguntas verificadas igual que las clases en video. Cada pregunta cita "Apunte 3, pág. 14" con el enlace al campus.
+- **Simulacro con el formato de tu cátedra:** cargá tus parciales viejos (PDF o foto) y Estudia saca la cantidad de ejercicios, el tiempo y la escala. Podés editar el formato. Las preguntas que falten se generan y se verifican como todas.
+- **Tus parciales no salen de tu compu:** no van a Anki, al calendario ni a ninguna exportación. A las fotos y los PDF se les borran los datos ocultos, como la ubicación del celular.
+- **Más robusto:** un archivo raro del campus no frena la sincronización, y los videos y los apuntes no se traban entre sí en la cola.
 
 Si ya tenías Estudia, instalá encima: tus materias y tu progreso se mantienen.
 

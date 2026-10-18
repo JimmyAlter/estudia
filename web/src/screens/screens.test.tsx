@@ -330,7 +330,7 @@ describe("Materials", () => {
     expect(await screen.findByText("Video-clase 1: Rectas")).toBeInTheDocument();
     expect(screen.queryByText("listo")).not.toBeInTheDocument();
     expect(screen.getByText("Se prepara mañana")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Abrir en el campus" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Solo en el campus" })).toHaveAttribute(
       "href",
       "https://campus.example/mod/page/view.php?id=9",
     );
@@ -344,24 +344,37 @@ describe("Materials: reintentar", () => {
     const fetchMock = mockApi({
       "GET /api/materials": () => [
         { id: 1, course_id: 1, course: "Matemática", num: 1, name: "UNIDAD 1",
-          materials: [{ ...base, id: 1, title: "Clase 2", status }] },
+          materials: [{ ...base, id: 1, title: "Clase 2", status }, { ...base, id: 2, title: "Clase 3", status }] },
       ],
       "POST /api/materials/retry-failed": () => {
         status = "pending";
-        return { reset: 1 };
+        return { reset: 2 };
       },
     });
     render(<Materials aiStopReason={null} />);
-    expect(await screen.findByText("No se pudo preparar")).toBeInTheDocument();
+    expect(await screen.findAllByText("No se pudo preparar")).toHaveLength(2);
 
     await userEvent.click(screen.getByRole("button", { name: "Reintentar las que fallaron" }));
 
-    expect(await screen.findByText("En preparación")).toBeInTheDocument();
+    expect(await screen.findAllByText("En preparación")).toHaveLength(2);
     expect(screen.queryByRole("button", { name: "Reintentar las que fallaron" })).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/materials/retry-failed",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("con una sola fallida no lo ofrece arriba", async () => {
+    const base = { kind: "youtube", summary_md: null, error: null, youtube_id: null, campus_url: null };
+    mockApi({
+      "GET /api/materials": [
+        { id: 1, course_id: 1, course: "Matemática", num: 1, name: "UNIDAD 1",
+          materials: [{ ...base, id: 1, title: "Clase 2", status: "failed" }] },
+      ],
+    });
+    render(<Materials aiStopReason={null} />);
+    expect(await screen.findByText("No se pudo preparar")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reintentar las que fallaron" })).not.toBeInTheDocument();
   });
 
   it("sin clases fallidas no ofrece reintentar", async () => {
@@ -396,7 +409,8 @@ describe("Materials: video que no es público", () => {
     expect(note).toHaveClass("text-muted");
     expect(screen.getByRole("link", { name: "Ajustes" })).toHaveAttribute("href", "#/ajustes");
     expect(screen.queryByText("No se pudo preparar")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reintentar las que fallaron" })).toBeInTheDocument();
+    // Una sola: el botón de arriba no aparece.
+    expect(screen.queryByRole("button", { name: "Reintentar las que fallaron" })).not.toBeInTheDocument();
   });
 });
 
@@ -511,5 +525,139 @@ describe("Materials: practicar esta clase", () => {
     expect(screen.getByText("Pendiente y ordenada.")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Practicar esta clase" }));
     expect(calls).toEqual([{ topic_id: 4 }]);
+  });
+});
+
+describe("Materials: practicar un apunte", () => {
+  it("un PDF o unas diapositivas dicen 'Practicar este apunte'", async () => {
+    const base = { error: null, youtube_id: null, campus_url: null, status: "done", summary_md: null,
+      questions: 4, part: null, pages: 10 };
+    mockApi({
+      "GET /api/materials": [
+        { id: 1, course_id: 1, course: "Matemática", num: 1, name: "UNIDAD 1",
+          materials: [
+            { ...base, id: 1, kind: "pdf", title: "Apunte 1", topic_ids: [4] },
+            { ...base, id: 2, kind: "slides", title: "Clase 2", topic_ids: [5] },
+            { ...base, id: 3, kind: "youtube", title: "Video 3", topic_ids: [6], pages: null },
+          ] },
+      ],
+    });
+    render(<Materials aiStopReason={null} onPractice={() => {}} />);
+    await screen.findByText("Apunte 1");
+    expect(screen.getAllByRole("button", { name: "Practicar este apunte" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Practicar esta clase" })).toHaveLength(1);
+  });
+});
+
+describe("Materials: archivos del campus", () => {
+  const base = {
+    kind: "pdf", summary_md: null, error: null, youtube_id: null, campus_url: null,
+    topic_ids: [], questions: 0, part: null, pages: null,
+  };
+  const CAMPUS = "https://campus.example/mod/resource/view.php?id=31";
+  const sections = (materials: unknown[]) => [
+    { id: 1, course_id: 1, course: "Matemática", num: 1, name: "UNIDAD 1", materials },
+  ];
+
+  it('lo que Estudia no lee dice "Solo en el campus", enlazado a la página del campus', async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Planilla de notas", kind: "file", status: "unsupported", error: "No se puede leer todavía", campus_url: CAMPUS },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    const link = await screen.findByRole("link", { name: "Solo en el campus" });
+    expect(link).toHaveAttribute("href", CAMPUS);
+    expect(link).toHaveClass("text-muted");
+    expect(screen.queryByText("No se puede leer todavía")).not.toBeInTheDocument();
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it('un archivo demasiado grande dice solo "Solo en el campus"', async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Apunte completo", status: "too_large", error: "Archivo demasiado grande", campus_url: CAMPUS },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    expect(await screen.findByRole("link", { name: "Solo en el campus" })).toHaveAttribute("href", CAMPUS);
+    expect(screen.queryByText("Archivo demasiado grande")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Abrir en el campus" })).not.toBeInTheDocument();
+  });
+
+  it("un tramo muestra sus páginas", async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Apunte 3, págs. 41–80", status: "pending", part: { from: 41, to: 80 }, pages: 40 },
+        { ...base, id: 2, title: "Capítulo 2: Derivadas", status: "done", part: { from: 81, to: 112, doc: "Apunte 3" }, pages: 32 },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    // El título no repite las páginas: van en su propia línea.
+    expect(await screen.findByText("Apunte 3")).toBeInTheDocument();
+    expect(screen.getByText("págs. 41–80")).toBeInTheDocument();
+    expect(screen.getByText("Capítulo 2: Derivadas")).toBeInTheDocument();
+    // Con capítulo, la segunda línea dice de qué apunte es.
+    expect(screen.getByText("Apunte 3, págs. 81–112")).toBeInTheDocument();
+  });
+
+  it("los estados de un archivo del campus se dicen con calma", async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Clase 4", kind: "slides", status: "downloading" },
+        { ...base, id: 2, title: "Apunte roto", status: "unreadable", error: "No se pudo leer" },
+        { ...base, id: 3, title: "Apunte viejo", status: "failed", error: "No se pudo leer" },
+        { ...base, id: 4, title: "Apunte 5", status: "failed", error: "Otro texto cualquiera", fail_kind: "download" },
+        { ...base, id: 5, title: "Clase 9", status: "failed", error: "No se pudo bajar del campus", fail_kind: "format" },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    expect(await screen.findByText("Se baja del campus")).toBeInTheDocument();
+    expect(screen.getAllByText("Solo en el campus")).toHaveLength(2);
+    expect(screen.queryByText("No se pudo leer")).not.toBeInTheDocument();
+    // Se reconoce por fail_kind, no por el texto del error.
+    const row = (title: string) => screen.getByText(title).closest("li")!;
+    expect(row("Apunte 5")).toHaveTextContent("No se pudo bajar");
+    expect(row("Clase 9")).toHaveTextContent("No se pudo preparar");
+    expect(row("Clase 9")).not.toHaveTextContent("No se pudo bajar");
+    expect(screen.getByText(/Puede ser la conexión con el campus/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reintentar" })).toBeInTheDocument();
+  });
+
+  it("nunca enlaza un archivo del campus, solo su página", async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Apunte", status: "too_large",
+          campus_url: "https://campus.example/webservice/pluginfile.php/1/mod_resource/content/0/a.pdf" },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    expect(await screen.findByText("Solo en el campus")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Solo en el campus" })).not.toBeInTheDocument();
+  });
+
+  it("el resumen muestra la página del apunte aparte, en gris", async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Apunte 3", status: "done", summary_md: "## Límites (pág. 14)\nTexto." },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ver resumen" }));
+    const mark = screen.getByText("(pág. 14)");
+    expect(mark).toHaveClass("text-muted");
+    expect(screen.getByRole("heading", { name: /Límites/ })).toBeInTheDocument();
+  });
+
+  it("en diapositivas la marca es (diap. N), también en gris", async () => {
+    mockApi({
+      "GET /api/materials": sections([
+        { ...base, id: 1, title: "Clase 2", status: "done", summary_md: "## Límites (diap. 4)\nTexto." },
+      ]),
+    });
+    render(<Materials aiStopReason={null} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ver resumen" }));
+    expect(screen.getByText("(diap. 4)")).toHaveClass("text-muted");
   });
 });

@@ -32,8 +32,11 @@ def normalize_words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", plain) if w not in STOPWORDS}
 
 
+_PAGE_MARK = re.compile(r"\s*\((?:pág|diap)\. \d+\)$")
+
+
 def summary_headings(summary_md: str) -> list[str]:
-    """Los títulos Markdown (# a ######), sin los # ni los **, en orden."""
+    """Los títulos Markdown (# a ######), sin los # ni los ** ni el "(pág. N)" o "(diap. N)" final, en orden."""
     headings: list[str] = []
     in_code = False
     for line in summary_md.splitlines():
@@ -46,6 +49,8 @@ def summary_headings(summary_md: str) -> list[str]:
         if not m:
             continue
         title = _CLOSING_HASHES.sub("", m.group(1)).replace("**", "").strip()
+        # La marca de página de un documento ("Límites (pág. 14)") no es parte del título.
+        title = _PAGE_MARK.sub("", title).strip()
         if title:
             headings.append(title)
     return headings

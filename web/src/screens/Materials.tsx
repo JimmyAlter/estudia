@@ -1,12 +1,22 @@
+import { File, FileText, Presentation, Video, type LucideIcon } from "lucide-react";
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { api, type Age, type AppState, type Material, type QuizParams, type Section } from "../api";
 import { keepMath, tidy } from "../format";
-import { Button, Label, Notice } from "../ui";
+import { Button, Label, Notice, campusHref } from "../ui";
 import Recall from "./Recall";
 
 const quietLink = "text-muted underline decoration-line underline-offset-4 hover:text-ink";
 
 type StopReason = AppState["ai_stop_reason"];
+
+// Texto que manda el servidor en `error` (material/files.py, UNREADABLE_TEXT).
+const UNREADABLE_TEXT = "No se pudo leer";
+// `fail_kind` de un archivo que no se pudo bajar (material/files.py, FAIL_DOWNLOAD).
+const FAIL_DOWNLOAD = "download";
+/** Un archivo del campus que no se pudo bajar (y no una clase que no se pudo preparar). */
+const downloadFailed = (m: Material) => m.status === "failed" && m.fail_kind === FAIL_DOWNLOAD;
+
+const KIND_ICONS: Record<string, LucideIcon> = { pdf: FileText, slides: Presentation, youtube: Video };
 /** Sin IA (menor o sin responder) lo pendiente no se va a procesar. */
 const noAi = (age?: Age | null) => age === "minor" || age === null;
 
@@ -62,7 +72,12 @@ export default function Materials({
   const courses = [...new Set(sections.map((s) => s.course ?? ""))];
   const courseIds = new Map(sections.map((s) => [s.course ?? "", s.course_id]));
   // Lo que pide un enlace público también se reintenta (con la descarga prendida o pasados 7 días).
-  const anyFailed = sections.some((s) => s.materials.some((m) => m.status === "failed" || m.status === "needs_public_link"));
+  // Arriba se ofrece desde dos: una sola se ve en su fila.
+  const retryable = sections.reduce(
+    (n, s) => n + s.materials.filter((m) => m.status === "failed" || m.status === "needs_public_link").length,
+    0,
+  );
+  const anyFailed = retryable >= 2;
 
   return (
     <div className="max-w-3xl">
@@ -98,7 +113,15 @@ export default function Materials({
                 <h2 className="mb-2 font-semibold">{tidy(section.name)}</h2>
                 <ul>
                   {section.materials.map((m) => (
-                    <MaterialRow key={m.id} material={m} stopReason={aiStopReason} age={age} onPractice={onPractice} />
+                    <MaterialRow
+                      key={m.id}
+                      material={m}
+                      stopReason={aiStopReason}
+                      age={age}
+                      onPractice={onPractice}
+                      onRetry={retry}
+                      retrying={retrying}
+                    />
                   ))}
                 </ul>
               </section>
@@ -118,17 +141,25 @@ export default function Materials({
 /** Estado de la clase; nada si ya está lista (es lo normal). */
 function Status({ material, stopReason, age }: { material: Material; stopReason: StopReason; age?: Age | null }) {
   const linkClass = "shrink-0 text-sm text-muted underline decoration-line underline-offset-4 hover:text-ink";
+  const href = campusHref(material.campus_url);
+  // Lo que Estudia no lee (muy grande, ilegible o de otro formato) se abre en el campus: una sola
+  // línea, sin explicar por qué. Sin una página segura a la que ir, queda el texto solo.
+  const onlyInCampus = href ? (
+    <a href={href} target="_blank" rel="noopener noreferrer" className={linkClass}>
+      Solo en el campus
+    </a>
+  ) : (
+    <span className="shrink-0 text-sm text-muted">Solo en el campus</span>
+  );
   switch (material.status) {
     case "done":
       return null;
+    case "downloading":
+      return <span className="shrink-0 text-sm text-muted">Se baja del campus</span>;
+    case "too_large":
+    case "unreadable":
     case "unsupported":
-      return material.campus_url ? (
-        <a href={material.campus_url} target="_blank" rel="noreferrer" className={linkClass}>
-          Abrir en el campus
-        </a>
-      ) : (
-        <span className="shrink-0 text-sm text-muted">Solo en el campus</span>
-      );
+      return onlyInCampus;
     case "needs_public_link":
       // Sin IA no se va a preparar igual: la pista de la descarga no aplica.
       if (noAi(age)) return <span className="shrink-0 text-sm text-muted">Sin preparar</span>;
@@ -141,6 +172,9 @@ function Status({ material, stopReason, age }: { material: Material; stopReason:
         </span>
       );
     default:
+      if (material.error === UNREADABLE_TEXT) return onlyInCampus;
+      // La explicación y "Reintentar" van debajo del título.
+      if (downloadFailed(material)) return <span className="shrink-0 text-sm text-muted">No se pudo bajar</span>;
       return <span className="shrink-0 text-sm text-muted">No se pudo preparar</span>;
   }
 }
@@ -150,11 +184,15 @@ function MaterialRow({
   stopReason,
   age,
   onPractice,
+  onRetry,
+  retrying,
 }: {
   material: Material;
   stopReason: StopReason;
   age?: Age | null;
   onPractice?: (params: QuizParams) => void;
+  onRetry?: () => void;
+  retrying?: boolean;
 }) {
   const id = useId();
   /** Lo que se ve debajo de la clase: nada, el resumen o "Contá lo que te acordás". */
@@ -165,14 +203,27 @@ function MaterialRow({
   const status = <Status material={material} stopReason={stopReason} age={age} />;
   const canPractice = Boolean(onPractice && material.questions && material.topic_ids?.length);
   // Apagado solo lo que no se puede abrir ahora: lo que falta preparar o falló.
-  const unavailable = material.status === "pending" || material.status === "failed" || material.status === "needs_public_link";
+  const unavailable = ["pending", "downloading", "failed", "needs_public_link"].includes(material.status);
+  const Icon = KIND_ICONS[material.kind] ?? File;
+  const part = material.part;
+  const pageRange = part ? `págs. ${part.from}–${part.to}` : null;
+  // El tramo sin capítulo se llama "Apunte 3, págs. 1–40": las páginas van en su propia línea.
+  const unnamed = Boolean(pageRange && material.title.endsWith(`, ${pageRange}`));
+  const title = tidy(unnamed ? material.title.slice(0, -pageRange!.length - 2) : material.title);
+  // Con capítulo, la segunda línea dice de qué apunte es: "Apunte 3, págs. 1–40".
+  const partLine = pageRange && !unnamed && part?.doc ? `${tidy(part.doc)}, ${pageRange}` : pageRange;
 
   return (
     <li className="border-b border-line py-3">
       <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
-        <span className={`min-w-0 ${unavailable ? "text-muted" : ""}`}>{tidy(material.title)}</span>
+        {/* El ícono cuelga a la izquierda: un título largo sigue alineado con su primera línea. */}
+        <span className={`min-w-0 pl-6 -indent-6 ${unavailable ? "text-muted" : ""}`}>
+          <Icon size={16} aria-hidden className="mr-2 inline-block align-[-2px] text-muted" />
+          {title}
+          {partLine && <span className="block indent-0 text-sm text-muted tabular-nums">{partLine}</span>}
+        </span>
         {(canPractice || material.summary_md || material.status !== "done") && (
-          <span className="flex flex-wrap items-baseline gap-x-5 gap-y-1 text-sm">
+          <span className="flex basis-full flex-wrap items-baseline gap-x-5 gap-y-1 pl-6 text-sm sm:basis-auto">
             {status}
             {canPractice && (
               <button
@@ -184,7 +235,7 @@ function MaterialRow({
                 }
                 className="press cursor-pointer font-medium underline decoration-ink/40 underline-offset-4 hover:decoration-ink"
               >
-                Practicar esta clase
+                {material.kind === "pdf" || material.kind === "slides" ? "Practicar este apunte" : "Practicar esta clase"}
               </button>
             )}
             {canRecall && view === "closed" && (
@@ -212,8 +263,18 @@ function MaterialRow({
           </span>
         )}
       </div>
+      {downloadFailed(material) && (
+        <p className="mt-1 pl-6 text-sm text-muted">
+          Puede ser la conexión con el campus. Probá de nuevo ahora o más tarde.{" "}
+          {onRetry && (
+            <Button variant="quiet" onClick={onRetry} disabled={retrying}>
+              Reintentar
+            </Button>
+          )}
+        </p>
+      )}
       {material.status === "needs_public_link" && !noAi(age) && (
-        <p className="mt-1 text-sm text-muted">
+        <p className="mt-1 pl-6 text-sm text-muted">
           Este video no es público. Pedile a la cátedra el archivo en el campus, o activá la descarga en{" "}
           <a href="#/ajustes" className="underline decoration-line underline-offset-4 hover:text-ink">
             Ajustes
@@ -249,9 +310,12 @@ function MaterialRow({
   );
 }
 
-/** El texto de un título como lo compara el servidor: sin los # del final ni los **. */
+/** La marca de página de un documento al final de un título: "Límites (pág. 14)" o "(diap. 4)". */
+const PAGE_MARK = /\s*\((?:pág|diap)\. \d+\)$/;
+
+/** El texto de un título como lo compara el servidor: sin los # del final, ni los **, ni el "(pág. N)" o "(diap. N)". */
 function headingTitle(text: string): string {
-  return text.replace(/[ \t]+#+$/, "").replaceAll("**", "").trim();
+  return text.replace(/[ \t]+#+$/, "").replaceAll("**", "").trim().replace(PAGE_MARK, "").trim();
 }
 
 function summaryHeadings(markdown: string): string[] {
@@ -280,7 +344,8 @@ function Summary({ markdown, title, missed }: { markdown: string; title: string;
 
   // El primer título suele repetir el nombre de la clase, que ya está arriba.
   // Si quedó sin mencionar, se deja: la marca tiene que verse.
-  if (blocks[0]?.kind === "h" && sameTitle(blocks[0].text, title) && !missed?.has(headingTitle(blocks[0].text))) blocks.shift();
+  if (blocks[0]?.kind === "h" && sameTitle(headingTitle(blocks[0].text), title) && !missed?.has(headingTitle(blocks[0].text)))
+    blocks.shift();
 
   const out: ReactNode[] = [];
   let list: string[] = [];
@@ -306,13 +371,13 @@ function Summary({ markdown, title, missed }: { markdown: string; title: string;
       block.kind === "h" ? (
         missed?.has(headingTitle(block.text)) ? (
           <h3 key={out.length} className="mt-4 mb-1 font-semibold first:mt-0">
-            {inline(block.text)}
+            <HeadingText text={block.text} />
             <span className="sr-only">, </span>
             <span className="ml-2 font-sans text-sm font-normal whitespace-nowrap text-muted">No lo mencionaste</span>
           </h3>
         ) : (
           <h3 key={out.length} className="mt-4 mb-1 font-semibold first:mt-0">
-            {inline(block.text)}
+            <HeadingText text={block.text} />
           </h3>
         )
       ) : (
@@ -324,6 +389,18 @@ function Summary({ markdown, title, missed }: { markdown: string; title: string;
   }
   flush();
   return <div className="math max-w-[65ch] text-[1.0625rem] leading-relaxed">{out}</div>;
+}
+
+/** Un título del resumen; la página del apunte, si la tiene, va en gris. */
+function HeadingText({ text }: { text: string }) {
+  const mark = text.match(PAGE_MARK);
+  if (!mark) return <>{inline(text)}</>;
+  return (
+    <>
+      {inline(text.slice(0, mark.index))}{" "}
+      <span className="font-normal whitespace-nowrap text-muted tabular-nums">{mark[0].trim()}</span>
+    </>
+  );
 }
 
 /** "Rectas" repite a "Video-clase 1: Rectas." (o al título entero). */

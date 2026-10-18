@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type Feedback, type PretestOffer, type QuizItem } from "../api";
 import { keepMath, tidy } from "../format";
-import { Button, Label } from "../ui";
+import { Button, DocumentSource, Label } from "../ui";
 import type { Screen } from "./Home";
 import { OptionButton, optionState, shuffled } from "./Practice";
 
@@ -128,16 +128,18 @@ export default function Pretest({ onNavigate }: { onNavigate: (screen: Screen) =
     );
   }
   if (!items || !offer) return null;
+  // Un PDF o unas diapositivas se leen; un video se mira.
+  const isDocument = offer.kind === "pdf" || offer.kind === "slides";
 
   if (finished) {
     return (
       <div className="reveal max-w-xl">
         <Label className="mb-2">{tidy(offer.title)}</Label>
         <h1 className="mb-8 font-serif text-[2rem] leading-tight tracking-[-0.02em]">
-          Listo. Ahora mirá la clase: te va a rendir más.
+          {isDocument ? "Listo. Ahora leé el apunte: te va a rendir más." : "Listo. Ahora mirá la clase: te va a rendir más."}
         </h1>
         <div className="flex flex-wrap gap-3">
-          <Button onClick={() => onNavigate("materiales")}>Ver la clase</Button>
+          <Button onClick={() => onNavigate("materiales")}>{isDocument ? "Ver el apunte" : "Ver la clase"}</Button>
           <Button variant="secondary" onClick={() => onNavigate("inicio")}>
             Volver al inicio
           </Button>
@@ -188,6 +190,9 @@ export default function Pretest({ onNavigate }: { onNavigate: (screen: Screen) =
             <p className="math mt-4 text-[1.0625rem] leading-relaxed">
               <span className="font-semibold">Error común:</span> {keepMath(feedback.common_error)}
             </p>
+          )}
+          {feedback.source_label && (
+            <DocumentSource className="mt-4" label={feedback.source_label} url={feedback.source_url} />
           )}
           <div className="mt-8">
             <Button onClick={next}>{last ? "Terminar" : "Siguiente"}</Button>

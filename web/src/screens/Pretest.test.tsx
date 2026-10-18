@@ -134,3 +134,51 @@ describe("3 preguntas para arrancar", () => {
     expect(onNavigate).toHaveBeenCalledWith("materiales");
   });
 });
+
+describe("3 preguntas para arrancar: de un apunte", () => {
+  it("cita la página y al final invita a leer el apunte", async () => {
+    const routes = pretestRoutes();
+    mockApi({
+      ...routes,
+      "GET /api/home": { ...HOME, pretest: { ...OFFER, title: "Apunte 3", kind: "pdf" } },
+      "POST /api/pretest/answer": (body: unknown) => ({
+        ...(routes["POST /api/pretest/answer"](body) as Feedback),
+        source_page: 14,
+        source_label: "Apunte 3, pág. 14",
+        source_url: "https://campus.example/mod/resource/view.php?id=31",
+      }),
+    });
+    render(<Pretest onNavigate={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: /^1/ }));
+    expect(await screen.findByRole("link", { name: "Apunte 3, pág. 14" })).toHaveAttribute(
+      "href",
+      "https://campus.example/mod/resource/view.php?id=31",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Siguiente" }));
+    await userEvent.click(await screen.findByRole("button", { name: /^1/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Siguiente" }));
+    await userEvent.click(await screen.findByRole("button", { name: /^y\s=\s2x\s\+\s5/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Terminar" }));
+    expect(await screen.findByText("Listo. Ahora leé el apunte: te va a rendir más.")).toBeInTheDocument();
+  });
+});
+
+describe("Inicio: pretest de un apunte", () => {
+  it.each([
+    ["pdf", "De Apunte 3. No cuentan: es para que el apunte te rinda más."],
+    ["slides", "De Apunte 3. No cuentan: es para que el apunte te rinda más."],
+    ["youtube", "De Apunte 3. No cuentan: es para que la clase te rinda más."],
+  ])("con kind %s, la oferta dice %s", async (kind, text) => {
+    mockApi({
+      ...pretestRoutes(),
+      "GET /api/home": { ...HOME, pretest: { ...OFFER, title: "Apunte 3", kind } },
+      "GET /api/plan/health": [],
+      "GET /api/exams": [],
+      "GET /api/agenda": { days: [], health: [] },
+    });
+    render(
+      <Home refreshKey={0} aiStopReason={null} working={false} onPractice={() => {}} onNavigate={() => {}} onSessionExpired={() => {}} />,
+    );
+    expect(await screen.findByText(text)).toBeInTheDocument();
+  });
+});

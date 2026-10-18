@@ -26,8 +26,8 @@ _BLIND_CHAIN = ["gemini-3.5-flash-lite", "gemma-4-31b-it", "gemini-2.5-flash-lit
 # GeminiProvider la lee al construirse.
 MODEL_CHAINS: dict[str, list[str]] = {"analysis": _ANALYSIS_CHAIN, "blind": _BLIND_CHAIN}
 # Pedidos por día del Pacífico para cada función de IA (se pisa con kv `ai_budget:<función>`).
-# `pdf` y `photo` quedan reservados para las etapas 3b y 3c.
-DAILY_BUDGET: dict[str, int] = {"analysis": 40, "blind": 20, "pdf": 0, "photo": 0}
+# `pdf` cuenta el análisis de documentos; `photo` queda reservado para la etapa 3c.
+DAILY_BUDGET: dict[str, int] = {"analysis": 40, "blind": 20, "pdf": 10, "photo": 0}
 
 # Si Gemini no acepta enlaces de YouTube con una clave (403 en toda la cadena), no se
 # vuelve a probar el enlace durante 7 días; después se prueba de nuevo.
@@ -47,6 +47,14 @@ GEMINI_TIMEOUT_S = 300
 SYNC_EVERY_S = 21600
 
 SECRETS_SERVICE = "estudia"
+
+# Carpeta, dentro de la carpeta de datos, donde quedan los PDF y diapositivas del campus.
+# El nombre de cada archivo sale del id del material, nunca del nombre que trae el campus.
+DOCUMENTS_DIRNAME = "documentos"
+
+# Carpeta de los parciales viejos que carga el estudiante (`origin='parcial_propio'`).
+# Nunca salen de la compu; el nombre de cada archivo sale del id de su fila.
+PAST_EXAMS_DIRNAME = "parciales"
 
 
 # Variable de entorno que fija la carpeta de datos (los tests la usan para no tocar
@@ -74,10 +82,18 @@ def data_dir() -> Path:
 BUNDLED_JS_RUNTIME = "node"
 
 
-def bundled_js_runtime() -> Path | None:
-    """El binario del runtime de JS incluido en el ejecutable congelado, si está."""
+def bundled_js_runtime_path() -> Path | None:
+    """Dónde tiene que estar el runtime de JS en el ejecutable congelado (exista o no).
+
+    None fuera del ejecutable congelado.
+    """
     if not getattr(sys, "frozen", False):
         return None
     exe = BUNDLED_JS_RUNTIME + (".exe" if sys.platform == "win32" else "")
-    path = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "runtime" / exe
-    return path if path.is_file() else None
+    return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "runtime" / exe
+
+
+def bundled_js_runtime() -> Path | None:
+    """El binario del runtime de JS incluido en el ejecutable congelado, si está."""
+    path = bundled_js_runtime_path()
+    return path if path is not None and path.is_file() else None

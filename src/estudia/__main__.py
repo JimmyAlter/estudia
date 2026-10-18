@@ -13,6 +13,7 @@ import threading
 import time
 import webbrowser
 from functools import partial
+from pathlib import Path
 
 import uvicorn
 
@@ -125,6 +126,155 @@ def check_worker() -> int:
     return 0 if ok else 1
 
 
+CHECK_DOCUMENTS_FLAG = "--check-documents"
+
+
+def check_documents() -> int:
+    """`Estudia.exe --check-documents`: 0 si se leen PDF, diapositivas y fotos; 1 si no.
+
+    Lo usa la prueba de CI del .exe: prueba la DLL de pdfium, el proceso hijo congelado, las
+    plantillas de python-pptx, Pillow y python-multipart. Imprime solo el paso que falló.
+    """
+    import io
+    import tempfile
+
+    from estudia.material import documents, files
+
+    step = "preparar"
+    try:
+        with tempfile.TemporaryDirectory(prefix="estudia-check-") as tmp:
+            step = "crear un PDF con pdfium"
+            import pypdfium2
+
+            pdf = pypdfium2.PdfDocument.new()
+            for _ in range(2):
+                pdf.new_page(200, 200)
+            pdf_path = Path(tmp) / "prueba.pdf"
+            pdf.save(str(pdf_path))
+            pdf.close()
+
+            step = "leer el PDF"
+            info = documents.inspect_document(pdf_path, files.PDF)
+            if info.pages != 2:
+                raise ValueError("páginas")
+
+            step = "cortar una página del PDF"
+            if not documents.pdf_pages_bytes(pdf_path, 2, 2).startswith(b"%PDF"):
+                raise ValueError("pdf")
+
+            step = "crear diapositivas con python-pptx"
+            from pptx import Presentation
+
+            prs = Presentation()
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            slide.shapes.title.text = "Prueba de Estudia"
+            pptx_path = Path(tmp) / "prueba.pptx"
+            prs.save(str(pptx_path))
+
+            step = "leer las diapositivas"
+            if "Prueba de Estudia" not in documents.slides_text(pptx_path):
+                raise ValueError("pptx")
+
+            step = "limpiar una foto"
+            from PIL import Image
+
+            buf = io.BytesIO()
+            Image.new("RGB", (8, 8), (200, 100, 50)).save(buf, "JPEG")
+            if not files.reencode_image(buf.getvalue(), files.JPEG):
+                raise ValueError("jpeg")
+
+            step = "cargar python-multipart"
+            import python_multipart  # noqa: F401 - FastAPI lo necesita para recibir archivos
+    except Exception:
+        print("Lectura de documentos: no anda (" + step + ")")
+        return 1
+    print("Lectura de documentos: bien")
+    return 0
+
+
+CHECK_VIDEO_TOOLS_FLAG = "--check-video-tools"
+JS_CHECK_TIMEOUT_S = 30
+
+
+def _run_js(name: str, path: str) -> str:
+    """Corre un script mínimo con el runtime de JS, como lo hace yt-dlp: sin ventana."""
+    import subprocess
+
+    script = "console.log('ok')"
+    args = [path, "eval", script] if name == "deno" else [path, "-e", script]
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=JS_CHECK_TIMEOUT_S,
+                          stdin=subprocess.DEVNULL, creationflags=flags)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def check_video_tools() -> int:
+    """`Estudia.exe --check-video-tools`: 0 si yt-dlp y su runtime de JS andan; 1 si no.
+
+    Sin red: arma el YoutubeDL con las opciones de `material.video`, corre el runtime de JS
+    y le pide a yt-dlp que lo acepte y que cargue con él los scripts del desafío de YouTube.
+    En el ejecutable congelado exige el runtime incluido. Fuera de él usa el que usaría
+    `material.video` (el deno de la dependencia o node); si no hay ninguno, avisa y sale con 0.
+    Imprime solo el paso que falló.
+    """
+    import shutil
+
+    from estudia import config
+    from estudia.material import video
+
+    step = "cargar yt-dlp"
+    try:
+        import yt_dlp
+
+        options = video.ydl_options("check.%(ext)s")
+        with yt_dlp.YoutubeDL(options) as ydl:
+            step = "encontrar el runtime de JavaScript"
+            if getattr(sys, "frozen", False):
+                bundled = config.bundled_js_runtime_path()
+                if bundled is None or not bundled.is_file():
+                    raise FileNotFoundError("runtime")
+                name, path = config.BUNDLED_JS_RUNTIME, str(bundled)
+                if options["js_runtimes"] != {name: {"path": path}}:
+                    raise ValueError("runtime")
+            else:
+                found = [(n, (c or {}).get("path") or shutil.which(n))
+                         for n, c in options["js_runtimes"].items()]
+                found = [(n, p) for n, p in found if p and Path(p).is_file()]
+                if not found:
+                    print("Herramientas de video: sin runtime empaquetado (modo desarrollo)")
+                    return 0
+                name, path = found[0]
+
+            step = "correr el runtime de JavaScript"
+            if _run_js(name, path) != "ok":
+                raise RuntimeError("js")
+
+            step = "que yt-dlp acepte el runtime de JavaScript"
+            runtime = ydl._js_runtimes.get(name)
+            if runtime is None or runtime.info is None or not runtime.info.supported:
+                raise RuntimeError("runtime")
+
+            step = "resolver con yt-dlp el desafío de YouTube"
+            from yt_dlp.extractor.youtube.jsc._director import initialize_jsc_director
+
+            director = initialize_jsc_director(ydl.get_info_extractor("Youtube"))
+            provider = next(p for p in director.providers.values()
+                            if getattr(p, "JS_RUNTIME_NAME", None) == name)
+            if not provider.is_available():
+                raise RuntimeError("provider")
+            # Los scripts del desafío (yt_dlp_ejs) corridos con el runtime y los permisos que
+            # usa yt-dlp: sin el reproductor de YouTube, alcanza con que definan `jsc`.
+            code = (f"{provider._lib_script.code}\nObject.assign(globalThis, lib);\n"
+                    f"{provider._core_script.code}\nconsole.log(typeof jsc);\n")
+            if provider._run_js_runtime(code).strip() != "function":
+                raise RuntimeError("jsc")
+    except Exception:
+        print("Herramientas de video: no anda (" + step + ")")
+        return 1
+    print("Herramientas de video: bien")
+    return 0
+
+
 def warn_if_worker_broken() -> None:
     """Al arrancar: un solo aviso en el log si el worker de SymPy no anda (sin detalles)."""
     if not _worker_works():
@@ -227,4 +377,8 @@ if __name__ == "__main__":
     redirect_missing_streams(data_dir() / "estudia.log")
     if CHECK_WORKER_FLAG in sys.argv[1:]:
         sys.exit(check_worker())
+    if CHECK_DOCUMENTS_FLAG in sys.argv[1:]:
+        sys.exit(check_documents())
+    if CHECK_VIDEO_TOOLS_FLAG in sys.argv[1:]:
+        sys.exit(check_video_tools())
     main()

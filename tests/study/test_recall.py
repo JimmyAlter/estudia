@@ -42,3 +42,10 @@ def test_half_of_the_words_is_enough():
 def test_title_only_stopwords_never_marked():
     assert recall_check("# Y el de la", "nada")[0].mentioned
     assert recall_check("# π", "nada")[0].mentioned
+
+
+def test_recall_headings_ignore_page_marks():
+    md = "## Límites (pág. 14)\n## Continuidad (pág. 3) ##\n## Teorema (pág. 2) de Bolzano\n"
+    assert summary_headings(md) == ["Límites", "Continuidad", "Teorema (pág. 2) de Bolzano"]
+    # En diapositivas la marca es "(diap. N)".
+    assert summary_headings("## Límites (diap. 4)\n") == ["Límites"]

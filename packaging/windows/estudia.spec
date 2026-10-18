@@ -18,9 +18,28 @@
 # packaging/windows/runtime/node.exe; el binario no se commitea.
 # En el ejecutable queda en `runtime/node.exe`; `estudia.config.bundled_js_runtime()`
 # lo encuentra ahí y `estudia.material.video` lo usa en lugar de deno.
+#
+# Lectura de PDF y diapositivas: licencias de lo que se suma al ejecutable
+# ------------------------------------------------------------------------
+#   - pypdfium2 5.14.0: BSD-3-Clause o Apache-2.0. El binario PDFium (pdfium.dll) trae
+#     FreeType (FTL/GPLv2 a elección: vale la FTL), libjpeg-turbo, OpenJPEG, lcms2, libpng,
+#     zlib, ICU y abseil, todas permisivas. Los textos viajan con copy_metadata("pypdfium2").
+#   - python-pptx 1.0.2: MIT.
+#   - lxml 6.1.3 (por python-pptx): BSD-3-Clause.
+#   - XlsxWriter 3.2.9 (por python-pptx): BSD-2-Clause.
+#   - typing-extensions 4.16.0 (por python-pptx): PSF-2.0.
+#   - Pillow 13.0.0: MIT-CMU (HPND).
+#   - python-multipart 0.0.32: Apache-2.0 (FastAPI la necesita para recibir archivos).
+# Ninguna es GPL ni AGPL (tests/test_licenses.py). PyMuPDF (AGPL) queda prohibido.
+# `Estudia.exe --check-documents` prueba en la CI que todo esto ande congelado.
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+    copy_metadata,
+)
 
 ROOT = Path(SPECPATH).resolve().parents[1]  # noqa: F821 - SPECPATH lo define PyInstaller
 SRC = ROOT / "src"
@@ -53,6 +72,11 @@ datas += collect_data_files("yt_dlp_ejs", includes=["**/*.js"])
 # keyring busca sus backends por entry points: sin la metadata no encuentra el de Windows.
 datas += copy_metadata("keyring")
 datas += copy_metadata("google-genai")
+# pdfium: la DLL va como binario; version.json de pypdfium2_raw y pypdfium2 como datos.
+# python-pptx: sus plantillas (default.pptx y demás) están en pptx/templates.
+datas += collect_data_files("pypdfium2_raw") + collect_data_files("pypdfium2") + collect_data_files("pptx")
+datas += copy_metadata("pypdfium2")  # las licencias de PDFium y sus dependencias
+binaries = collect_dynamic_libs("pypdfium2_raw")
 
 hiddenimports = [
     # keyring: el backend de Windows (Credential Manager) se carga por entry point.
@@ -76,6 +100,9 @@ hiddenimports += collect_submodules("sympy", filter=_no_tests)
 hiddenimports += collect_submodules("yt_dlp")
 # Los módulos de la app: el worker de SymPy se arranca con spawn y vuelve a importarlos.
 hiddenimports += collect_submodules("estudia")
+# pypdfium2 carga sus módulos y la DLL por nombre; python-pptx usa lxml.
+hiddenimports += collect_submodules("pypdfium2") + collect_submodules("pypdfium2_raw") + [
+    "python_multipart", "lxml.etree", "lxml._elementpath"]
 
 excludes = [
     "deno",  # el runtime incluido es node; el paquete de PyPI solo sirve en desarrollo
@@ -86,6 +113,7 @@ excludes = [
 common = dict(
     pathex=[str(SRC)],
     datas=datas,
+    binaries=binaries,
     hiddenimports=hiddenimports,
     excludes=excludes,
     noarchive=False,

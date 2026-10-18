@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from estudia.study.exams import FINAL, RETAKE, exam_topics
-from estudia.study.mastery import topic_probability
+from estudia.study.mastery import REGULAR, topic_probability
 from estudia.study.schedule import TZ, occurrences
 from estudia.study.sessions import (
     FOCUS,
@@ -195,7 +195,7 @@ def _plannable_topics(conn: sqlite3.Connection) -> dict[int, int]:
         r["id"]: r["course_id"]
         for r in conn.execute(
             "SELECT DISTINCT t.id, t.course_id FROM topic t JOIN question q ON q.topic_id = t.id "
-            "WHERE q.verified = 1 AND q.retired = 0"
+            f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR}"
         )
     }
 
@@ -496,7 +496,7 @@ def mark_done_from_answers(conn: sqlite3.Connection, now: int) -> int:
         for a in conn.execute(
             f"SELECT q.topic_id, a.at, a.correct = 1 AND COALESCE(a.confidence, -1) != ? AS good "
             f"FROM answer a JOIN question q ON q.id = a.question_id "
-            f"WHERE q.topic_id IN ({','.join('?' * len(topics))}) AND a.at >= ? AND a.at < ? "
+            f"WHERE {REGULAR} AND q.topic_id IN ({','.join('?' * len(topics))}) AND a.at >= ? AND a.at < ? "
             f"AND COALESCE(a.mode, '') != 'pretest' ORDER BY a.at, a.id",
             (GUESS, *topics, day_start, day_end),
         ):
@@ -529,7 +529,7 @@ def _due_before(conn: sqlite3.Connection, topic_ids: list[int], at: int) -> dict
         r["topic_id"]: r["n"]
         for r in conn.execute(
             f"SELECT q.topic_id, COUNT(*) AS n FROM review_state rs JOIN question q ON rs.card_key = 'q:' || q.id "
-            f"WHERE q.verified = 1 AND q.retired = 0 AND rs.due < ? "
+            f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} AND rs.due < ? "
             f"AND q.topic_id IN ({','.join('?' * len(topic_ids))}) GROUP BY q.topic_id",
             (at, *topic_ids),
         )

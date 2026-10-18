@@ -990,11 +990,11 @@ def test_new_model_in_chain_is_used_without_code_change(monkeypatch):
 def test_requests_counted_per_function_excluding_429():
     p, client = _provider(outcomes=[_rate_limited("20s"), json.dumps(_analysis()), _answers(1)],
                           sleeps=[])
-    assert p.requests == {"analysis": 0, "blind": 0}
+    assert p.requests == {"analysis": 0, "blind": 0, "pdf": 0}
     p.analyze_video("aaaaaaaaaa1", "Clase 1")
     p.answer_blind_batch(ITEMS)
     assert len(client.calls) == 3  # el 429 llegó a Gemini pero no se cuenta
-    assert p.requests == {"analysis": 1, "blind": 1}
+    assert p.requests == {"analysis": 1, "blind": 1, "pdf": 0}
 
 
 def test_blind_never_uses_excluded_model():
@@ -1009,7 +1009,7 @@ def test_blind_chain_empty_after_exclusion_raises_quota():
     with pytest.raises(AIQuotaError):
         p.answer_blind_batch(ITEMS, exclude_models={"b", "c"})
     assert client.calls == []
-    assert p.requests == {"analysis": 0, "blind": 0}
+    assert p.requests == {"analysis": 0, "blind": 0, "pdf": 0}
 
 
 def test_5xx_retried_then_next_model_counts_every_request():
@@ -1017,20 +1017,20 @@ def test_5xx_retried_then_next_model_counts_every_request():
                           sleeps=[], analyze_models=("m", "m2"))
     p.analyze_video("aaaaaaaaaa1", "Clase 1")
     assert [c.model for c in client.calls] == ["m", "m", "m2"]
-    assert p.requests == {"analysis": 3, "blind": 0}
+    assert p.requests == {"analysis": 3, "blind": 0, "pdf": 0}
 
 
 def test_blind_fallback_across_two_models_counts_two():
     p, client = _provider(outcomes=["no es json", _answers(1)], blind_models=("b", "b2"))
     assert p.answer_blind_batch(ITEMS) == [1]
-    assert p.requests == {"analysis": 0, "blind": 2}
+    assert p.requests == {"analysis": 0, "blind": 2, "pdf": 0}
 
 
 def test_transport_error_is_not_counted():
     p, _ = _provider(error=httpx.ConnectError("x"))
     with pytest.raises(AIUnavailableError):
         p.answer_blind_batch(ITEMS)
-    assert p.requests == {"analysis": 0, "blind": 0}
+    assert p.requests == {"analysis": 0, "blind": 0, "pdf": 0}
 
 
 def test_requests_read_and_reset_through_the_gate_and_age_gate_still_blocks():
@@ -1040,7 +1040,7 @@ def test_requests_read_and_reset_through_the_gate_and_age_gate_still_blocks():
     allowed = [True]
     gated = GatedProvider(real, lambda: allowed[0])
     gated.answer_blind_batch(ITEMS)
-    assert gated.requests == {"analysis": 0, "blind": 1} == real.requests
+    assert gated.requests == {"analysis": 0, "blind": 1, "pdf": 0} == real.requests
     gated.requests = {"analysis": 0, "blind": 0}
     assert real.requests == {"analysis": 0, "blind": 0}
     allowed[0] = False

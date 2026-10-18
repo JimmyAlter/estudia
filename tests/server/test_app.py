@@ -12,8 +12,9 @@ from estudia.ai.base import AIAuthError, AIFormatError, AIQuotaError
 from estudia.ai.gemini import GeminiProvider
 from estudia.db import connect
 from estudia.moodle.client import TokenInvalid
-from estudia.secrets import get_secret, set_secret
+from estudia.secrets import delete_secret, get_secret, set_secret
 from estudia.server.app import create_app
+from estudia.study.practice import QUESTION_SUPERSEDED_TEXT
 from fakes import DeniedYoutubeUrlClient, FakeProvider
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "moodle"
@@ -318,7 +319,7 @@ def test_answer_flow(env):
     assert r.status_code == 200
     items = r.json()
     assert items == [{"question_id": 1, "stem": "¿Pendiente?", "options": ["1", "2", "3", "4"], "topic": "Rectas",
-                      "format": "mcq", "phase": "focus", "relearning": None}]
+                      "format": "mcq", "phase": "focus", "relearning": None, "points": None}]
 
     r = c.post("/api/answer", json={"question_id": 1, "chosen_index": 0})
     assert r.status_code == 200
@@ -348,7 +349,7 @@ def test_home_and_materials(env):
         "id": 1, "title": "Video 1", "kind": "youtube", "status": "done",
         "summary_md": "# Resumen", "error": None, "youtube_id": "abcdefghijk",
         "campus_url": f"{SITE_URL}/mod/page/view.php?id=1001",
-        "topic_ids": [1], "questions": 1,
+        "topic_ids": [1], "questions": 1, "part": None, "pages": None, "fail_kind": None,
     }
     # "Practicar esta clase" solo cuenta preguntas que se pueden mostrar.
     c.post("/api/question/1/retire")
@@ -464,6 +465,27 @@ def test_unretire_undoes_a_report(env):
     assert [q["question_id"] for q in c.post("/api/quiz", json={}).json()] == [1]
     assert c.post("/api/question/99/unretire").status_code == 404
     assert c.post("/api/question/99/retire").status_code == 404
+
+
+@pytest.mark.parametrize("setup", [
+    "UPDATE material SET status='replaced' WHERE id=1",   # tramo de una versión vieja del archivo
+    "UPDATE material SET status='split' WHERE id=1",      # documento que después se partió
+    "UPDATE question SET dedupe_key=NULL WHERE id=1",     # el campus reemplazó el archivo
+])
+def test_unretire_refuses_superseded_question(env, setup):
+    c = logged_in(env)
+    seed_question(env["db_path"])
+    assert c.post("/api/question/1/retire").status_code == 200
+    conn = connect(env["db_path"])
+    conn.execute(setup)
+    conn.commit()
+    conn.close()
+    r = c.post("/api/question/1/unretire")
+    assert r.status_code == 409
+    assert r.json()["detail"] == QUESTION_SUPERSEDED_TEXT
+    conn = connect(env["db_path"])
+    assert conn.execute("SELECT retired FROM question WHERE id=1").fetchone()[0] == 1
+    conn.close()
 
 
 def test_unretire_rejects_foreign_origin(env):
@@ -704,6 +726,17 @@ def test_allow_download_must_be_a_bool(env, value):
     assert env["client"].get("/api/settings").json()["allow_download"] is False
 
 
+def test_materials_expose_fail_kind(env):
+    """Materiales distingue un archivo que no se pudo bajar por `fail_kind`, no por el texto."""
+    from estudia.material.files import FAIL_DOWNLOAD
+
+    add_failed_material(env["db_path"], 1, fail_kind=FAIL_DOWNLOAD)
+    add_failed_material(env["db_path"], 2, fail_kind="format")
+    add_failed_material(env["db_path"], 3, status="pending", fail_kind=None)
+    materials = env["client"].get("/api/materials").json()[0]["materials"]
+    assert [(m["id"], m["fail_kind"]) for m in materials] == [(1, "download"), (2, "format"), (3, None)]
+
+
 def test_materials_show_needs_public_link(env):
     add_failed_material(env["db_path"], 1, status="needs_public_link", fail_kind=None)
     conn = connect(env["db_path"])
@@ -761,3 +794,200 @@ def test_state_exposes_youtube_cap_with_its_reset(env):
     state = env["client"].get("/api/state").json()
     assert state["ai_stop_reason"] == "youtube_cap"
     assert state["ai_quota_resets_at"] == 1792292400
+
+
+FILES_CONTENTS = json.loads((FIXTURES / "core_course_get_contents_files.json").read_text("utf-8"))
+
+
+class FilesMoodle(FakeMoodle):
+    """Un campus con un PDF en un `resource`; `download_error` simula una descarga que falla."""
+
+    download_error = None
+
+    def call(self, fn, **params):
+        if fn == "core_course_get_contents" and self.fail_with is None:
+            return FILES_CONTENTS
+        return super().call(fn, **params)
+
+    def download_file(self, fileurl, dest, *, max_bytes):
+        from docs_factory import make_pdf
+
+        if self.download_error is not None:
+            raise self.download_error
+        dest.write_bytes(make_pdf(["Hola"]))
+        return dest.stat().st_size
+
+
+def test_sync_downloads_campus_documents(env):
+    from estudia.config import data_dir
+
+    c = logged_in(env)
+    delete_secret("gemini_key")   # sin IA: la tubería de documentos llega en la Tarea 6
+    env["app"].state.jobs.moodle_client_factory = lambda url, token: FilesMoodle(url, token)
+    assert c.post("/api/sync").status_code == 202
+    conn = connect(env["db_path"])
+    pdf = conn.execute("SELECT id, status, ref FROM material WHERE kind='pdf'").fetchone()
+    conn.close()
+    assert (pdf["status"], pdf["ref"]) == ("pending", f"documentos/{pdf['id']}.pdf")
+    assert (data_dir() / "documentos" / f"{pdf['id']}.pdf").is_file()
+    assert c.get("/api/state").json()["last_sync_error"] is None
+
+
+@pytest.mark.parametrize("error, logged_out", [
+    (TokenInvalid("invalidtoken"), True),
+    (TokenInvalid("accessexception"), False),
+])
+def test_sync_download_token_error(env, error, logged_out):
+    c = logged_in(env)
+
+    class Failing(FilesMoodle):
+        download_error = error
+
+    env["app"].state.jobs.moodle_client_factory = lambda url, token: Failing(url, token)
+    c.post("/api/sync")
+    assert (get_secret(f"moodle_token:{SITE_ID}") is None) is logged_out
+    conn = connect(env["db_path"])
+    assert conn.execute("SELECT status FROM material WHERE kind='pdf'").fetchone()[0] == "downloading"
+    conn.close()
+
+
+def seed_documents(db_path):
+    """Un PDF partido en dos tramos, una carpeta con diapositivas y una página sin video."""
+    conn = connect(db_path)
+    conn.execute("INSERT INTO course(id, site_id, fullname, shortname) VALUES (10, ?, 'Álgebra', 'ALG')", (SITE_ID,))
+    conn.execute("INSERT INTO section(id, course_id, num, name, visible) VALUES (1, 10, 1, 'S1', 1)")
+    conn.execute("INSERT INTO section(id, course_id, num, name, visible) VALUES (2, 10, 2, 'S2', 1)")
+    secret = f"{SITE_URL}/webservice/pluginfile.php/9/mod_resource/content/1/libro.pdf?token=SECRETO"
+    conn.execute(
+        "INSERT INTO material(id, section_id, kind, title, ref, status, module_id, module_kind,"
+        " remote_url, pages) VALUES (1, 1, 'pdf', 'Libro', 'documentos/1.pdf', 'split', 501,"
+        " 'resource', ?, 100)", (secret,))
+    conn.execute(
+        "INSERT INTO material(id, section_id, kind, title, ref, status, parent_id, page_from, page_to)"
+        " VALUES (2, 1, 'pdf', 'Capítulo 1', 'documentos/1.pdf', 'done', 1, 1, 40),"
+        " (3, 1, 'pdf', 'Capítulo 2', 'documentos/1.pdf', 'pending', 1, 41, 100),"
+        # Un tramo de una versión anterior del archivo (el campus lo reemplazó): no se lista.
+        " (7, 1, 'pdf', 'Capítulo viejo', 'documentos/1.pdf', 'replaced', 1, 1, 50)")
+    conn.execute(
+        "INSERT INTO material(id, section_id, kind, title, ref, status, module_id, module_kind,"
+        " remote_url, pages) VALUES (4, 2, 'slides', 'Clase 2', 'documentos/4.pptx', 'done', 602,"
+        " 'folder', ?, 12)", (secret,))
+    conn.execute(
+        "INSERT INTO material(id, section_id, cmid, kind, title, status)"
+        " VALUES (5, 2, 703, 'page', 'Página', 'unsupported')")
+    conn.execute(
+        "INSERT INTO material(id, section_id, cmid, kind, title, ref, status)"
+        " VALUES (6, 1, 704, 'youtube', 'Video', 'abcdefghijk', 'done')")
+    conn.execute("INSERT INTO topic(id, course_id, slug, name) VALUES (1, 10, 'rectas', 'Rectas')")
+    conn.execute(
+        "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
+        " explanation, common_error, source_seconds, source_page, verified, retired, dedupe_key)"
+        " VALUES (1, 2, 1, '¿Pendiente?', ?, 2, 'Porque m = 3', 'Confundir', NULL, 14, 1, 0, 'k1')",
+        (json.dumps(["1", "2", "3", "4"]),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_materials_api_hides_split_parent_and_lists_parts(env):
+    c = logged_in(env)
+    seed_documents(env["db_path"])
+    sections = c.get("/api/materials").json()
+    first = sections[0]["materials"]
+    assert [m["id"] for m in first] == [2, 3, 6]
+    part = first[0]
+    # `doc`: el documento entero, para decir "Libro, págs. 1–40" debajo del capítulo.
+    assert (part["title"], part["kind"], part["part"], part["pages"]) == (
+        "Capítulo 1", "pdf", {"from": 1, "to": 40, "doc": "Libro"}, 40)
+    assert first[1]["part"] == {"from": 41, "to": 100, "doc": "Libro"} and first[1]["pages"] == 60
+    assert first[2]["part"] is None and first[2]["pages"] is None
+    slides = sections[1]["materials"][0]
+    assert (slides["id"], slides["part"], slides["pages"], slides["youtube_id"]) == (4, None, 12, None)
+
+
+def test_materials_campus_url_per_module_kind(env):
+    c = logged_in(env)
+    seed_documents(env["db_path"])
+    urls = {m["id"]: m["campus_url"] for s in c.get("/api/materials").json() for m in s["materials"]}
+    assert urls == {
+        2: f"{SITE_URL}/mod/resource/view.php?id=501",   # un tramo: el módulo del padre
+        3: f"{SITE_URL}/mod/resource/view.php?id=501",
+        4: f"{SITE_URL}/mod/folder/view.php?id=602",
+        5: f"{SITE_URL}/mod/page/view.php?id=703",
+        6: f"{SITE_URL}/mod/page/view.php?id=704",
+    }
+
+
+def test_citations_never_carry_campus_token(env):
+    """Ni la lista de materiales ni la corrección llevan la URL del archivo con su token."""
+    c = logged_in(env)
+    seed_documents(env["db_path"])
+    materials = c.get("/api/materials")
+    assert "token=" not in materials.text and "pluginfile" not in materials.text
+    fb = c.post("/api/answer", json={"question_id": 1, "chosen_index": 0})
+    assert fb.status_code == 200
+    body = fb.json()
+    assert body["source_label"] == "Libro, pág. 14"
+    assert body["source_url"] == f"{SITE_URL}/mod/resource/view.php?id=501"
+    assert body["youtube_id"] is None
+    for field in ("source_label", "source_url", "youtube_id"):
+        assert "token=" not in str(body[field]) and "pluginfile" not in str(body[field])
+    assert "token=" not in fb.text
+
+
+def test_campus_token_never_leaks_through_any_route(env, tmp_path):
+    """Con un `remote_url` que trae `?token=SECRETO`, ninguna ruta ni archivo exportado lo repite:
+    simulacro (inicio, entrega, resultado), pretest, mazo de Anki (completo y semanal) y .ics."""
+    import io
+    import time
+    import zipfile
+
+    from estudia.study.anki import build_apkg
+    from estudia.study.exams import create_manual_exam
+
+    c = logged_in(env)
+    seed_documents(env["db_path"])
+    conn = connect(env["db_path"])
+    for qid in range(2, 9):   # el pretest necesita 3 y el simulacro 5 preguntas del apunte
+        conn.execute(
+            "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
+            " explanation, common_error, source_page, verified, retired, dedupe_key)"
+            " VALUES (?, 2, 1, ?, ?, 0, 'e', 'c', ?, 1, 0, ?)",
+            (qid, f"P{qid}", json.dumps(["1", "2", "3", "4"]), qid, f"k{qid}"))
+    conn.execute("UPDATE material SET updated_at = ? WHERE id = 2", (int(time.time()),))
+    exam_id = create_manual_exam(conn, 10, "Parcial", int(time.time()) + 86400, [1], None)
+    conn.commit()
+
+    def clean(text: str, where: str):
+        assert "token=" not in text.lower() and "pluginfile" not in text, where
+
+    start = c.post("/api/mock/start", json={"exam_id": exam_id})
+    assert start.status_code == 200, start.text
+    clean(start.text, "mock start")
+    attempt = start.json()["attempt_id"]
+    answers = {str(i["question_id"]): 0 for i in start.json()["items"]}
+    finish = c.post(f"/api/mock/{attempt}/finish", json={"answers": answers})
+    assert finish.status_code == 200, finish.text
+    clean(finish.text, "mock finish")
+    result = c.get(f"/api/mock/{attempt}")
+    assert result.status_code == 200
+    clean(result.text, "mock result")
+
+    pretest = c.post("/api/pretest/2/start")
+    assert pretest.status_code == 200, pretest.text
+    clean(pretest.text, "pretest start")
+    first = pretest.json()[0]["question_id"]
+    answered = c.post("/api/pretest/answer", json={"question_id": first, "chosen_index": 0})
+    assert answered.status_code == 200
+    clean(answered.text, "pretest answer")
+    clean(c.post("/api/pretest/2/close").text, "pretest close")
+
+    for deck, where in ((build_apkg(conn, None), "mazo completo"),
+                        (build_apkg(conn, None, set(range(1, 9))), "mazo semanal")):
+        with zipfile.ZipFile(io.BytesIO(deck)) as z:
+            z.extract("collection.anki2", tmp_path)
+        raw = (tmp_path / "collection.anki2").read_bytes().decode("latin-1")
+        clean(raw, where)
+    clean(c.get("/api/export/anki.apkg").content.decode("latin-1"), "anki.apkg")
+    clean(c.get("/api/calendar.ics").text, ".ics")
+    conn.close()
