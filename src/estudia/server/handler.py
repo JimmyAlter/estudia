@@ -18,6 +18,7 @@ from estudia import winreg_schemes
 from estudia.catalog import load_catalog
 from estudia.config import data_dir, data_path
 from estudia.launcher import headless
+from estudia.moodle.calendar_feed import feed_secret_name
 from estudia.secrets import delete_secret
 from estudia.server.app import GEMINI_KEY, HOST, moodle_private_name, moodle_token_name
 from estudia.streams import redirect_missing_streams
@@ -184,7 +185,8 @@ def forget_secrets() -> int:
     """
     names = [GEMINI_KEY]
     for site in load_catalog():
-        names += [moodle_token_name(site.id), moodle_private_name(site.id)]
+        names += [moodle_token_name(site.id), moodle_private_name(site.id),
+                  feed_secret_name(site.id)]
     for name in names:
         delete_secret(name)
     return 0

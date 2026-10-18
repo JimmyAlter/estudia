@@ -187,3 +187,74 @@ def test_topic_rows_say_how_many_questions_were_seen_and_for_which_date(conn):
 def test_topic_row_without_exam_has_no_date(conn):
     add_topic(conn, 1, 10, "Tema", 1)
     assert home_view(conn, NOW).topics[0].at is None
+
+
+def add_questions(conn, topic_id, count, start, verified=1, retired=0):
+    for qid in range(start, start + count):
+        conn.execute(
+            "INSERT INTO question(id, topic_id, stem, options_json, correct_index, verified, retired) "
+            "VALUES (?, ?, 'p', '[\"x\",\"y\"]', 0, ?, ?)",
+            (qid, topic_id, verified, retired),
+        )
+    conn.commit()
+
+
+def test_home_offers_practice_at_10_questions_while_processing(conn):
+    from estudia.study.home import READY_QUESTIONS, ReadyCourse
+
+    assert READY_QUESTIONS == 10
+    add_topic(conn, 1, 10, "Límites", 1)                      # 1 pregunta verificada
+    add_topic(conn, 2, 10, "Derivadas", 2, status="pending")  # 1 más; su clase sigue pendiente
+    add_questions(conn, 1, 7, 100)                            # 9 en total
+    add_questions(conn, 1, 3, 200, verified=0)                # sin verificar: no cuentan
+    add_questions(conn, 1, 3, 300, retired=1)                 # retiradas: no cuentan
+    assert home_view(conn, NOW).ready is None
+
+    add_questions(conn, 2, 1, 400)                            # 10
+    assert home_view(conn, NOW).ready == ReadyCourse(10, "Análisis Matemático", 10)
+
+    conn.execute("UPDATE material SET status='done'")
+    conn.commit()
+    assert home_view(conn, NOW).ready is None
+
+
+def test_ready_prefers_next_exam_course_then_most_questions(conn):
+    from estudia.study.home import ReadyCourse
+
+    conn.execute("INSERT INTO course(id, site_id, fullname, shortname) VALUES (30, 's', 'Química', 'Q')")
+    add_topic(conn, 1, 10, "AM", 1, status="pending")
+    add_topic(conn, 2, 20, "F", 1)
+    add_topic(conn, 3, 30, "Q", 1)
+    add_questions(conn, 1, 9, 100)    # AM: 10
+    add_questions(conn, 2, 19, 200)   # Física: 20
+    add_questions(conn, 3, 14, 300)   # Química: 15
+    assert home_view(conn, NOW).ready == ReadyCourse(20, "Física", 20)
+    add_exam(conn, 1, 30, NOW + 10 * DAY)
+    add_exam(conn, 2, 10, NOW + 3 * DAY)
+    assert home_view(conn, NOW).ready == ReadyCourse(10, "Análisis Matemático", 10)
+
+
+def test_ready_course_ignores_enrollment(conn):
+    from estudia.study.home import ReadyCourse
+
+    add_topic(conn, 1, 10, "AM", 1, status="pending")
+    add_topic(conn, 2, 20, "F", 1)
+    add_questions(conn, 1, 10, 100)   # AM: 11
+    add_questions(conn, 2, 9, 200)    # Física: 10
+    conn.execute("INSERT INTO exam(course_id, name, opens_at, source, kind) VALUES (20, 'I', ?, 'manual', 'inscripcion')",
+                 (NOW + DAY,))
+    conn.commit()
+    assert home_view(conn, NOW).ready == ReadyCourse(10, "Análisis Matemático", 11)
+
+
+def test_ready_course_counts_an_exam_open_right_now_as_next(conn):
+    from estudia.study.home import ReadyCourse
+
+    add_topic(conn, 1, 10, "AM", 1, status="pending")
+    add_topic(conn, 2, 20, "F", 1)
+    add_questions(conn, 1, 9, 100)    # AM: 10
+    add_questions(conn, 2, 19, 200)   # Física: 20
+    add_exam(conn, 1, 10, NOW + 3 * DAY)
+    add_exam(conn, 2, 20, NOW - DAY, closes_at=NOW + DAY)   # abierto ahora: es el próximo
+    assert home_view(conn, NOW).exam.course == "Física"
+    assert home_view(conn, NOW).ready == ReadyCourse(20, "Física", 20)

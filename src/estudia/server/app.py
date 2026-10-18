@@ -5,6 +5,7 @@ aparecen en respuestas, mensajes de error ni logs.
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import hmac
 import logging
@@ -41,6 +42,7 @@ from estudia.db import connect
 from estudia.generation.verify import GradingUnavailable
 from estudia.generation.pipeline import (
     ALLOW_DOWNLOAD_KEY,
+    BUDGET,
     QUOTA_RESET_KEY,
     RETRY_ON_NEW_KEY,
     STOP_KEY,
@@ -53,6 +55,13 @@ from estudia.generation.pipeline import (
     retry_needs_link,
 )
 from estudia.moodle.auth import AuthError, launch_url, parse_callback
+from estudia.moodle.calendar_feed import (
+    FeedUnreachable,
+    campus_calendar_url,
+    feed_secret_name,
+    feed_status_key,
+    fetch_feed_url,
+)
 from estudia.moodle.client import MoodleClient, MoodleError, TokenInvalid
 from estudia.moodle.sync import sync_all
 from estudia.updates import default_http, latest_release
@@ -63,6 +72,7 @@ from estudia.reminders import reminders_enabled
 from estudia.study.exams import (
     create_manual_exam,
     delete_manual_exam,
+    ENROLLMENT,
     exam_topics,
     list_exams,
     set_exam_result,
@@ -70,9 +80,12 @@ from estudia.study.exams import (
     update_manual_exam,
 )
 from estudia.study.home import home_view, next_exam
-from estudia.study.anki import build_apkg, course_slug
+from estudia.study.progress import progress_view
+from estudia.study.pretest import build_pretest, close_pretest, record_pretest_answer
+from estudia.study.recall import recall_check
+from estudia.study.anki import build_apkg, course_slug, weekly_question_ids
 from estudia.study.ics import EXAM_MIN, build_ics
-from estudia.study.mock_exam import NotEnoughQuestions, finish_mock, mock_result, start_mock
+from estudia.study.mock_exam import SHORT_NOT_ENOUGH_TEXT, NotEnoughQuestions, finish_mock, mock_result, start_mock
 from estudia.study.planner import (
     get_availability,
     mark_done_from_answers,
@@ -86,6 +99,7 @@ from estudia.study.practice import (
     build_quiz,
     build_session_quiz,
     record_answer,
+    record_explain_match,
     retire_question,
     unretire_question,
 )
@@ -124,7 +138,7 @@ AGES = ("adult", "minor")
 MINOR_AI_TEXT = "Estudia no usa la IA con menores de 18 años. La agenda, el plan y los recordatorios siguen andando."
 AGE_PENDING_TEXT = "Antes de conectar la IA, contestá si tenés 18 años o más."
 # Motivos de corte que vuelven solos a una hora conocida (kv "ai_quota_resets_at").
-RESETTING_REASONS = ("quota", YOUTUBE_CAP)
+RESETTING_REASONS = ("quota", YOUTUBE_CAP, BUDGET)
 NOT_ENOUGH_TEXT = "Todavía no hay suficientes preguntas para un simulacro"
 
 log = logging.getLogger(__name__)
@@ -398,6 +412,8 @@ class Jobs:
 def forget_moodle_session(site_id: str) -> None:
     delete_secret(moodle_token_name(site_id))
     delete_secret(moodle_private_name(site_id))
+    # La URL del feed lleva un token del campus: se va con la sesión.
+    delete_secret(feed_secret_name(site_id))
 
 
 def periodic_sync(jobs: Jobs, stop: threading.Event, *,
@@ -502,6 +518,20 @@ class AnswerIn(BaseModel):
     shown_order: list[StrictInt] | None = None
 
 
+class ExplainIn(BaseModel):
+    same: bool                              # "¿Dijiste lo mismo?" Sí / No; lo que escribió no se manda
+
+
+class RecallIn(BaseModel):
+    text: str = Field(max_length=5000)      # nunca se guarda ni se loguea
+
+
+class PretestAnswerIn(BaseModel):
+    question_id: int
+    chosen_index: StrictInt                 # posición tocada en `shown_order`
+    shown_order: list[StrictInt] | None = None
+
+
 def _quiz_course(conn: sqlite3.Connection, topic_id: int | None, now: int) -> int | None:
     """Curso del cuestionario: el del tema pedido, el del próximo examen o el primero con preguntas."""
     if topic_id is not None:
@@ -525,6 +555,8 @@ class ExamIn(BaseModel):
     at: int
     topic_ids: list[int] = []
     max_grade: float | None = None
+    kind: str = "parcial"
+    closes_at: int | None = None
 
 
 class ExamPatchIn(BaseModel):
@@ -534,6 +566,7 @@ class ExamPatchIn(BaseModel):
     max_grade: float | None = None
     time_limit_s: int | None = None
     topic_ids: list[int] | None = None
+    closes_at: int | None = None
 
 
 class SlotIn(BaseModel):
@@ -552,6 +585,7 @@ class PlanSettingsIn(BaseModel):
 class MockStartIn(BaseModel):
     exam_id: int
     predicted_grade: float | None = None
+    short: bool = False   # simulacro corto de 6 preguntas (el sugerido en un recuperatorio)
 
 
 class MockAnswerIn(BaseModel):
@@ -602,10 +636,18 @@ def agenda_week(conn: sqlite3.Connection, monday: date, now: int) -> dict:
         items.append({"kind": "class", "id": o.slot_id, "title": o.course or "Clase", "course": o.course,
                       "starts_at": o.starts_at, "ends_at": o.ends_at, "place": o.place})
     for e in conn.execute(
-        "SELECT e.id, e.name, e.opens_at, COALESCE(c.fullname, '') AS course FROM exam e "
-        "LEFT JOIN course c ON c.id = e.course_id WHERE e.opens_at >= ? AND e.opens_at < ?",
-        (start, end),
+        "SELECT e.id, e.name, e.opens_at, e.closes_at, COALESCE(e.kind, 'parcial') AS kind, "
+        "COALESCE(c.fullname, '') AS course FROM exam e "
+        "LEFT JOIN course c ON c.id = e.course_id "
+        "WHERE (e.opens_at >= ? AND e.opens_at < ?) OR (e.kind = 'inscripcion' AND e.closes_at >= ? AND e.closes_at < ?)",
+        (start, end, start, end),
     ):
+        if e["kind"] == ENROLLMENT:
+            for phase, at in (("open", e["opens_at"]), ("close", e["closes_at"])):
+                if at is not None and start <= at < end:
+                    items.append({"kind": "enrollment", "phase": phase, "id": e["id"], "title": e["name"] or "",
+                                  "course": e["course"], "starts_at": at})
+            continue
         items.append({"kind": "exam", "id": e["id"], "title": e["name"] or "", "course": e["course"],
                       "starts_at": e["opens_at"], "ends_at": e["opens_at"] + EXAM_MIN * 60})
     for d in conn.execute(
@@ -786,6 +828,10 @@ def create_app(
         if not pair.signature or not hmac.compare_digest(pair.signature.lower(), expected):
             raise HTTPException(400, "la respuesta no corresponde a este inicio de sesión")
         login["passport"] = None
+        if get_secret(moodle_token_name(site_id)) != pair.token:
+            # Sesión nueva (quizás otra cuenta): el feed de la anterior no se hereda.
+            delete_secret(feed_secret_name(site_id))
+            _kv_delete(conn, feed_status_key(site_id))
         set_secret(moodle_token_name(site_id), pair.token)
         if pair.private_token:
             set_secret(moodle_private_name(site_id), pair.private_token)
@@ -844,6 +890,10 @@ def create_app(
     def home(conn: sqlite3.Connection = Depends(get_conn)):
         # Datos locales: con la sesión del campus vencida el inicio sigue andando.
         return home_view(conn, int(time.time()))
+
+    @app.get("/api/progress")
+    def progress(conn: sqlite3.Connection = Depends(get_conn)):
+        return progress_view(conn)
 
     @app.get("/api/materials")
     def materials(conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
@@ -936,6 +986,51 @@ def create_app(
         refresh_plan_throttled(conn, now)
         return feedback
 
+    @app.post("/api/answers/{answer_id}/explain")
+    def answer_explain(answer_id: int, body: ExplainIn, conn: sqlite3.Connection = Depends(get_conn)):
+        try:
+            record_explain_match(conn, answer_id, body.same)
+        except LookupError:
+            raise HTTPException(404, "respuesta inexistente") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        refresh_plan_throttled(conn, int(time.time()))
+        return {"ok": True}
+
+    # "3 preguntas para arrancar": no toca el repaso ni el plan, así que no se replanifica.
+    @app.post("/api/pretest/{material_id}/start")
+    def pretest_start(material_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+        try:
+            return build_pretest(conn, material_id)
+        except LookupError:
+            raise HTTPException(404, "Esta clase no tiene preguntas para arrancar") from None
+
+    @app.post("/api/pretest/answer")
+    def pretest_answer(body: PretestAnswerIn, conn: sqlite3.Connection = Depends(get_conn)):
+        try:
+            return record_pretest_answer(conn, body.question_id, body.chosen_index, int(time.time()),
+                                         option_order=body.shown_order)
+        except LookupError:
+            raise HTTPException(404, "pregunta no disponible") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/api/pretest/{material_id}/close")
+    def pretest_close(material_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        try:
+            close_pretest(conn, material_id, int(time.time()))
+        except LookupError:
+            raise HTTPException(404, "La clase no existe") from None
+        return {"ok": True}
+
+    # "Contá lo que te acordás": el texto se compara en memoria y no se guarda ni se loguea.
+    @app.post("/api/materials/{material_id}/recall")
+    def recall(material_id: int, body: RecallIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        row = conn.execute("SELECT summary_md FROM material WHERE id = ?", (material_id,)).fetchone()
+        if row is None or not (row["summary_md"] or "").strip():
+            raise HTTPException(404, "Esta clase no tiene resumen")
+        return {"headings": [asdict(h) for h in recall_check(row["summary_md"], body.text)]}
+
     @app.post("/api/question/{question_id}/retire")
     def retire(question_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
         if conn.execute("SELECT 1 FROM question WHERE id=?", (question_id,)).fetchone() is None:
@@ -985,7 +1080,8 @@ def create_app(
     def create_exam(body: ExamIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
         try:
             exam_id = create_manual_exam(conn, body.course_id, body.name, body.at, body.topic_ids,
-                                         body.max_grade)
+                                         body.max_grade, kind=body.kind, closes_at=body.closes_at,
+                                         now=int(time.time()))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         replan_safely(conn, int(time.time()))
@@ -1111,9 +1207,9 @@ def create_app(
     def mock_start(body: MockStartIn, conn: sqlite3.Connection = Depends(get_conn)):
         # NotEnoughQuestions hereda de ValueError: va primero.
         try:
-            return start_mock(conn, body.exam_id, int(time.time()), body.predicted_grade)
+            return start_mock(conn, body.exam_id, int(time.time()), body.predicted_grade, short=body.short)
         except NotEnoughQuestions:
-            raise HTTPException(409, NOT_ENOUGH_TEXT) from None
+            raise HTTPException(409, SHORT_NOT_ENOUGH_TEXT if body.short else NOT_ENOUGH_TEXT) from None
         except LookupError:
             raise HTTPException(404, "El examen no existe") from None
         except ValueError as exc:
@@ -1177,6 +1273,71 @@ def create_app(
             media_type="application/octet-stream",
             headers={"Content-Disposition": f'attachment; filename="estudia-{course_slug(name or "todo")}.apkg"'},
         )
+
+    @app.get("/api/export/anki-semana.apkg")
+    def export_anki_week(conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+        now = int(time.time())
+        try:
+            data = build_apkg(conn, None, weekly_question_ids(conn, now))
+        except LookupError:
+            raise HTTPException(404, "No hay preguntas para esta semana") from None
+        day = datetime.fromtimestamp(now, TZ).date().isoformat()
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="estudia-semana-{day}.apkg"'},
+        )
+
+    # --- Feed del calendario del campus ------------------------------------------------------
+    # La URL lleva un token del campus: vive solo en el keyring y sale únicamente por
+    # POST /api/calendar-feed/reveal (POST: pasa por OriginGuard).
+
+    def feed_status(conn: sqlite3.Connection) -> str:
+        """Estado del feed del campus elegido (el kv global viejo ya no se lee)."""
+        site_id = _kv_get(conn, SITE_KEY)
+        if not site_id:
+            return "unknown"
+        status = _kv_get(conn, feed_status_key(site_id))
+        # Guardado pero sin secreto (se cerró la sesión): hay que pedirlo de nuevo.
+        if status == "saved" and not get_secret(feed_secret_name(site_id)):
+            return "unknown"
+        return status if status in ("saved", "unavailable") else "unknown"
+
+    @app.get("/api/calendar-feed")
+    def calendar_feed(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        site_url = _campus_url(conn)
+        return {
+            "status": feed_status(conn),
+            "campus_calendar_url": campus_calendar_url(site_url) if site_url else None,
+        }
+
+    @app.post("/api/calendar-feed/fetch")
+    def fetch_calendar_feed(conn: sqlite3.Connection = Depends(require_session)) -> dict:
+        site_id = _kv_get(conn, SITE_KEY)
+        token = get_secret(moodle_token_name(site_id))
+        client = jobs.moodle_client_factory(get_site(site_id).url, token)
+        # Nada de este camino toca la sesión del campus.
+        try:
+            url = fetch_feed_url(client)
+        except FeedUnreachable:
+            # Sin respuesta del campus: lo guardado queda como está y se reintenta después.
+            return {"status": feed_status(conn), "retry": True}
+        if url is None:
+            delete_secret(feed_secret_name(site_id))
+            status = "unavailable"
+        else:
+            set_secret(feed_secret_name(site_id), url)
+            status = "saved"
+        _kv_set(conn, feed_status_key(site_id), status)
+        return {"status": status, "retry": False}
+
+    @app.post("/api/calendar-feed/reveal")
+    def reveal_calendar_feed(conn: sqlite3.Connection = Depends(get_conn)) -> JSONResponse:
+        site_id = _kv_get(conn, SITE_KEY)
+        url = get_secret(feed_secret_name(site_id)) if site_id else None
+        if not url:
+            raise HTTPException(404, "no hay feed del calendario guardado")
+        return JSONResponse({"url": url}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/settings")
     def settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict:

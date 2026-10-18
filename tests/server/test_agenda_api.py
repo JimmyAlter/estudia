@@ -343,6 +343,9 @@ def test_mock_errors_mapped(env):
     r = c.post("/api/mock/start", json={"exam_id": exam_id})
     assert r.status_code == 409
     assert r.json() == {"detail": "Todavía no hay suficientes preguntas para un simulacro"}
+    r = c.post("/api/mock/start", json={"exam_id": exam_id, "short": True})
+    assert r.status_code == 409
+    assert r.json() == {"detail": "Todavía no hay suficientes preguntas de los temas flojos para un simulacro corto."}
 
     add_questions(conn, 1, start=5)
     attempt = c.post("/api/mock/start", json={"exam_id": exam_id}).json()["attempt_id"]
@@ -547,3 +550,58 @@ def test_mock_finish_payload_limits(env):
     assert conn.execute("SELECT finished_at FROM mock_attempt WHERE id = ?",
                         (start["attempt_id"],)).fetchone()[0] is None
     assert c.post(url, json={"answers": {str(i): 0 for i in range(1000, 1050)}}).status_code == 200
+
+
+def add_enrollment(conn, opens, closes, name="Inscripción a finales"):
+    cur = conn.execute(
+        "INSERT INTO exam(course_id, name, opens_at, closes_at, source, kind) "
+        "VALUES (10, ?, ?, ?, 'manual', 'inscripcion')", (name, opens, closes))
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_agenda_includes_enrollment(env):
+    c, conn = env["client"], env["conn"]
+    eid = add_enrollment(conn, ts(2030, 1, 7, 9), ts(2030, 1, 9, 18))
+    # Abre la semana anterior y cierra en esta: solo sale el cierre.
+    other = add_enrollment(conn, ts(2030, 1, 2, 9), ts(2030, 1, 10, 12), "Otra")
+    r = c.get("/api/agenda", params={"week_start": ts(2030, 1, 7)})
+    items = [i for d in r.json()["days"] for i in d["items"]]
+    assert not any(i["kind"] == "exam" for i in items)
+    got = sorted((i["id"], i["phase"], i["starts_at"]) for i in items if i["kind"] == "enrollment")
+    assert got == sorted([(eid, "open", ts(2030, 1, 7, 9)), (eid, "close", ts(2030, 1, 9, 18)),
+                          (other, "close", ts(2030, 1, 10, 12))])
+    assert r.json()["health"] == []
+
+
+def test_exam_api_kind(env, replan_calls):
+    c, conn = env["client"], env["conn"]
+    at = int(time.time()) + 86400
+    assert c.post("/api/exams", json={"course_id": 10, "name": "X", "at": at, "kind": "otro"}).status_code == 400
+    assert c.post("/api/exams", json={"course_id": 10, "name": "I", "at": at, "kind": "inscripcion"}).status_code == 400
+    r = c.post("/api/exams", json={"course_id": 10, "name": "I", "at": at, "kind": "inscripcion",
+                                   "closes_at": at + 86400})
+    assert r.status_code == 200
+    (e,) = [e for e in c.get("/api/exams").json() if e["id"] == r.json()["id"]]
+    assert e["kind"] == "inscripcion" and e["closes_at"] == at + 86400 and e["topic_ids"] == []
+    # Sin nota: ni el resultado ni el simulacro.
+    past = add_enrollment(conn, int(time.time()) - 5 * 86400, int(time.time()) + 86400)
+    assert c.post(f"/api/exams/{past}/result", json={"grade": 7}).status_code == 400
+    assert c.post(f"/api/exams/{past}/result/skip").status_code == 400
+    assert c.post("/api/mock/start", json={"exam_id": past}).status_code == 400
+    p = c.post("/api/exams", json={"course_id": 10, "name": "P", "at": at}).json()["id"]
+    assert [e for e in c.get("/api/exams").json() if e["id"] == p][0]["kind"] == "parcial"
+
+
+def test_anki_weekly_route(env, monkeypatch):
+    conn, c = env["conn"], env["client"]
+    r = c.get("/api/export/anki-semana.apkg")
+    assert r.status_code == 404 and r.json()["detail"] == "No hay preguntas para esta semana"
+    add_questions(conn, 2)
+    conn.execute("INSERT INTO review_state(card_key, due) VALUES ('q:1', ?)", (int(time.time()) + 86400,))
+    conn.commit()
+    # 2030-01-01 02:00 UTC es todavía el 31/12/2029 en Buenos Aires.
+    monkeypatch.setattr(app_module.time, "time", lambda: ts(2029, 12, 31, 23))
+    r = c.get("/api/export/anki-semana.apkg")
+    assert r.status_code == 200 and r.content[:2] == b"PK"
+    assert r.headers["content-disposition"] == 'attachment; filename="estudia-semana-2029-12-31.apkg"'

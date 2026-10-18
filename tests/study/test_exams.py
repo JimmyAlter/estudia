@@ -169,3 +169,124 @@ def test_skip_exam_result_only_after_the_exam(conn):
     assert by_id[past].result_skipped is True
     assert by_id[future].result_skipped is False
     assert by_id[past].result is None
+
+
+# --- Tipo de examen e Inscripción ----------------------------------------------------------------
+
+from estudia.study.exams import ENROLLMENT, EXAM_KINDS, set_exam_result, skip_exam_result  # noqa: E402
+from estudia.study.mock_exam import start_mock  # noqa: E402
+from estudia.study.planner import plan_health, replan  # noqa: E402
+from estudia.study.srs import exam_dates_by_topic  # noqa: E402
+
+
+def add_enrollment(conn, opens, closes, name="Inscripción a finales"):
+    return create_manual_exam(conn, 10, name, opens, [], None, kind=ENROLLMENT, closes_at=closes, now=NOW)
+
+
+def add_question(conn, qid, topic_id):
+    conn.execute(
+        "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index, explanation,"
+        " verified, retired, dedupe_key) VALUES (?, ?, ?, 'p', '[\"a\",\"b\"]', 0, 'e', 1, 0, ?)",
+        (qid, topic_id, topic_id, f"k{qid}"),
+    )
+    conn.commit()
+
+
+def test_exam_kinds_and_default_kind():
+    assert EXAM_KINDS == ("parcial", "recuperatorio", "final", "inscripcion")
+    assert ENROLLMENT == "inscripcion"
+
+
+def test_create_stores_kind_and_created_at(conn):
+    eid = create_manual_exam(conn, 10, "Final", NOW + DAY, [], None, kind="final", closes_at=NOW + 2 * DAY, now=NOW)
+    row = conn.execute("SELECT kind, created_at, closes_at FROM exam WHERE id = ?", (eid,)).fetchone()
+    assert (row["kind"], row["created_at"], row["closes_at"]) == ("final", NOW, None)
+    assert next(e for e in list_exams(conn, NOW) if e.id == eid).kind == "final"
+    with pytest.raises(ValueError):
+        create_manual_exam(conn, 10, "X", NOW + DAY, [], None, kind="otro")
+
+
+def test_campus_exam_defaults_to_parcial(conn):
+    conn.execute("INSERT INTO exam(course_id, cmid, name, opens_at, source) VALUES (10, 5, 'Quiz', ?, 'campus')", (NOW + DAY,))
+    conn.commit()
+    assert list_exams(conn, NOW)[0].kind == "parcial"
+
+
+def test_enrollment_requires_close_after_open(conn):
+    with pytest.raises(ValueError):
+        create_manual_exam(conn, 10, "I", NOW + DAY, [], None, kind=ENROLLMENT, now=NOW)
+    with pytest.raises(ValueError):
+        add_enrollment(conn, NOW + DAY, NOW + DAY)
+    with pytest.raises(ValueError):
+        add_enrollment(conn, NOW + DAY, NOW)
+    add_topic(conn, 1)
+    with pytest.raises(ValueError):
+        create_manual_exam(conn, 10, "I", NOW + DAY, [1], None, kind=ENROLLMENT, closes_at=NOW + 2 * DAY, now=NOW)
+    with pytest.raises(ValueError):
+        create_manual_exam(conn, 10, "I", NOW + DAY, [], 10.0, kind=ENROLLMENT, closes_at=NOW + 2 * DAY, now=NOW)
+    assert list_exams(conn, NOW) == []
+
+
+def test_enrollment_edit_closes_at_and_type_fixed(conn):
+    eid = add_enrollment(conn, NOW + DAY, NOW + 3 * DAY)
+    update_manual_exam(conn, eid, closes_at=NOW + 5 * DAY)
+    assert conn.execute("SELECT closes_at FROM exam WHERE id = ?", (eid,)).fetchone()[0] == NOW + 5 * DAY
+    with pytest.raises(ValueError):
+        update_manual_exam(conn, eid, at=NOW + 6 * DAY)  # abriría después del cierre
+    with pytest.raises(ValueError):
+        update_manual_exam(conn, eid, kind="parcial")
+    pid = create_manual_exam(conn, 10, "P", NOW + DAY, [], None)
+    with pytest.raises(ValueError):
+        update_manual_exam(conn, pid, closes_at=NOW + 2 * DAY)
+
+
+def test_enrollment_has_no_topics_plan_or_mock(conn):
+    add_topic(conn, 1)
+    for i in range(1, 13):
+        add_question(conn, i, 1)
+    eid = add_enrollment(conn, NOW + 5 * DAY, NOW + 9 * DAY)
+    assert exam_topics(conn, eid) == []
+    replan(conn, NOW)
+    assert conn.execute("SELECT COUNT(*) FROM plan_session WHERE exam_id = ?", (eid,)).fetchone()[0] == 0
+    assert plan_health(conn, NOW) == []
+    with pytest.raises(ValueError, match="Una inscripción no tiene simulacro"):
+        start_mock(conn, eid, NOW)
+
+
+def test_enrollment_not_next_exam(conn):
+    add_enrollment(conn, NOW + DAY, NOW + 2 * DAY)
+    assert next_exam(conn, NOW) is None
+    assert home_view(conn, NOW).exam is None
+    pid = create_manual_exam(conn, 10, "Parcial", NOW + 10 * DAY, [], None, now=NOW)
+    row = next_exam(conn, NOW)
+    assert row["name"] == "Parcial" and row["id"] == pid
+
+
+def test_enrollment_does_not_set_exam_horizon(conn):
+    add_topic(conn, 1)
+    add_enrollment(conn, NOW + DAY, NOW + 2 * DAY)
+    assert exam_dates_by_topic(conn) == {}
+
+
+def test_enrollment_has_no_result(conn):
+    eid = add_enrollment(conn, NOW - 2 * DAY, NOW + DAY)
+    with pytest.raises(ValueError):
+        set_exam_result(conn, eid, 7, NOW)
+    with pytest.raises(ValueError):
+        skip_exam_result(conn, eid, NOW)
+
+
+def test_old_exams_default_to_parcial(tmp_path):
+    path = tmp_path / "old.db"
+    c = connect(path)
+    c.execute("INSERT INTO course(id, site_id, fullname, shortname) VALUES (10, 's', 'A', 'A')")
+    c.execute("INSERT INTO exam(id, course_id, name, opens_at) VALUES (1, 10, 'Viejo', 5)")
+    c.execute("ALTER TABLE exam DROP COLUMN kind")
+    c.execute("ALTER TABLE exam DROP COLUMN created_at")
+    c.commit()
+    c.close()
+    c = connect(path)  # migra
+    row = c.execute("SELECT kind, created_at FROM exam WHERE id = 1").fetchone()
+    assert (row["kind"], row["created_at"]) == ("parcial", None)
+    c.close()
+    connect(path).close()  # idempotente

@@ -85,7 +85,10 @@ def test_typed_near_misses_rejected(env):
 def test_typed_grading_unavailable_503_no_write(env, monkeypatch):
     c, conn = env["client"], env["conn"]
     add_question(conn, 1, check_expr="2")
-    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    # Sin worker y sin que arranque: determinista. Con `EVAL_TIMEOUT_S = 0` el worker (tibio de
+    # otro test) podía contestar entre el envío y el `poll(0)` y la respuesta salía 200.
+    verify._stop_worker()
+    monkeypatch.setattr(verify, "_start_worker", lambda: False)
     r = typed(c, "2")
     assert r.status_code == 503
     assert r.json()["detail"] == "No pude corregir ahora, probá de nuevo"
@@ -273,3 +276,61 @@ def test_typed_to_a_flagged_question_400_points_to_the_options(env):
     assert (r.status_code, r.json()["detail"]) == (
         400, "Esta pregunta va con opciones. Tocá «Mostrame opciones».")
     assert answers(conn) == []
+
+
+def add_summary(conn, material_id=1, summary="# Funciones lineales\n## Raíces\n## Pendiente\n"):
+    conn.execute("INSERT INTO section(id, course_id, num, name, visible) VALUES (1001, 10, 1, 's', 1)")
+    conn.execute("INSERT INTO material(id, section_id, cmid, kind, title, ref, status, summary_md, updated_at) "
+                 "VALUES (?, 1001, 1, 'youtube', 'Rectas', 'r', 'done', ?, 0)", (material_id, summary))
+    conn.commit()
+
+
+def test_recall_route_marks_missing_headings(env):
+    c, conn = env["client"], env["conn"]
+    add_summary(conn)
+    r = c.post("/api/materials/1/recall", json={"text": "la funcion lineal y sus raices"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"headings": [{"title": "Funciones lineales", "mentioned": True},
+                                     {"title": "Raíces", "mentioned": True},
+                                     {"title": "Pendiente", "mentioned": False}]}
+
+
+def test_recall_route_does_not_store_text(env):
+    c, conn = env["client"], env["conn"]
+    add_summary(conn)
+    secret = "mi recuerdo secreto zanahoria"
+    assert c.post("/api/materials/1/recall", json={"text": secret}).status_code == 200
+    assert secret not in "\n".join(conn.iterdump())
+
+
+def test_recall_route_404_without_summary(env):
+    c, conn = env["client"], env["conn"]
+    assert c.post("/api/materials/1/recall", json={"text": "x"}).status_code == 404
+    add_summary(conn, summary="   ")
+    assert c.post("/api/materials/1/recall", json={"text": "x"}).status_code == 404
+
+
+def test_recall_route_guarded_and_422_does_not_echo(env):
+    c, conn = env["client"], env["conn"]
+    add_summary(conn)
+    assert c.post("/api/materials/1/recall", json={"text": "x"}, headers=EVIL).status_code == 403
+    long_text = "zanahoria " * 600
+    r = c.post("/api/materials/1/recall", json={"text": long_text})
+    assert r.status_code == 422
+    assert "zanahoria" not in r.text
+    assert c.post("/api/materials/1/recall", json={"text": "a" * 5000}).status_code == 200
+
+
+def test_explain_route_saves_match_and_rejects_repeat(env):
+    c, conn = env["client"], env["conn"]
+    add_question(conn, 1, correct=0)
+    r = c.post("/api/answer", json={"question_id": 1, "chosen_index": 0, "confidence": 1})
+    fb = r.json()
+    assert fb["explain_prompt"] is True and isinstance(fb["answer_id"], int)
+    url = f"/api/answers/{fb['answer_id']}/explain"
+    assert c.post(url, json={"same": True}, headers=EVIL).status_code == 403
+    assert c.post(url, json={"same": "x"}).status_code == 422
+    assert c.post(url, json={"same": False}).json() == {"ok": True}
+    assert conn.execute("SELECT explain_match FROM answer").fetchone()[0] == 0
+    assert c.post(url, json={"same": True}).status_code == 400
+    assert c.post("/api/answers/999/explain", json={"same": True}).status_code == 404

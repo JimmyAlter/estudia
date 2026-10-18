@@ -206,4 +206,38 @@ describe("App: navegación", () => {
     const title = await screen.findByRole("heading", { level: 1, name: "Agenda" });
     await waitFor(() => expect(title).toHaveFocus());
   });
+
+  it("el botón del simulacro corto lleva al simulacro corto de ese examen", async () => {
+    vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    const now = Math.floor(Date.now() / 1000);
+    const retake = {
+      exam_id: 7, exam: "Recuperatorio del primer parcial", course: "Análisis Matemático", at: now + 10 * 86400,
+      minutes_needed: 60, minutes_available: 300, verdict: "llegás", due_reviews: 0, weak_topics: [], today: null,
+      kind: "recuperatorio", note: null, mock_suggested_at: now,
+    };
+    const fetchMock = mockApi({
+      "GET /api/state": READY,
+      "GET /api/home": HOME,
+      "GET /api/agenda": { days: [], health: [retake] },
+      "GET /api/exams": [
+        {
+          id: 7, course_id: 10, course: "Análisis Matemático", name: "Recuperatorio del primer parcial",
+          at: now + 10 * 86400, closes_at: null, source: "manual", kind: "recuperatorio", topic_ids: [1],
+          max_grade: 10, time_limit_s: null, attempts: null, editable: true, result: null, result_skipped: false,
+        },
+      ],
+      "POST /api/mock/start": () => new Response(JSON.stringify({ detail: "x" }), { status: 500 }),
+    });
+    render(<App />);
+    await screen.findByText("Sin exámenes próximos");
+    await userEvent.click(screen.getByRole("link", { name: "Agenda" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Hoy: simulacro corto" }));
+    expect(await screen.findByText("Simulacro corto")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/simulacro");
+    await userEvent.click(screen.getByRole("button", { name: "Empezar" }));
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/mock/start");
+    expect(JSON.parse(String(call![1]!.body))).toEqual({ exam_id: 7, predicted_grade: null, short: true });
+    vi.restoreAllMocks();
+  });
 });
+

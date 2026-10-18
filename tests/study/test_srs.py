@@ -273,3 +273,40 @@ def test_migration_replays_history(tmp_path):
     assert {r["card_key"]: dict(r) for r in again.execute("SELECT * FROM review_state")} == first
     assert sync_review_state(again) == 0
     assert again.execute("SELECT value FROM kv WHERE key = ?", (WATERMARK_KEY,)).fetchone()[0] == "4"
+
+
+def _explained(conn, qid, match):
+    """Marca la última respuesta de la pregunta con "Explicá por qué" y rehace su tarjeta."""
+    from estudia.study.srs import rebuild_card
+    conn.execute("UPDATE answer SET explain_match = ? WHERE id = (SELECT MAX(id) FROM answer WHERE question_id = ?)",
+                 (match, qid))
+    rebuild_card(conn, qid)
+    return state(conn, qid)
+
+
+def test_explain_no_brings_it_back_soon(conn):
+    from estudia.study.srs import SURE, UNSURE
+    assert rating_for(True, SURE, "typed", explain_match=0) == Rating.Again
+    assert rating_for(True, UNSURE, "mcq", explain_match=0) == Rating.Again
+    assert rating_for(True, SURE, "typed", explain_match=1) == Rating.Easy
+    assert rating_for(False, SURE, "mcq", explain_match=0) == Rating.Again
+    assert rating_for(True, 0, "mcq", explain_match=0) == Rating.Again   # Adiviné sigue siendo Again
+
+    # Un acierto con "Seguro" sin "Explicá por qué" vuelve en días; con "No", en ~1 día.
+    ans(conn, 1, True, local(5, 10), confidence=SURE)
+    ans(conn, 1, True, local(9, 10), confidence=SURE)
+    plain = state(conn, 1)
+    assert _explained(conn, 1, 1) == plain            # "Sí" no cambia nada
+    no = _explained(conn, 1, 0)
+    assert plain["due"] - local(9, 10) > 2 * DAY
+    assert no["due"] - local(9, 10) <= DAY + 3600
+    assert no["state"] == STATE_REVIEW               # no es un error: no entra en reaprendizaje
+
+    # En reaprendizaje, el "No" sigue contando como acierto: el avance de días no cambia.
+    ans(conn, 2, False, local(5, 10))
+    ans(conn, 2, True, local(6, 10), confidence=SURE)
+    counted = state(conn, 2)
+    assert counted["state"] == STATE_RELEARNING and counted["relearn_days"] == 1
+    no = _explained(conn, 2, 0)
+    assert (no["state"], no["relearn_days"], no["relearn_last_day"]) == \
+        (STATE_RELEARNING, 1, counted["relearn_last_day"])

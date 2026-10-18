@@ -4,7 +4,7 @@ import time
 import pytest
 
 from estudia.ai.base import AIFormatError, AIQuotaError
-from estudia.config import ANALYZE_MODELS
+from estudia import config
 from estudia.db import connect
 from estudia.generation.reverify import reverify_all
 from fakes import FakeProvider
@@ -81,13 +81,15 @@ def test_wrong_length_retires_the_whole_material(conn):
     assert retired(conn) == {1: 1, 2: 1}
 
 
-def test_unknown_analysis_model_excludes_the_whole_analysis_chain(conn):
+def test_unknown_analysis_model_excludes_the_whole_analysis_chain(conn, monkeypatch):
+    monkeypatch.setitem(config.MODEL_CHAINS, "analysis", [*config.MODEL_CHAINS["analysis"], "gemini-3.6-flash"])
     add_material(conn, 1, None)
     add_question(conn, 1, 1, "A")
     conn.commit()
     prov = Scripted({"A": [1]})
     reverify_all(conn, prov)
-    assert set(prov.blind_batches[0][1]) == set(ANALYZE_MODELS)
+    assert set(prov.blind_batches[0][1]) == set(config.MODEL_CHAINS["analysis"])
+    assert "gemini-3.6-flash" in prov.blind_batches[0][1]
 
 
 def test_quota_stops_without_retiring_and_the_next_run_resumes(conn):
@@ -134,3 +136,29 @@ def test_exhaustion_marks_are_loaded_and_saved(conn):
     reverify_all(conn, Prov({}))
     assert list(seen[0]) == ["b"]
     assert conn.execute("SELECT COUNT(*) FROM kv WHERE key='model_exhausted:fake:c'").fetchone()[0] == 1
+
+
+def test_requests_are_added_to_the_daily_usage(conn):
+    """Los pedidos de la reverificación cuentan para la cuota del día, también si se corta."""
+    from estudia.ai.quota import used_today
+    for mid, stem in ((1, "A"), (2, "B"), (3, "C")):
+        add_material(conn, mid, "m")
+        add_question(conn, mid, mid, stem)
+    conn.commit()
+
+    class Counting(Scripted):
+        def answer_blind_batch(self, items, exclude_models=()):
+            self.requests["blind"] += 1
+            return super().answer_blind_batch(items, exclude_models)
+
+    prov = Counting({"A": [1], "B": [1], "C": AIQuotaError()})
+    reverify_all(conn, prov)
+    assert used_today(conn, "blind", time.time()) == 3
+    assert prov.requests == {"analysis": 0, "blind": 0}
+
+    boom = Counting({"A": RuntimeError("se rompió")})
+    conn.execute("DELETE FROM kv WHERE key LIKE 'reverified:%'")
+    conn.commit()
+    with pytest.raises(RuntimeError):
+        reverify_all(conn, boom)
+    assert used_today(conn, "blind", time.time()) == 4

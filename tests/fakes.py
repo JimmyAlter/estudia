@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from google.genai import errors, types
 
-from estudia.ai.base import AIFormatError, VideoAnalysis
+from estudia.ai.base import AIFormatError, AIQuotaError, VideoAnalysis
 
 
 class FakeProvider:
@@ -22,6 +22,9 @@ class FakeProvider:
         analysis_model: str | None = "analizador",
         video_seconds: float | None = None,
         by_link: bool = True,
+        models_by_ref: dict[str, str] | None = None,
+        blind_errors: list[Exception | None] | None = None,
+        blind_models: tuple[str, ...] | None = None,
     ):
         self.analyses = analyses
         self.video_seconds = video_seconds
@@ -32,16 +35,25 @@ class FakeProvider:
         self.analyzed_refs: list[str] = []
         self.blind = blind
         self.analysis_model = analysis_model
+        # Modelo de análisis por id de video (pisa a `analysis_model`).
+        self.models_by_ref = models_by_ref or {}
+        self.requests: dict[str, int] = {"analysis": 0, "blind": 0}
         self.exhausted_until: dict[str, float] = {}
         self.last_analysis_model: str | None = None
         self.blind_batches: list[tuple[list[tuple[str, list[str]]], tuple[str, ...]]] = []
+        # Errores para los próximos pedidos a ciegas, en orden (uno por pedido; None = sin error).
+        self.blind_errors = list(blind_errors or [])
+        # Cadena a ciegas simulada: si todos sus modelos están excluidos, AIQuotaError
+        # sin pedido (como la rotación real con la cadena vacía). None = sin cadena.
+        self.blind_models = blind_models
 
     def analyze_video(self, youtube_id: str, title: str) -> VideoAnalysis:
         self.analyzed_refs.append(youtube_id)
         self.last_link_sent = False
         if youtube_id not in self.analyses:
             raise AIFormatError(f"sin análisis simulado para {youtube_id}")
-        self.last_analysis_model = self.analysis_model
+        self.requests["analysis"] += 1
+        self.last_analysis_model = self.models_by_ref.get(youtube_id, self.analysis_model)
         self.last_video_seconds = self.video_seconds
         self.last_link_sent = self.by_link
         return self.analyses[youtube_id]
@@ -53,7 +65,12 @@ class FakeProvider:
             return None
 
     def answer_blind_batch(self, items, exclude_models=()):
+        if self.blind_models is not None and all(m in exclude_models for m in self.blind_models):
+            raise AIQuotaError("no queda modelo a ciegas")
+        self.requests["blind"] += 1
         self.blind_batches.append((items, tuple(exclude_models)))
+        if self.blind_errors and (error := self.blind_errors.pop(0)) is not None:
+            raise error
         return [self.answer_blind(stem, options) for stem, options in items]
 
     def check_key(self) -> None:

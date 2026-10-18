@@ -6,6 +6,12 @@ rotación entre días, y un tipo que dice qué se hace en ella (ver `sessions`):
 - `mixed_focus`: repaso mezclado y después el tema foco.
 - `mixed_only`: en los últimos 7 días antes del examen, todo repaso mezclado de los temas del
   examen. El tema foco queda como el que encabeza la mezcla (el que más lo necesita).
+
+Un recuperatorio solo planifica los temas que todavía no están firmes: los de P < 0,7 el día del
+recuperatorio (`retake_topics`). Ni el foco ni la mezcla nombran otro.
+
+Un final abarca todos los temas de la materia y se prepara desde 6 semanas antes. Entre sus
+candidatos van primero los temas sin ninguna sesión para ese final, así el plan los cubre todos.
 """
 import json
 import math
@@ -13,7 +19,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from estudia.study.exams import exam_topics
+from estudia.study.exams import FINAL, RETAKE, exam_topics
 from estudia.study.mastery import topic_probability
 from estudia.study.schedule import TZ, occurrences
 from estudia.study.sessions import (
@@ -37,6 +43,13 @@ DONE_CORRECT = 3           # ... si además hay tantos aciertos que no fueron "A
 
 BLOCKED_SESSIONS = 2       # sesiones hechas de un tema antes de pasar a la mezcla
 MIXED_ONLY_DAYS = NEAR_EXAM_DAYS   # última semana antes del examen: todo mezclado
+
+RETAKE_THRESHOLD = 0.7     # en un recuperatorio entran los temas con P menor a esto el día del examen
+RETAKE_MOCK_AFTER_DAYS = 3  # simulacro corto sugerido a los 3 días de cargar el recuperatorio
+
+FINAL_MIN_WEEKS = 4        # con menos, el plan del final avisa que usa el tiempo que hay
+FINAL_MAX_WEEKS = 6        # los temas de un final son candidatos desde 6 semanas antes
+FINAL_SHORT_NOTE = "Faltan menos de 4 semanas: el plan usa el tiempo que hay."
 
 
 @dataclass
@@ -78,6 +91,9 @@ class ExamHealth:
     due_reviews: int = 0                                       # repasos que vencen antes del examen
     weak_topics: list[WeakTopic] = field(default_factory=list)   # por qué: los 3 de menor P
     today: SessionOut | None = None                            # qué hacer: la próxima sesión de hoy
+    kind: str = "parcial"                                      # tipo del examen (`exams.EXAM_KINDS`)
+    note: str | None = None                                    # una línea de aclaración, sin alarma
+    mock_suggested_at: int | None = None                       # recuperatorio: día del simulacro corto
 
 
 # --- Configuración -----------------------------------------------------------------------------
@@ -187,11 +203,37 @@ def _plannable_topics(conn: sqlite3.Connection) -> dict[int, int]:
 def _future_exams(conn: sqlite3.Connection, now: int) -> list[sqlite3.Row]:
     """Exámenes con fecha posterior a `now`, ordenados por fecha; los sin fecha no cuentan."""
     return conn.execute(
-        "SELECT e.id, e.name, e.opens_at, c.fullname AS course FROM exam e "
+        "SELECT e.id, e.name, e.opens_at, COALESCE(e.kind, 'parcial') AS kind, e.created_at, "
+        "c.fullname AS course FROM exam e "
         "LEFT JOIN course c ON c.id = e.course_id "
-        "WHERE e.opens_at IS NOT NULL AND e.opens_at > ? ORDER BY e.opens_at, e.id",
+        "WHERE e.opens_at IS NOT NULL AND e.opens_at > ? AND COALESCE(e.kind, 'parcial') != 'inscripcion' ORDER BY e.opens_at, e.id",
         (now,),
     ).fetchall()
+
+
+def retake_topics(conn: sqlite3.Connection, exam_id: int) -> list[int]:
+    """Temas del examen que todavía no están firmes: P < 0,7 el día del examen, en el orden de `exam_topics`."""
+    row = conn.execute("SELECT opens_at FROM exam WHERE id = ?", (exam_id,)).fetchone()
+    if row is None or row["opens_at"] is None:
+        return []
+    return [t for t in exam_topics(conn, exam_id)
+            if topic_probability(conn, t, row["opens_at"]) < RETAKE_THRESHOLD]
+
+
+def _scheduled_topics(conn: sqlite3.Connection, exam: sqlite3.Row) -> list[int]:
+    """Temas que el plan prepara para el examen: en un recuperatorio, solo los que no están firmes."""
+    return retake_topics(conn, exam["id"]) if exam["kind"] == RETAKE else exam_topics(conn, exam["id"])
+
+
+def _retake_mock_at(exam: sqlite3.Row, now: int) -> int | None:
+    """Inicio del día local del simulacro corto: 3 días después de cargar el recuperatorio, como
+    mucho el día anterior a él. None si no es recuperatorio, si no se sabe cuándo se cargó o si
+    ese día ya pasó."""
+    if exam["kind"] != RETAKE or exam["created_at"] is None:
+        return None
+    day = min(_local_day(exam["created_at"]) + timedelta(days=RETAKE_MOCK_AFTER_DAYS),
+              _local_day(exam["opens_at"]) - timedelta(days=1))
+    return _midnight(day) if day >= _local_day(now) else None
 
 
 def _priority(probability: float, days_left: int) -> float:
@@ -220,10 +262,14 @@ def _replan(conn: sqlite3.Connection, now: int, horizon_days: int) -> int:
     exams_by_topic: dict[int, list[tuple[date, int]]] = {}
     exam_at: dict[int, int] = {}
     topics_of_exam: dict[int, list[int]] = {}
+    final_from: dict[int, date] = {}   # final → primer día local en que sus temas son candidatos
     for exam in _future_exams(conn, now):
         exam_day = _local_day(exam["opens_at"])
         exam_at[exam["id"]] = exam["opens_at"]
-        topics_of_exam[exam["id"]] = [t for t in exam_topics(conn, exam["id"]) if t in topics]
+        if exam["kind"] == FINAL:
+            final_from[exam["id"]] = exam_day - timedelta(weeks=FINAL_MAX_WEEKS)
+        # Un recuperatorio deja afuera los temas firmes: así ni el foco ni la mezcla los nombran.
+        topics_of_exam[exam["id"]] = [t for t in _scheduled_topics(conn, exam) if t in topics]
         for topic_id in topics_of_exam[exam["id"]]:
             exams_by_topic.setdefault(topic_id, []).append((exam_day, exam["id"]))
     if not exams_by_topic:
@@ -251,6 +297,14 @@ def _replan(conn: sqlite3.Connection, now: int, horizon_days: int) -> int:
     start_min = preferred_start_min(conn)
     today = _local_day(now)
     last_exam_day = max(d for items in exams_by_topic.values() for d, _ in items)
+    # Temas que ya tienen alguna sesión de cada final (las que quedaron y las que se van creando).
+    covered: dict[int, set[int]] = {e: set() for e in final_from}
+    if final_from:
+        for r in conn.execute(
+            f"SELECT exam_id, topic_id FROM plan_session WHERE exam_id IN ({','.join('?' * len(final_from))})",
+            list(final_from),
+        ):
+            covered[r["exam_id"]].add(r["topic_id"])
     created = 0
 
     for offset in range(horizon_days):
@@ -260,7 +314,8 @@ def _replan(conn: sqlite3.Connection, now: int, horizon_days: int) -> int:
         # Cada tema se prepara para su examen más cercano que todavía no llegó.
         candidates = {}
         for topic_id, items in exams_by_topic.items():
-            ahead = [(d, e) for d, e in items if d > day]
+            # Un final todavía lejano no cuenta: el tema se prepara para otro examen, o espera.
+            ahead = [(d, e) for d, e in items if d > day and day >= final_from.get(e, day)]
             if ahead:
                 exam_day, exam_id = min(ahead)
                 candidates[topic_id] = (exam_id, (exam_day - day).days)
@@ -298,15 +353,23 @@ def _replan(conn: sqlite3.Connection, now: int, horizon_days: int) -> int:
                 (_midnight(day - timedelta(days=REPEAT_WINDOW_DAYS)), day_end),
             )
         }
+        # La última sesión nueva del día: si la siguiente es igual y va pegada, se unen (ver abajo).
+        last: dict | None = None
         for starts_at, minutes in _layout(first, day_end, busy, sizes):
             # Cada repetición reciente multiplica la prioridad por REPEAT_FACTOR; empate: id menor.
             # En la última semana la rotación sigue eligiendo el tema que encabeza la mezcla.
-            topic_id = min(
-                candidates,
-                key=lambda t: (-_priority(p_at_exam(t, candidates[t][0]), candidates[t][1])
-                               * REPEAT_FACTOR ** assigned.get(t, 0), t),
-            )
-            assigned[topic_id] = assigned.get(topic_id, 0) + 1
+            def rank(t: int) -> tuple[float, int]:
+                return (-_priority(p_at_exam(t, candidates[t][0]), candidates[t][1])
+                        * REPEAT_FACTOR ** assigned.get(t, 0), t)
+
+            topic_id = min(candidates, key=rank)
+            exam_id = candidates[topic_id][0]
+            if exam_id in covered:
+                # En un final, primero los temas sin ninguna sesión para él; después, la prioridad.
+                uncovered = [t for t in candidates if candidates[t][0] == exam_id and t not in covered[exam_id]]
+                if uncovered and topic_id not in uncovered:
+                    topic_id = min(uncovered, key=rank)
+                covered[exam_id].add(topic_id)
             exam_id, days_left = candidates[topic_id]
             mixed = [topic_id] + [t for t in topics_of_exam[exam_id] if t != topic_id]
             if days_left <= MIXED_ONLY_DAYS:
@@ -315,31 +378,60 @@ def _replan(conn: sqlite3.Connection, now: int, horizon_days: int) -> int:
                 kind, topics_for_session = FOCUS, [topic_id]
             else:
                 kind, topics_for_session = MIXED_FOCUS, mixed
+            # Dos bloques seguidos con lo mismo (mismo examen, tipo y temas; fuera de la mezcla
+            # pura, también el mismo foco) son una sola sesión, mientras no pase de un bloque largo.
+            if (
+                last is not None
+                and last["exam_id"] == exam_id
+                and last["kind"] == kind
+                and set(last["topics"]) == set(topics_for_session)
+                and (kind == MIXED_ONLY or last["topic_id"] == topic_id)
+                and starts_at == last["starts_at"] + (last["minutes"] + BREAK_MIN) * 60
+                and last["minutes"] + minutes <= LONG_BLOCK
+            ):
+                last["minutes"] += minutes
+                conn.execute("UPDATE plan_session SET minutes = ? WHERE id = ?", (last["minutes"], last["id"]))
+                last = None   # ya ocupa un bloque largo entero
+                continue
+            assigned[topic_id] = assigned.get(topic_id, 0) + 1
             if kind != MIXED_ONLY:
                 # Las sesiones planeadas antes que esta cuentan como hechas para cuando llegue.
                 blocked[topic_id] = blocked.get(topic_id, 0) + 1
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO plan_session(course_id, topic_id, exam_id, starts_at, minutes, done, kind, "
                 "topics_json) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
                 (topics[topic_id], topic_id, exam_id, starts_at, minutes, kind, json.dumps(topics_for_session)),
             )
+            last = {"id": cur.lastrowid, "exam_id": exam_id, "kind": kind, "topic_id": topic_id,
+                    "topics": topics_for_session, "starts_at": starts_at, "minutes": minutes}
             created += 1
     return created
 
 
 def _names(names: list[str]) -> str:
-    """Hasta dos nombres y "y N más": "A", "A y B", "A, B y 2 más"."""
+    """Hasta dos nombres y "y N más": "A", "A y B", "A, B y 2 más".
+
+    Si algún nombre ya tiene una "y" ("Paralelismo y perpendicularidad"), los nombres se unen con
+    coma: "A y B" se leería como tres temas.
+    """
     if len(names) <= 2:
-        return " y ".join(names)
+        return (", " if any(" y " in n for n in names) else " y ").join(names)
     return f"{names[0]}, {names[1]} y {len(names) - 2} más"
 
 
+def _sorted_names(names: list[str]) -> list[str]:
+    return sorted(names, key=str.casefold)
+
+
 def _label(kind: str, topic_names: list[str]) -> str:
-    """Qué se hace en la sesión; `topic_names` en el orden de `topic_ids` (el foco primero)."""
+    """Qué se hace en la sesión; `topic_names` en el orden de `topic_ids` (el foco primero).
+
+    Los temas del repaso van en orden alfabético: la misma mezcla se llama igual sea cual sea el foco.
+    """
     if kind == MIXED_ONLY:
-        return f"Repaso mezclado: {_names(topic_names)}"
+        return f"Repaso mezclado: {_names(_sorted_names(topic_names))}"
     if kind == MIXED_FOCUS and len(topic_names) > 1:
-        return f"Foco: {topic_names[0]}, con repaso de {_names(topic_names[1:])}"
+        return f"Foco: {topic_names[0]}, con repaso de {_names(_sorted_names(topic_names[1:]))}"
     return f"Foco: {topic_names[0]}"
 
 
@@ -373,7 +465,7 @@ def _counted_topics(row: sqlite3.Row) -> set[int]:
 
 def mark_done_from_answers(conn: sqlite3.Connection, now: int) -> int:
     """Marca hechas las sesiones de hoy o anteriores con 5 o más respuestas y, entre ellas, 3 o más
-    aciertos que no fueron "Adiviné" (un acierto de suerte no es recuperación).
+    aciertos que no fueron "Adiviné" (un acierto de suerte no es recuperación). El pretest no cuenta.
 
     Cada respuesta cuenta para una sola sesión. Por día local se reparten en orden de hora: una
     respuesta va a la primera sesión todavía sin completar que la cuenta (ver `_counted_topics`)
@@ -404,7 +496,8 @@ def mark_done_from_answers(conn: sqlite3.Connection, now: int) -> int:
         for a in conn.execute(
             f"SELECT q.topic_id, a.at, a.correct = 1 AND COALESCE(a.confidence, -1) != ? AS good "
             f"FROM answer a JOIN question q ON q.id = a.question_id "
-            f"WHERE q.topic_id IN ({','.join('?' * len(topics))}) AND a.at >= ? AND a.at < ? ORDER BY a.at, a.id",
+            f"WHERE q.topic_id IN ({','.join('?' * len(topics))}) AND a.at >= ? AND a.at < ? "
+            f"AND COALESCE(a.mode, '') != 'pretest' ORDER BY a.at, a.id",
             (GUESS, *topics, day_start, day_end),
         ):
             open_ = [r for r in day_sessions if r["id"] not in complete and a["topic_id"] in counted[r["id"]]]
@@ -447,11 +540,14 @@ def plan_health(conn: sqlite3.Connection, now: int) -> list[ExamHealth]:
     """Para cada examen futuro: minutos que hacen falta, minutos que hay, si alcanzan, por qué y qué hacer hoy.
 
     `minutes_needed = Σ_temas 50 × (1 − P(tema, examen)) + repasos que vencen antes del examen × 1`.
-    Cuenta todos los temas del examen (`exam_topics`), tengan o no preguntas.
+    Cuenta todos los temas del examen (`exam_topics`), tengan o no preguntas; en un recuperatorio,
+    solo los que no están firmes (`retake_topics`).
     `minutes_available` suma la disponibilidad desde hoy hasta el día anterior al examen; la de hoy
     se limita a lo que queda desde max(ahora, hora preferida) hasta las 24:00 y descuenta lo ya hecho.
     `weak_topics`: los 3 temas con menor P a los que les falta algo, con sus minutos.
     `today`: la próxima sesión de hoy para ese examen que no está hecha ni terminó.
+    `mock_suggested_at`: en un recuperatorio, el día sugerido para el simulacro corto (ver `_retake_mock_at`).
+    `note`: en un final a menos de 4 semanas (días locales), `FINAL_SHORT_NOTE`.
     """
     availability = get_availability(conn)
     today = _local_day(now)
@@ -467,7 +563,7 @@ def plan_health(conn: sqlite3.Connection, now: int) -> list[ExamHealth]:
 
     out = []
     for exam in _future_exams(conn, now):
-        topic_ids = exam_topics(conn, exam["id"])
+        topic_ids = _scheduled_topics(conn, exam)
         at = exam["opens_at"]
         due = _due_before(conn, topic_ids, at)
         # Lo que le falta a cada tema el día del examen: un tema que se olvida necesita más minutos.
@@ -492,9 +588,12 @@ def plan_health(conn: sqlite3.Connection, now: int) -> list[ExamHealth]:
             verdict = "justo"
         else:
             verdict = "no llegás"
+        short_final = exam["kind"] == FINAL and (exam_day - today).days < FINAL_MIN_WEEKS * 7
         out.append(ExamHealth(
             exam["id"], exam["name"], exam["course"] or "", at, needed, available, verdict,
             due_reviews=sum(due.values()), weak_topics=weak,
             today=next((s for s in pending_today if s.exam_id == exam["id"]), None),
+            kind=exam["kind"], note=FINAL_SHORT_NOTE if short_final else None,
+            mock_suggested_at=_retake_mock_at(exam, now),
         ))
     return out

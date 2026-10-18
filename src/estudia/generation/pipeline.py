@@ -3,8 +3,8 @@
 Regla central: una pregunta solo se guarda (verified=1) si sus opciones son
 distintas, la respuesta a ciegas coincide con `correct_index` y, cuando hay
 `check_expr`, SymPy confirma la opción marcada y ninguna otra. Todo lo demás se
-descarta y no se guarda. La pasada a ciegas va en un solo pedido por material y con
-otro modelo que el que hizo el análisis.
+descarta y no se guarda. La pasada a ciegas va en un pedido por lote de hasta
+BLIND_BATCH_MAX clases y nunca con un modelo que haya analizado alguna de ellas.
 """
 from __future__ import annotations
 
@@ -32,6 +32,14 @@ from estudia.ai.base import (
     AIVideoUnavailableError,
     VideoAnalysis,
     option_key,
+)
+from estudia.ai.quota import (
+    BLIND_BATCH_MAX,
+    can_analyze,
+    prune_usage,
+    quota_day,
+    record_usage,
+    remaining,
 )
 from estudia.config import (
     DAILY_VIDEO_CAP_S,
@@ -77,6 +85,9 @@ DAY_PREFIXES = (VIDEO_DAY_PREFIX, MEASURED_PREFIX, DENIED_VIDEOS_PREFIX)
 CAP_PREFIXES = (VIDEO_DAY_PREFIX, MEASURED_PREFIX)
 # Motivo de corte propio: se llegó al tope de YouTube del día (vuelve a la medianoche del Pacífico).
 YOUTUBE_CAP = "youtube_cap"
+# Motivo de corte propio: se llegó al presupuesto diario de pedidos (estudia.ai.quota), o
+# analizar más dejaría sin pedidos a la pasada a ciegas. Vuelve a la medianoche del Pacífico.
+BUDGET = "budget"
 LOCAL_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 CAP_TZ = ZoneInfo("America/Los_Angeles")   # la zona del día de la cuota de Gemini (rotation.py)
 # material.fail_kind: por qué falló, para decidir qué reintentar.
@@ -178,24 +189,22 @@ def blind_matches(provider: AIProvider, questions: list, exclude_models) -> list
     return [a is not None and a == q.correct_index for q, a in zip(questions, answers)]
 
 
-def _verified(provider: AIProvider, analysis: VideoAnalysis, analysis_model: str) -> list:
-    """Las preguntas que pasan todo: primero lo local (gratis), después la pasada a
-    ciegas con otro modelo que el del análisis."""
-    candidates = [q for q in analysis.questions if _passes_local_checks(q)]
-    matches = blind_matches(provider, candidates, (analysis_model,))
-    return [q for q, ok in zip(candidates, matches) if ok]
+def _local_candidates(analysis: VideoAnalysis) -> list:
+    """Las preguntas que pasan lo que se verifica gratis; solo estas van a ciegas."""
+    return [q for q in analysis.questions if _passes_local_checks(q)]
 
 
 def _set_status(conn, material_id: int, status: str, summary_md=None, error=None,
-                fail_kind=None) -> None:
+                fail_kind=None, segments_json=None) -> None:
     """Cierra el material (done/failed): el análisis guardado ya no hace falta.
 
     Con `done` queda anotado qué modelo hizo el análisis (para verificar de nuevo con otro).
     """
     conn.execute(
         "UPDATE material SET status=?, summary_md=?, error=?, fail_kind=?, analysis_json=NULL,"
-        " analysis_model=CASE WHEN ?='done' THEN analysis_model END, updated_at=? WHERE id=?",
-        (status, summary_md, error, fail_kind, status, int(time.time()), material_id),
+        " analysis_model=CASE WHEN ?='done' THEN analysis_model END, segments_json=?,"
+        " updated_at=? WHERE id=?",
+        (status, summary_md, error, fail_kind, status, segments_json, int(time.time()), material_id),
     )
 
 
@@ -210,7 +219,7 @@ def local_day(now: float) -> dt.date:
 
 def cap_day(now: float) -> dt.date:
     """El día del tope de YouTube: el de la cuota de Gemini (Pacífico)."""
-    return dt.datetime.fromtimestamp(now, CAP_TZ).date()
+    return quota_day(now)
 
 
 def next_cap_reset(now: float) -> float:
@@ -326,9 +335,7 @@ def _topic_id(conn, course_id: int, name: str) -> int | None:
     ).fetchone()[0]
 
 
-def process_material(conn: sqlite3.Connection, provider: AIProvider, material_id: int,
-                     clock: Callable[[], float] = time.time) -> ProcessResult:
-    """Procesa un material. Quota/Unavailable/Auth se propagan sin guardar nada."""
+def _material_row(conn, material_id: int):
     row = conn.execute(
         "SELECT m.ref, m.title, m.analysis_json, m.analysis_model, s.course_id FROM material m"
         " JOIN section s ON s.id = m.section_id WHERE m.id=?",
@@ -336,9 +343,17 @@ def process_material(conn: sqlite3.Connection, provider: AIProvider, material_id
     ).fetchone()
     if row is None:
         raise LookupError(f"material {material_id} inexistente")
+    return row
+
+
+def _analyze_or_close(conn, provider: AIProvider, material_id: int,
+                      clock: Callable[[], float]) -> ProcessResult | None:
+    """Deja guardado el análisis (lo pide si hace falta). Si el video no se puede leer o
+    la respuesta es inservible, cierra el material y devuelve cómo quedó; si no, None.
+    Quota/Unavailable/Auth se propagan sin guardar nada."""
+    row = _material_row(conn, material_id)
     try:
-        analysis, analysis_model = _analysis(conn, provider, material_id, row, clock)
-        kept = _verified(provider, analysis, analysis_model)
+        _analysis(conn, provider, material_id, row, clock)
     except AINeedsPublicLinkError:
         _set_status(conn, material_id, NEEDS_LINK, error=NEEDS_LINK_TEXT)
         conn.commit()
@@ -351,9 +366,12 @@ def process_material(conn: sqlite3.Connection, provider: AIProvider, material_id
         _set_status(conn, material_id, "failed", error=FORMAT_ERROR_TEXT, fail_kind=FAIL_FORMAT)
         conn.commit()
         return ProcessResult(0, 0, "failed")
+    return None
 
-    # Recién acá se escribe: preguntas y `done` van en una sola transacción.
-    course_id = row["course_id"]
+
+def _finalize(conn, material_id: int, analysis: VideoAnalysis, kept: list) -> ProcessResult:
+    """Escribe temas, preguntas verificadas, tramos y `done` en una sola transacción."""
+    course_id = _material_row(conn, material_id)["course_id"]
     stored = 0
     try:
         analysis_tids = []
@@ -394,12 +412,93 @@ def process_material(conn: sqlite3.Connection, provider: AIProvider, material_id
                 ),
             )
             stored += cur.rowcount  # 0 si ya estaba (mismo enunciado)
-        _set_status(conn, material_id, "done", summary_md=student_math(analysis.summary_md))
+        segments_json = (json.dumps([s.model_dump() for s in analysis.segments], ensure_ascii=False)
+                         if analysis.segments else None)
+        _set_status(conn, material_id, "done", summary_md=student_math(analysis.summary_md),
+                    segments_json=segments_json)
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
     return ProcessResult(stored, len(analysis.questions) - stored)
+
+
+def _analysis_model_of(conn, material_id: int) -> str:
+    """El modelo que analizó la clase; sin anotar, el único de antes (LEGACY_ANALYSIS_MODEL)."""
+    row = conn.execute("SELECT COALESCE(analysis_model, ?) FROM material WHERE id=?",
+                       (LEGACY_ANALYSIS_MODEL, material_id)).fetchone()
+    if row is None:
+        raise LookupError(f"material {material_id} inexistente")
+    return row[0]
+
+
+def paid_batches(conn: sqlite3.Connection, material_ids: list[int]) -> list[list[int]]:
+    """Agrupa los pendientes ya analizados (en orden de cola) por el modelo que los analizó,
+    en el orden en que aparece cada modelo, y parte cada grupo en lotes de hasta
+    BLIND_BATCH_MAX."""
+    groups: dict[str, list[int]] = {}
+    for material_id in material_ids:
+        groups.setdefault(_analysis_model_of(conn, material_id), []).append(material_id)
+    return [ids[i:i + BLIND_BATCH_MAX] for ids in groups.values()
+            for i in range(0, len(ids), BLIND_BATCH_MAX)]
+
+
+def verify_batch(conn: sqlite3.Connection, provider: AIProvider,
+                 material_ids: list[int]) -> list[ProcessResult]:
+    """Pasada a ciegas de un lote de clases ya analizadas, en un solo pedido.
+
+    El pedido excluye el modelo de análisis de todas las clases del lote (si no queda
+    ninguno, la rotación da AIQuotaError y el lote sigue pendiente). Las respuestas
+    vuelven a su clase por posición y cada clase se cierra con `_finalize`; una clase sin
+    candidatos se cierra sin pedido. Quota/Unavailable/Auth se propagan sin escribir nada.
+    Una respuesta inservible con más de una clase en el pedido se reintenta clase por
+    clase; con una sola, la clase queda `failed` (formato).
+    """
+    loaded = []
+    for material_id in material_ids:
+        row = _material_row(conn, material_id)
+        if not row["analysis_json"]:
+            raise LookupError(f"material {material_id} sin análisis guardado")
+        analysis = VideoAnalysis.model_validate_json(row["analysis_json"])
+        loaded.append((material_id, analysis, _local_candidates(analysis)))
+    exclude = tuple(dict.fromkeys(_analysis_model_of(conn, mid) for mid in material_ids))
+    questions = [q for _, _, candidates in loaded for q in candidates]
+    try:
+        matches = blind_matches(provider, questions, exclude)
+    except AIFormatError:
+        asked = [mid for mid, _, candidates in loaded if candidates]
+        if len(asked) > 1:
+            # No se sabe qué clase rompió la respuesta: cada una va sola.
+            log.info("Pasada a ciegas ilegible para %d clases; se reintenta de a una", len(asked))
+            # Por la cola: un error inesperado deja esa clase `failed` y no la vuelve a pedir.
+            return [result for mid in material_ids for result in _verify_in_queue(conn, provider, [mid])]
+        results = []
+        for mid, analysis, candidates in loaded:
+            if candidates:
+                _set_status(conn, mid, "failed", error=FORMAT_ERROR_TEXT, fail_kind=FAIL_FORMAT)
+                conn.commit()
+                results.append(ProcessResult(0, 0, "failed"))
+            else:
+                results.append(_finalize(conn, mid, analysis, []))
+        return results
+    results = []
+    offset = 0
+    for material_id, analysis, candidates in loaded:
+        own = matches[offset:offset + len(candidates)]
+        offset += len(candidates)
+        kept = [q for q, ok in zip(candidates, own) if ok]
+        results.append(_finalize(conn, material_id, analysis, kept))
+    return results
+
+
+def process_material(conn: sqlite3.Connection, provider: AIProvider, material_id: int,
+                     clock: Callable[[], float] = time.time) -> ProcessResult:
+    """Procesa un material: lo analiza si hace falta y lo verifica solo (lote de una
+    clase). Quota/Unavailable/Auth se propagan sin guardar nada más que el análisis."""
+    closed = _analyze_or_close(conn, provider, material_id, clock)
+    if closed is not None:
+        return closed
+    return verify_batch(conn, provider, [material_id])[0]
 
 
 def retry_failed(conn: sqlite3.Connection, kinds: tuple[str, ...] | None = None) -> int:
@@ -416,7 +515,7 @@ def retry_failed(conn: sqlite3.Connection, kinds: tuple[str, ...] | None = None)
         failed += f" AND (fail_kind IS NULL OR fail_kind IN ({','.join('?' * len(kinds))}))"
         params.extend(kinds)
     sql = ("UPDATE material SET status='pending', error=NULL, fail_kind=NULL, analysis_json=NULL,"
-           f" analysis_model=NULL, updated_at=? WHERE status='{NEEDS_LINK}' OR ({failed})")
+           f" analysis_model=NULL, segments_json=NULL, updated_at=? WHERE status='{NEEDS_LINK}' OR ({failed})")
     cur = conn.execute(sql, params)
     conn.commit()
     return cur.rowcount
@@ -472,74 +571,194 @@ def _save_url_denial(conn: sqlite3.Connection, provider: AIProvider, now: float)
 
 
 def _stop(conn: sqlite3.Connection, reason: str, resets_at: float | None) -> None:
+    """Anota el motivo de corte; si hay varios en una corrida, queda el último."""
     conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)", (STOP_KEY, reason))
     if resets_at is not None:
         conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)",
                      (QUOTA_RESET_KEY, str(int(resets_at))))
+    else:
+        conn.execute("DELETE FROM kv WHERE key=?", (QUOTA_RESET_KEY,))
     conn.commit()
+
+
+def _stop_reason(exc: Exception) -> str:
+    return next(r for cls, r in STOP_REASONS if isinstance(exc, cls))
+
+
+def _fail_unexpected(conn: sqlite3.Connection, material_id: int, exc: Exception) -> None:
+    # Solo el tipo: el mensaje podría traer datos del proveedor.
+    log.warning("Falló el material %s (%s)", material_id, type(exc).__name__)
+    conn.rollback()
+    _set_status(conn, material_id, "failed", error=GENERIC_ERROR_TEXT, fail_kind=FAIL_ERROR)
+    conn.commit()
+
+
+def _verify_in_queue(conn: sqlite3.Connection, provider: AIProvider,
+                     material_ids: list[int]) -> list[ProcessResult]:
+    """`verify_batch` dentro de la cola: un error inesperado no traba a las demás clases.
+
+    Con un lote de varias, las que siguen pendientes se reintentan de a una; una sola
+    queda `failed` con el texto genérico. Quota/Unavailable/Auth y la puerta de edad se
+    propagan.
+    """
+    try:
+        return verify_batch(conn, provider, material_ids)
+    except (AIQuotaError, AIUnavailableError, AIAuthError):
+        raise
+    except AIBlocked:
+        # La puerta de edad se cerró: no es culpa del material, queda pendiente.
+        conn.rollback()
+        raise
+    except Exception as exc:  # noqa: BLE001 - un material roto no traba la cola
+        conn.rollback()
+        if len(material_ids) == 1:
+            _fail_unexpected(conn, material_ids[0], exc)
+            return [ProcessResult(0, 0, "failed")]
+        log.warning("Falló un lote a ciegas (%s); se reintenta de a una clase", type(exc).__name__)
+        return [result for material_id in _still_pending(conn, material_ids)
+                for result in _verify_in_queue(conn, provider, [material_id])]
+
+
+def _still_pending(conn: sqlite3.Connection, material_ids: list[int]) -> list[int]:
+    """Los de `material_ids` (en ese orden) que siguen pendientes con un análisis legible."""
+    ready = []
+    for material_id in material_ids:
+        row = conn.execute("SELECT analysis_json FROM material WHERE id=? AND status='pending'",
+                           (material_id,)).fetchone()
+        if row is None or not row[0]:
+            continue
+        try:
+            VideoAnalysis.model_validate_json(row[0])
+        except ValidationError:
+            continue  # guardado roto: la próxima corrida lo vuelve a analizar
+        ready.append(material_id)
+    return ready
+
+
+@dataclass
+class QueueItem:
+    material_id: int
+    paid: bool                # ya tiene el análisis guardado
+    exam_at: int | None       # el examen futuro más próximo de su curso
+
+
+def pending_queue(conn: sqlite3.Connection, now: int, limit: int) -> list[QueueItem]:
+    """Los pendientes de secciones visibles, primero los del curso que rinde antes.
+
+    Una clase sin analizar todavía no tiene temas: "los temas del próximo examen" se
+    resuelven por curso. Un examen abierto (cierra después de `now`) todavía cuenta, como en
+    `home.next_exam`. Sin examen futuro van al final; dentro de lo mismo, por sección y por id.
+    """
+    rows = conn.execute(
+        "SELECT m.id, m.analysis_json IS NOT NULL AS paid,"
+        " (SELECT MIN(e.opens_at) FROM exam e WHERE e.course_id = s.course_id AND COALESCE(NULLIF(e.closes_at, 0), e.opens_at) > ? AND COALESCE(e.kind, 'parcial') != 'inscripcion')"
+        " AS exam_at FROM material m JOIN section s ON s.id = m.section_id"
+        " WHERE m.status='pending' AND s.visible=1"
+        " ORDER BY exam_at IS NULL, exam_at, s.num, m.id LIMIT ?",
+        (now, limit),
+    ).fetchall()
+    return [QueueItem(r[0], bool(r[1]), r[2]) for r in rows]
+
+
+def _awaiting_blind(conn: sqlite3.Connection) -> int:
+    """Clases ya analizadas que esperan la pasada a ciegas."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM material m JOIN section s ON s.id = m.section_id"
+        " WHERE m.status='pending' AND s.visible=1 AND m.analysis_json IS NOT NULL"
+    ).fetchone()[0]
 
 
 def process_pending(conn: sqlite3.Connection, provider: AIProvider, budget: int = 10,
                     clock: Callable[[], float] = time.time) -> int:
     """Procesa hasta `budget` materiales pendientes; devuelve cuántos quedaron `done`.
 
-    Orden: secciones visibles por `num`, luego id de material. Ante
-    Quota/Unavailable/Auth se detiene y guarda el motivo en kv["ai_stop_reason"]
-    (y, por cuota, cuándo vuelve el primer modelo en kv["ai_quota_resets_at"]).
-    Los modelos agotados por el día se leen y se guardan en kv["model_exhausted:<clave>:*"].
-    Con DAILY_VIDEO_CAP_S de video leído por enlace en el día de la cuota de Gemini (Pacífico),
-    saltea los que mandarían otro video (los ya analizados terminan igual) y deja el motivo
-    "youtube_cap", que vuelve a la medianoche del Pacífico. Cualquier otra excepción
-    marca ese material `failed` (con un texto genérico) y sigue con el próximo.
+    Orden: `pending_queue` (primero el curso del próximo examen, después sección e id).
+    Va en dos fases:
+    1. Analiza los que no tienen análisis guardado, en orden (cada análisis se guarda
+       apenas llega). Con DAILY_VIDEO_CAP_S de video leído por enlace en el día de la
+       cuota de Gemini (Pacífico), saltea los que mandarían otro video y deja el motivo
+       "youtube_cap". Saltea también los que dejarían sin presupuesto del día a la pasada
+       a ciegas de lo ya analizado (`can_analyze`), con el motivo "budget". Los dos
+       vuelven a la medianoche del Pacífico.
+    2. Verifica a ciegas, en lotes (`paid_batches`), todos los ya analizados de la ventana,
+       mientras quede presupuesto a ciegas del día (si no, corta con "budget").
+    Ante Quota/Unavailable/Auth corta la fase y guarda el motivo en kv["ai_stop_reason"]
+    (y, por cuota, cuándo vuelve el primer modelo en kv["ai_quota_resets_at"]); queda el
+    último. Si la fase 1 se corta por cuota, presupuesto, el tope de YouTube o Gemini caído,
+    la fase 2 corre igual; por clave, no. Los pedidos hechos se suman al uso del día de la
+    cuota. Los modelos agotados por el día se leen y se guardan en
+    kv["model_exhausted:<clave>:*"]. Cualquier otra excepción marca ese material `failed`
+    (con un texto genérico) y sigue con el próximo.
     """
     conn.execute("DELETE FROM kv WHERE key IN (?, ?)", (STOP_KEY, QUOTA_RESET_KEY))
     conn.commit()
     if budget <= 0:
         return 0  # (LIMIT negativo en SQLite sería "sin límite")
-    pending = conn.execute(
-        "SELECT m.id, m.analysis_json IS NOT NULL AS paid FROM material m"
-        " JOIN section s ON s.id = m.section_id"
-        " WHERE m.status='pending' AND s.visible=1"
-        " ORDER BY s.num, m.id LIMIT ?",
-        (budget,),
-    ).fetchall()
+    window = [item.material_id for item in pending_queue(conn, int(clock()), budget)]
     _load_url_denial(conn, provider, clock())
     load_exhausted(conn, provider)
-    finished = 0
     capped_at: float | None = None
+    over_budget_at: float | None = None
+    analysis_stop: str | None = None
     try:
-        for material_id, paid in pending:
+        # Fase 1: análisis.
+        for material_id in window:
             now = clock()
-            # Con el enlace rechazado no sale nada por enlace: el tope no aplica.
-            if not paid and not _link_denied(provider, now) and _cap_reached(conn, now):
-                capped_at = now  # mañana; los ya analizados siguen
-                continue
+            # Lo pedido hasta acá ya cuenta para el presupuesto del día.
+            record_usage(conn, provider, now)
+            if not _still_pending(conn, [material_id]):  # sin análisis legible: hay que pedirlo
+                if not can_analyze(conn, now, _awaiting_blind(conn)):
+                    over_budget_at = now  # la reserva de la pasada a ciegas manda
+                    continue
+                # Con el enlace rechazado no sale nada por enlace: el tope no aplica.
+                if not _link_denied(provider, now) and _cap_reached(conn, now):
+                    capped_at = now  # mañana; los ya analizados siguen
+                    continue
             try:
-                result = process_material(conn, provider, material_id, clock)
+                _analyze_or_close(conn, provider, material_id, clock)
             except (AIQuotaError, AIUnavailableError, AIAuthError) as exc:
-                reason = next(r for cls, r in STOP_REASONS if isinstance(exc, cls))
-                _stop(conn, reason, getattr(exc, "resets_at", None))
-                capped_at = None  # el otro motivo manda
+                analysis_stop = _stop_reason(exc)
+                _stop(conn, analysis_stop, getattr(exc, "resets_at", None))
+                capped_at = over_budget_at = None  # el otro motivo manda
                 break
             except AIBlocked:
                 # La puerta de edad se cerró: no es culpa del material, queda pendiente.
                 conn.rollback()
                 raise
             except Exception as exc:  # noqa: BLE001 - un material roto no traba la cola
-                # Solo el tipo: el mensaje podría traer datos del proveedor.
-                log.warning("Falló el material %s (%s)", material_id, type(exc).__name__)
-                conn.rollback()
-                _set_status(conn, material_id, "failed", error=GENERIC_ERROR_TEXT, fail_kind=FAIL_ERROR)
-                conn.commit()
-                continue
-            if result.status == "done":
-                finished += 1
+                _fail_unexpected(conn, material_id, exc)
         if capped_at is not None:
             _stop(conn, YOUTUBE_CAP, next_cap_reset(capped_at))
+        if over_budget_at is not None:
+            _stop(conn, BUDGET, next_cap_reset(over_budget_at))
+        # Fase 2: pasada a ciegas en lotes. Sin clave no tiene sentido; con la cadena de
+        # análisis caída sí: la cadena a ciegas usa otros modelos y, si también está
+        # caída, se corta sin escribir nada.
+        if analysis_stop != "auth":
+            for batch in paid_batches(conn, _still_pending(conn, window)):
+                now = clock()
+                record_usage(conn, provider, now)
+                if remaining(conn, "blind", now) <= 0:
+                    # Un motivo de la fase 1 (con su propio regreso) no se pisa.
+                    if conn.execute("SELECT 1 FROM kv WHERE key = ?", (STOP_KEY,)).fetchone() is None:
+                        _stop(conn, BUDGET, next_cap_reset(now))
+                    break
+                try:
+                    _verify_in_queue(conn, provider, batch)
+                except (AIQuotaError, AIUnavailableError, AIAuthError) as exc:
+                    _stop(conn, _stop_reason(exc), getattr(exc, "resets_at", None))
+                    break
     finally:
-        _save_url_denial(conn, provider, clock())
+        now = clock()
+        record_usage(conn, provider, now)
+        prune_usage(conn, now)
+        _save_url_denial(conn, provider, now)
         save_exhausted(conn, provider)
-    return finished
+    if not window:
+        return 0
+    marks = ",".join("?" * len(window))
+    return conn.execute(f"SELECT COUNT(*) FROM material WHERE status='done' AND id IN ({marks})",
+                        window).fetchone()[0]
 
 
 def _marks_prefix(provider: AIProvider) -> str:

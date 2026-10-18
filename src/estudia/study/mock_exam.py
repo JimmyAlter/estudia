@@ -5,12 +5,15 @@ import random
 import sqlite3
 from dataclasses import dataclass
 
-from estudia.study.exams import exam_topics
+from estudia.study.exams import ENROLLMENT, RETAKE, exam_topics
+from estudia.study.planner import retake_topics
 from estudia.study.practice import (
     MCQ, TYPED, AnswerFeedback, NotTypeable, QuizItem, _insert_answer, grade_typed_answer, typed_safe_ids,
 )
 
 MIN_QUESTIONS = 5
+RETAKE_MOCK_QUESTIONS = 6   # simulacro corto (el que se sugiere a los 3 días de cargar un recuperatorio)
+SHORT_NOT_ENOUGH_TEXT = "Todavía no hay suficientes preguntas de los temas flojos para un simulacro corto."
 SECONDS_PER_QUESTION = 90
 GRACE_SECONDS = 30
 RECENT_PRACTICE_DAYS = 7
@@ -45,7 +48,7 @@ class MockResult:
 
 def _exam_row(conn: sqlite3.Connection, exam_id: int):
     row = conn.execute(
-        "SELECT id, max_grade, time_limit_s FROM exam WHERE id = ?", (exam_id,)
+        "SELECT id, max_grade, time_limit_s, kind FROM exam WHERE id = ?", (exam_id,)
     ).fetchone()
     if row is None:
         raise LookupError(f"examen {exam_id} no existe")
@@ -123,18 +126,31 @@ def _pick_typed(conn: sqlite3.Connection, picked: list, seed: int) -> list[int]:
 
 
 def start_mock(
-    conn: sqlite3.Connection, exam_id: int, now: int, predicted_grade: float | None = None
+    conn: sqlite3.Connection, exam_id: int, now: int, predicted_grade: float | None = None,
+    *, short: bool = False,
 ) -> MockStart:
     """Arma el intento. `predicted_grade` es la nota que el estudiante espera, en la escala del examen.
+
+    Con `short` es el simulacro corto: 6 preguntas sobre los temas que todavía no están firmes
+    (`planner.retake_topics`) si es un recuperatorio, o sobre todos los del examen si no. Su
+    reloj es el de 90 segundos por pregunta, no el límite del examen completo.
 
     `LookupError` si el examen no existe; `NotEnoughQuestions` si no alcanzan las preguntas;
     `ValueError` si la nota esperada no es un número entre 0 y la escala.
     """
     exam = _exam_row(conn, exam_id)
-    topics = exam_topics(conn, exam_id)
-    count = min(20, max(10, len(topics) * 3))
+    if exam["kind"] == ENROLLMENT:
+        raise ValueError("Una inscripción no tiene simulacro")
+    if short:
+        topics = retake_topics(conn, exam_id) if exam["kind"] == RETAKE else exam_topics(conn, exam_id)
+        count = RETAKE_MOCK_QUESTIONS
+    else:
+        topics = exam_topics(conn, exam_id)
+        count = min(20, max(10, len(topics) * 3))
     picked = _pick(conn, topics, count, now, now)
     if len(picked) < MIN_QUESTIONS:
+        if short:   # cuenta solo los temas flojos: el total del examen confundiría
+            raise NotEnoughQuestions(SHORT_NOT_ENOUGH_TEXT)
         raise NotEnoughQuestions(
             f"Hay {len(picked)} preguntas verificadas para este examen; hacen falta al menos {MIN_QUESTIONS}"
         )
@@ -146,7 +162,8 @@ def start_mock(
         if not 0 <= predicted_grade <= max_grade:
             raise ValueError(f"La nota esperada tiene que estar entre 0 y {max_grade:g}")
         predicted_grade = round(float(predicted_grade), 2)
-    seconds = int(exam["time_limit_s"] or SECONDS_PER_QUESTION * len(picked))
+    limit = None if short else exam["time_limit_s"]
+    seconds = int(limit or SECONDS_PER_QUESTION * len(picked))
     typed_ids = _pick_typed(conn, picked, now)
     cur = conn.execute(
         "INSERT INTO mock_attempt(exam_id, started_at, question_ids_json, max_grade, seconds, "

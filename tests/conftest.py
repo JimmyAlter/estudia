@@ -1,5 +1,15 @@
+import os
+import webbrowser
+
 import keyring
 import pytest
+
+# Ningún test abre un navegador de verdad. Se reemplaza al importar el conftest, no en un
+# fixture: un hilo que sobrevive a su test (el servidor de `main`, la bandeja) puede llamar a
+# `webbrowser.open` después de que el monkeypatch del test se deshizo. BROWSER=true cubre
+# además a los subprocesos, que usan el `webbrowser` de su propio intérprete.
+webbrowser.open = webbrowser.open_new = webbrowser.open_new_tab = lambda *args, **kwargs: True
+os.environ["BROWSER"] = "true"
 
 # Variables que deciden dónde quedan los datos de la app (platformdirs) en cada sistema.
 DATA_ENV = ("HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",

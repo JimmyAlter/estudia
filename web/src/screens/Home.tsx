@@ -8,15 +8,16 @@ import {
   type ExamHealth,
   type ExamInfo,
   type HomeData,
+  type PretestOffer,
   type QuizParams,
   type SessionInfo,
   type Topic,
 } from "../api";
 import { clock, dayKey, formatDate, formatDuration, grade, plural, shortDate, tidy } from "../format";
 import { Button, FIELD, Label, Notice } from "../ui";
-import { HealthLine } from "./Health";
+import { HealthLine, hasActionOrNote } from "./Health";
 
-export type Screen = "inicio" | "agenda" | "practica" | "materiales" | "ajustes" | "simulacro";
+export type Screen = "inicio" | "agenda" | "practica" | "materiales" | "ajustes" | "simulacro" | "arrancar" | "como-vengo";
 
 /** Con menos preguntas vistas, la probabilidad todavía dice poco: se aclara cuántas se vieron. */
 const FEW_SEEN = 8;
@@ -34,10 +35,21 @@ interface Props {
   working: boolean;
   onPractice: (params: QuizParams, session?: SessionInfo) => void;
   onNavigate: (screen: Screen) => void;
+  /** El botón del simulacro corto ("Hoy: simulacro corto") de un recuperatorio. */
+  onShortMock?: (examId: number) => void;
   onSessionExpired: () => void;
 }
 
-export default function Home({ refreshKey, aiStopReason, age, working, onPractice, onNavigate, onSessionExpired }: Props) {
+export default function Home({
+  refreshKey,
+  aiStopReason,
+  age,
+  working,
+  onPractice,
+  onNavigate,
+  onShortMock,
+  onSessionExpired,
+}: Props) {
   const [data, setData] = useState<HomeData | null>(null);
   const [failed, setFailed] = useState(false);
   const [health, setHealth] = useState<ExamHealth[]>([]);
@@ -80,11 +92,13 @@ export default function Home({ refreshKey, aiStopReason, age, working, onPractic
   if (failed) return <Notice>No se pudo cargar el inicio. Probá recargar la página.</Notice>;
   if (!data) return null;
 
-  const { exam, topics, suggestion } = data;
+  const { exam, topics, suggestion, ready } = data;
   const now = Date.now() / 1000;
   const askResult = exams
     .filter(
       (e) =>
+        // Una inscripción no tiene nota: no se pregunta (el servidor la rechaza).
+        e.kind !== "inscripcion" &&
         e.at != null &&
         (e.closes_at ?? e.at) <= now &&
         now - e.at < ASK_RESULT_DAYS * 86400 &&
@@ -92,6 +106,7 @@ export default function Home({ refreshKey, aiStopReason, age, working, onPractic
         !e.result_skipped,
     )
     .sort((a, b) => b.at! - a.at!)[0];
+  const allOnTrack = health.every((h) => h.verdict === "llegás");
 
   return (
     <div>
@@ -129,11 +144,15 @@ export default function Home({ refreshKey, aiStopReason, age, working, onPractic
         )}
         {health.length > 0 && (
           <div className="mt-6 max-w-2xl space-y-2">
-            {health.map((h) => (
+            {/* Si llegás a todo, se dice una vez; abajo, solo lo que tiene algo para hacer o aclarar. */}
+            {allOnTrack && <p className="text-[0.9375rem] font-medium leading-relaxed">Con tu tiempo actual llegás a todo.</p>}
+            {(allOnTrack ? health.filter(hasActionOrNote) : health).map((h) => (
               <HealthLine
                 key={h.exam_id}
                 health={h}
                 onPractice={onPractice}
+                onShortMock={onShortMock}
+                compact={allOnTrack}
                 // El examen del título no se repite en su propia línea.
                 withExamName={!(exam && h.at === exam.opens_at && h.exam === exam.name)}
               />
@@ -165,6 +184,13 @@ export default function Home({ refreshKey, aiStopReason, age, working, onPractic
         </section>
 
         <aside className="max-md:order-first">
+          {data.pretest && (
+            <PretestCard
+              offer={data.pretest}
+              onStart={() => onNavigate("arrancar")}
+              onDismiss={() => setData((d) => d && { ...d, pretest: null })}
+            />
+          )}
           <Today items={today} now={now} onPractice={onPractice} />
           <h2 className="mb-3 font-semibold">Seguir estudiando</h2>
           {suggestion ? (
@@ -182,20 +208,108 @@ export default function Home({ refreshKey, aiStopReason, age, working, onPractic
                     </Button>
                   )}
                 </div>
-                <Button variant="quiet" className="mt-1" onClick={() => onPractice({})}>
-                  Práctica de todo
-                </Button>
+                {/* Con clases en cola, "Practicar" dice por qué ya se puede: reemplaza a "Práctica de todo", que hace lo mismo. */}
+                {ready ? (
+                  <ReadyLine ready={ready} untilTomorrow={aiStopReason === "budget"} onPractice={() => onPractice({})} />
+                ) : (
+                  <Button variant="quiet" className="mt-1" onClick={() => onPractice({})}>
+                    Práctica de todo
+                  </Button>
+                )}
               </div>
             </>
+          ) : ready ? (
+            <ReadyLine ready={ready} untilTomorrow={aiStopReason === "budget"} onPractice={() => onPractice({})} />
           ) : (
             <Button variant="secondary" onClick={() => onNavigate("materiales")}>
               Ver materiales
             </Button>
           )}
-          <Processing processing={data.processing} stopReason={aiStopReason} working={working} age={age} />
+          <Processing
+            processing={data.processing}
+            stopReason={aiStopReason}
+            working={working}
+            age={age}
+            // Con preguntas listas, la línea de "Ya hay…" ya dice que lo demás sigue mañana.
+            saidByReady={Boolean(ready)}
+          />
+          <p className="mt-10 text-sm">
+            <a
+              href="#/como-vengo"
+              onClick={(e) => {
+                e.preventDefault();
+                onNavigate("como-vengo");
+              }}
+              className="text-muted underline decoration-line underline-offset-4 hover:text-ink"
+            >
+              Cómo vengo
+            </a>
+          </p>
         </aside>
       </div>
     </div>
+  );
+}
+
+/** "3 preguntas para arrancar": una oferta tranquila, que se puede dejar pasar. */
+function PretestCard({ offer, onStart, onDismiss }: { offer: PretestOffer; onStart: () => void; onDismiss: () => void }) {
+  const [busy, setBusy] = useState(false);
+
+  async function dismiss() {
+    setBusy(true);
+    try {
+      await api.closePretest(offer.material_id);
+    } catch {
+      // Si no se pudo guardar, vuelve a aparecer la próxima vez: no pasa nada.
+    }
+    onDismiss();
+  }
+
+  return (
+    <section className="mb-10 border-b border-line pb-8">
+      <h2 className="mb-1 font-semibold">3 preguntas para arrancar</h2>
+      <p className="mb-4 text-muted">De {tidy(offer.title)}. No cuentan: es para que la clase te rinda más.</p>
+      <div className="flex flex-wrap items-baseline gap-x-5 gap-y-3">
+        <Button variant="secondary" onClick={onStart} disabled={busy}>
+          Empezar
+        </Button>
+        <Button variant="quiet" className="text-sm" onClick={dismiss} disabled={busy}>
+          Ahora no
+        </Button>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * "Ya hay 10 preguntas…": se puede practicar mientras se preparan las demás clases. Con el tope de
+ * pedidos del día (`untilTomorrow`), dice que las demás se preparan mañana.
+ */
+function ReadyLine({
+  ready,
+  untilTomorrow,
+  onPractice,
+}: {
+  ready: NonNullable<HomeData["ready"]>;
+  untilTomorrow: boolean;
+  onPractice: () => void;
+}) {
+  const course = tidy(ready.course);
+  return (
+    <p className="mt-1 text-sm text-muted">
+      <span>
+        {untilTomorrow
+          ? `Ya hay ${ready.questions} preguntas de ${course}. Las demás clases se preparan mañana.`
+          : `Ya hay ${ready.questions} preguntas de ${course}: podés empezar mientras se preparan las demás.`}
+      </span>{" "}
+      <button
+        type="button"
+        onClick={onPractice}
+        className="press cursor-pointer text-ink underline decoration-line underline-offset-4 hover:decoration-ink"
+      >
+        Practicar
+      </button>
+    </p>
   );
 }
 
@@ -396,11 +510,13 @@ function Processing({
   stopReason,
   working,
   age,
+  saidByReady = false,
 }: {
   processing: HomeData["processing"];
   stopReason: AppState["ai_stop_reason"];
   working: boolean;
   age?: Age | null;
+  saidByReady?: boolean;
 }) {
   const { pending, done, failed } = processing;
   if (age === "minor") {
@@ -417,6 +533,8 @@ function Processing({
   else if (!pending) line = done ? plural(done, "clase lista", "clases listas") : null;
   // Con la cuota agotada, el aviso de arriba ya lo dice.
   else if (stopReason === "quota" || stopReason === "youtube_cap") line = null;
+  // El tope de pedidos del día no es un error: es información tranquila.
+  else if (stopReason === "budget") line = saidByReady ? null : "Lo de hoy ya está. Las demás clases siguen mañana.";
   else if (stopReason === "unavailable") line = `${plural(pending, "clase", "clases")} en espera`;
   // "Preparando" solo si de verdad hay algo corriendo; si no, no se promete avance.
   else if (working) line = `Preparando ${plural(pending, "clase", "clases")}`;

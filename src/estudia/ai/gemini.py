@@ -12,6 +12,7 @@ from google import genai
 from google.genai import errors, types
 from pydantic import ValidationError
 
+from estudia import config
 from estudia.ai.base import (
     AIAuthError,
     AIFormatError,
@@ -20,6 +21,7 @@ from estudia.ai.base import (
     AIUnavailableError,
     AIVideoUnavailableError,
     GenQuestion,
+    Segment,
     VideoAnalysis,
     option_key,
 )
@@ -45,8 +47,6 @@ from estudia.ai.rotation import (
     retry_delay,
 )
 from estudia.config import (
-    ANALYZE_MODELS,
-    BLIND_MODELS,
     GEMINI_TIMEOUT_S,
     YOUTUBE_URL_DENIED_S,
     data_dir,
@@ -69,6 +69,8 @@ FILE_POLL_S = 5.0
 # Tokens por segundo de video con MEDIA_RESOLUTION_LOW: el audio va a 32 por segundo y
 # cada fotograma (uno por segundo) a 66. Sirven para saber cuánto video se mandó.
 AUDIO_TOKENS_PER_S = 32
+# La duración sale de los tokens y es aproximada: los tramos pueden pasarse por esto.
+SEGMENT_SLACK_S = 30
 LOW_RES_FRAME_TOKENS = 66
 
 # La clave entera se da por rechazada para enlaces recién con 403 en esta cantidad de
@@ -114,6 +116,20 @@ def _validate(analysis: VideoAnalysis) -> VideoAnalysis:
     if not questions:
         raise AIFormatError("no hay preguntas válidas")
     return analysis.model_copy(update={"questions": questions})
+
+
+def valid_segments(segments: list[Segment], duration_s: float | None) -> list[Segment]:
+    """Todo o nada: si algún tramo es inválido devuelve []."""
+    previous_end = 0
+    for seg in segments:
+        if not 0 <= seg.start_s < seg.end_s or not seg.title.strip():
+            return []
+        if seg.start_s < previous_end:
+            return []
+        if duration_s is not None and seg.end_s > duration_s + SEGMENT_SLACK_S:
+            return []
+        previous_end = seg.end_s
+    return list(segments)
 
 
 def _short_name(name: str) -> str:
@@ -169,8 +185,8 @@ class GeminiProvider:
                  download: Callable[[str, Path], Path] = _download_video,
                  video_dir: Path | None = None, youtube_url_denied: bool = False,
                  allow_download: bool = False):
-        self._analyze_models = list(analyze_models or ANALYZE_MODELS)
-        self._blind_models = list(blind_models or BLIND_MODELS)
+        self._analyze_models = list(analyze_models or config.MODEL_CHAINS["analysis"])
+        self._blind_models = list(blind_models or config.MODEL_CHAINS["blind"])
         self._sleep = sleep
         self._clock = clock
         self._download = download
@@ -194,6 +210,8 @@ class GeminiProvider:
         self._rotation = ModelRotation(clock)
         self.last_analysis_model: str | None = None
         self.last_blind_model: str | None = None
+        # Pedidos a Gemini por función desde la última lectura (quien lee lo reinicia).
+        self.requests: dict[str, int] = {"analysis": 0, "blind": 0}
         if client is None:
             client = genai.Client(
                 api_key=api_key,
@@ -235,15 +253,23 @@ class GeminiProvider:
         listed = self._listed_models()
         return self._rotation.run([m for m in chain if listed is None or m in listed], attempt)
 
-    def _generate(self, model: str, contents, config, *, video: str | None = None):
+    def _count_request(self, function: str) -> None:
+        self.requests[function] = self.requests.get(function, 0) + 1
+
+    def _generate(self, model: str, contents, gen_config, *, video: str | None = None,
+                  function: str):
         """Un pedido a `model`. `video`: de dónde sale el video (YOUTUBE_URL o UPLOADED_FILE);
-        None si es solo texto. Lanza NextModel si conviene probar el siguiente modelo."""
+        None si es solo texto. `function`: a qué función se le cuenta el pedido ("analysis"
+        o "blind"); un 429 no se cuenta porque no gasta cuota de Google.
+        Lanza NextModel si conviene probar el siguiente modelo."""
         quota_tries = transient_tries = 0
         while True:
             try:
-                return self._client.models.generate_content(
-                    model=model, contents=contents, config=config
+                response = self._client.models.generate_content(
+                    model=model, contents=contents, config=gen_config
                 )
+                self._count_request(function)
+                return response
             except errors.APIError as e:
                 if is_quota(e):
                     if is_daily_quota(e):
@@ -256,6 +282,7 @@ class GeminiProvider:
                         self._sleep(delay)
                         continue
                     raise NextModel(QUOTA) from None
+                self._count_request(function)  # un 429 no gasta cuota de Google; lo demás sí
                 if is_transient(e):
                     if transient_tries < TRANSIENT_RETRIES:
                         transient_tries += 1
@@ -271,6 +298,8 @@ class GeminiProvider:
                     raise NextModel(DENIED) from None
                 self._raise_mapped(e, video)
             except httpx.TransportError:
+                # No se cuenta: no hubo respuesta de Google y no se sabe si el pedido se
+                # facturó; el presupuesto diario es una guarda blanda.
                 raise AIUnavailableError("no se pudo conectar con Gemini") from None
 
     @staticmethod
@@ -321,7 +350,8 @@ class GeminiProvider:
         contents = types.Content(parts=[types.Part(file_data=file_data), prompt])
 
         def attempt(model: str) -> VideoAnalysis:
-            response = self._generate(model, contents, _analysis_config(), video=video)
+            response = self._generate(model, contents, _analysis_config(), video=video,
+                                       function="analysis")
             if video == YOUTUBE_URL:
                 self.last_link_sent = True
             try:
@@ -329,8 +359,12 @@ class GeminiProvider:
             except ValidationError:
                 raise AIFormatError("la respuesta no es un análisis válido") from None
             analysis = _validate(analysis)
+            seconds = _video_seconds(response)
+            # Tramos inválidos se descartan: nunca invalidan el análisis.
+            analysis = analysis.model_copy(
+                update={"segments": valid_segments(analysis.segments, seconds)})
             self.last_analysis_model = model
-            self.last_video_seconds = _video_seconds(response)
+            self.last_video_seconds = seconds
             return analysis
 
         try:
@@ -425,7 +459,7 @@ class GeminiProvider:
         chain = [m for m in self._blind_models if m not in exclude_models]
 
         def attempt(model: str) -> list[int | None]:
-            response = self._generate(model, prompt, blind_config(model))
+            response = self._generate(model, prompt, blind_config(model), function="blind")
             answers = parse_blind(response.text or "", items)
             if answers is None:
                 log.info("Gemini: %s no devolvió respuestas legibles; se prueba otro", model)

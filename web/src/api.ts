@@ -8,7 +8,7 @@ export interface AppState {
   /** La respuesta a "¿Tenés 18 años o más?"; null: todavía no contestó. */
   age?: Age | null;
   site_id: string | null;
-  ai_stop_reason: "quota" | "youtube_cap" | "unavailable" | "auth" | null;
+  ai_stop_reason: "quota" | "youtube_cap" | "budget" | "unavailable" | "auth" | null;
   // Con cuota agotada: cuándo vuelve el primer modelo de Gemini (epoch en segundos).
   ai_quota_resets_at?: number | null;
   syncing: boolean;
@@ -56,6 +56,47 @@ export interface HomeData {
   topics: Topic[];
   suggestion: Topic | null;
   processing: { pending: number; done: number; failed: number };
+  /** Con clases en cola: el curso que ya tiene preguntas para practicar. */
+  ready: { course_id: number; course: string; questions: number } | null;
+  /** "3 preguntas para arrancar": la clase recién procesada que se ofrece; null: ninguna. */
+  pretest?: PretestOffer | null;
+}
+
+export interface PretestOffer {
+  material_id: number;
+  title: string;
+  course: string;
+}
+
+/** "Contá lo que te acordás": cada título del resumen y si apareció en lo escrito. */
+export interface RecallHeading {
+  title: string;
+  mentioned: boolean;
+}
+
+export interface CalibrationLevel {
+  confidence: Confidence;
+  label: string;
+  answers: number;
+  hit_rate: number;
+}
+
+export interface PredictionRow {
+  exam_id: number;
+  exam: string;
+  predicted: number | null;
+  mock_grade: number;
+  real: number;
+  max_grade: number;
+}
+
+/** "Cómo vengo": calibración de la confianza y nota prevista contra la real. */
+export interface ProgressData {
+  /** `missing` > 0: todavía no hay respuestas con confianza suficientes (y `levels` viene vacío). */
+  calibration: { total: number; missing: number; levels: CalibrationLevel[] };
+  predictions: PredictionRow[];
+  /** Promedio de lo que se erra la nota prevista, sobre 10; null: sin notas previstas. */
+  gap: number | null;
 }
 
 export type MaterialStatus = "pending" | "done" | "failed" | "unsupported" | "needs_public_link";
@@ -127,6 +168,10 @@ export interface Feedback {
   feedback_style: FeedbackStyle;
   /** De qué pregunta es (la revisión del simulacro se arma por id). */
   question_id?: number | null;
+  /** La fila de la respuesta recién guardada (para "Explicá por qué"). */
+  answer_id?: number | null;
+  /** Pedir "Explicá por qué" antes de mostrar la explicación. */
+  explain_prompt?: boolean;
 }
 
 export interface QuizParams {
@@ -209,9 +254,14 @@ export interface ExamHealth {
   weak_topics: WeakTopic[];
   /** Qué hacer: la próxima sesión de hoy para ese examen. */
   today: PlanSession | null;
+  kind: ExamKind;
+  /** Una línea de aclaración, sin alarma (un final a menos de 4 semanas). */
+  note: string | null;
+  /** Recuperatorio: inicio del día local sugerido para el simulacro corto; null: ninguno. */
+  mock_suggested_at: number | null;
 }
 
-export type AgendaKind = "class" | "exam" | "deadline" | "event" | "session";
+export type AgendaKind = "class" | "exam" | "deadline" | "event" | "session" | "enrollment";
 
 export interface AgendaItem {
   kind: AgendaKind;
@@ -219,8 +269,11 @@ export interface AgendaItem {
   title: string;
   course: string | null;
   starts_at: number;
+  /** Las inscripciones no tienen fin: son un instante (abre o cierra). */
   ends_at?: number;
   place?: string | null;
+  /** Solo las inscripciones: si ese día abre o cierra. */
+  phase?: "open" | "close";
   url?: string | null;
   // Solo las sesiones de estudio:
   topic_id?: number;
@@ -250,6 +303,18 @@ export interface ExamResult {
   at: number;
 }
 
+/** "inscripcion" no es un examen: abre en `at` y cierra en `closes_at`, sin temas ni nota. */
+export type ExamKind = "parcial" | "recuperatorio" | "final" | "inscripcion";
+
+/** Estado del enlace del calendario del campus (el enlace en sí solo sale por `revealCalendarFeed`). */
+export type CalendarFeedStatus = "saved" | "unavailable" | "unknown";
+
+export interface CalendarFeed {
+  status: CalendarFeedStatus;
+  /** La página del campus donde se exporta el calendario; null sin campus elegido. */
+  campus_calendar_url: string | null;
+}
+
 export interface ExamInfo {
   id: number;
   course_id: number;
@@ -258,6 +323,7 @@ export interface ExamInfo {
   at: number | null;
   closes_at: number | null;
   source: string;
+  kind: ExamKind;
   topic_ids: number[];
   max_grade: number | null;
   time_limit_s: number | null;
@@ -349,6 +415,8 @@ const post = <T>(path: string, body?: unknown) => request<T>(path, { method: "PO
 const put = <T>(path: string, body?: unknown) => request<T>(path, { method: "PUT", body });
 const del = <T>(path: string) => request<T>(path, { method: "DELETE" });
 
+const WEEKLY_ANKI_PATH = "/api/export/anki-semana.apkg";
+
 export const api = {
   /** Descarga directa del .apkg; sin curso, uno con todos. */
   ankiUrl: (courseId?: number) => `/api/export/anki.apkg${courseId == null ? "" : `?course_id=${courseId}`}`,
@@ -371,10 +439,36 @@ export const api = {
   /** Sin semana, la actual. */
   agenda: (weekStart?: number) => request<AgendaWeek>(weekStart == null ? "/api/agenda" : `/api/agenda?week_start=${weekStart}`),
   calendarUrl: "/api/calendar.ics",
+  /** "Bajá el mazo de la semana para el celular": el .apkg y su nombre. 404 (ApiError): no hay preguntas esta semana. */
+  weeklyAnki: async (): Promise<{ blob: Blob; filename: string }> => {
+    const response = await fetch(WEEKLY_ANKI_PATH);
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      throw new ApiError(response.status, (data && data.detail) || response.statusText);
+    }
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? "estudia-semana.apkg";
+    return { blob: await response.blob(), filename };
+  },
+  calendarFeed: () => request<CalendarFeed>("/api/calendar-feed"),
+  /** Le pide el enlace al campus. `retry`: el campus no respondió y el estado quedó como estaba. */
+  fetchCalendarFeed: () => post<{ status: CalendarFeedStatus; retry: boolean }>("/api/calendar-feed/fetch"),
+  /** El enlace lleva un token del campus: se muestra solo cuando se pide y no se guarda en ningún lado. */
+  revealCalendarFeed: () => post<{ url: string }>("/api/calendar-feed/reveal"),
   health: () => request<ExamHealth[]>("/api/plan/health"),
   courses: () => request<Course[]>("/api/courses"),
   exams: () => request<ExamInfo[]>("/api/exams"),
-  createExam: (body: { course_id: number; name: string; at: number; max_grade: number | null }) =>
+  createExam: (body: {
+    course_id: number;
+    name: string;
+    at: number;
+    max_grade: number | null;
+    kind: ExamKind;
+    /** Solo una inscripción: cuándo cierra (después de `at`). */
+    closes_at?: number;
+    /** Temas del examen; sin ellos, los de la materia. */
+    topic_ids?: number[];
+  }) =>
     post<{ id: number }>("/api/exams", body),
   examTopics: (examId: number) => request<{ id: number; name: string }[]>(`/api/exams/${examId}/topics`),
   examResult: (examId: number, grade: number) => post<ExamResult>(`/api/exams/${examId}/result`, { grade }),
@@ -388,10 +482,27 @@ export const api = {
   savePlanSettings: (body: PlanSettings) => put<{ ok: true }>("/api/plan/settings", body),
   settings: () => request<{ reminders: boolean; age: Age | null; allow_download?: boolean }>("/api/settings"),
   saveSettings: (body: { reminders?: boolean; age?: Age; allow_download?: boolean }) => put<{ ok: true }>("/api/settings", body),
-  startMock: (examId: number, predictedGrade: number | null) =>
-    post<MockStart>("/api/mock/start", { exam_id: examId, predicted_grade: predictedGrade }),
+  /** Con `short`, el simulacro corto: 6 preguntas (en un recuperatorio, de los temas flojos). */
+  startMock: (examId: number, predictedGrade: number | null, short?: boolean) =>
+    post<MockStart>("/api/mock/start", {
+      exam_id: examId,
+      predicted_grade: predictedGrade,
+      ...(short ? { short: true } : {}),
+    }),
   finishMock: (attemptId: number, answers: Record<number, MockAnswer>) =>
     post<MockResult>(`/api/mock/${attemptId}/finish`, { answers }),
   /** El resultado de un simulacro ya entregado. */
   mockResult: (attemptId: number) => request<MockResult>(`/api/mock/${attemptId}`),
+  /** "3 preguntas para arrancar": no cuentan para el repaso ni para el plan. */
+  startPretest: (materialId: number) => post<QuizItem[]>(`/api/pretest/${materialId}/start`),
+  pretestAnswer: (body: { question_id: number; chosen_index: number; shown_order: number[] }) =>
+    post<Feedback>("/api/pretest/answer", body),
+  /** Al terminar o con "Ahora no": no se vuelve a ofrecer esa clase. */
+  closePretest: (materialId: number) => post<{ ok: true }>(`/api/pretest/${materialId}/close`),
+  /** Lo escrito se compara en el momento y no se guarda. */
+  recall: (materialId: number, text: string) =>
+    post<{ headings: RecallHeading[] }>(`/api/materials/${materialId}/recall`, { text }),
+  /** "¿Dijiste lo mismo?": lo escrito no se manda, solo Sí o No. */
+  explain: (answerId: number, same: boolean) => post<{ ok: true }>(`/api/answers/${answerId}/explain`, { same }),
+  progress: () => request<ProgressData>("/api/progress"),
 };

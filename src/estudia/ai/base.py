@@ -54,10 +54,18 @@ class GenQuestion(BaseModel):
     check_expr: str | None = None
 
 
+class Segment(BaseModel):
+    start_s: int
+    end_s: int
+    title: str
+
+
 class VideoAnalysis(BaseModel):
     summary_md: str
     topics: list[str]  # de 1 a 3 temas
     questions: list[GenQuestion]
+    # Tramos con marcas de tiempo; un análisis viejo guardado sin ellos se sigue leyendo.
+    segments: list[Segment] = []
 
 
 class AIProvider(Protocol):
@@ -75,6 +83,8 @@ class AIProvider(Protocol):
     last_analysis_model: str | None
     # Segundos de video del último análisis, según Gemini; None si no se sabe.
     last_video_seconds: float | None
+    # Pedidos hechos por función ("analysis", "blind") desde la última lectura.
+    requests: dict[str, int]
 
     def analyze_video(self, youtube_id: str, title: str) -> VideoAnalysis: ...
 

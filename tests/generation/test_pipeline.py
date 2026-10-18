@@ -11,6 +11,7 @@ from estudia.ai.base import (
     AIUnavailableError,
     AIVideoUnavailableError,
     GenQuestion,
+    Segment,
     VideoAnalysis,
 )
 from estudia.ai.gemini import GeminiProvider
@@ -434,12 +435,14 @@ def test_distractor_check_timeout_discards_the_question(conn, monkeypatch):
     real = verify.check_math_tristate
 
     def slow_on_distractors(expr, option):
+        real_start = verify._start_worker
         if option != "1/2":
-            monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)  # timeout de verdad, en el worker
+            verify._stop_worker()   # sin worker tibio que pueda contestar a tiempo
+            monkeypatch.setattr(verify, "_start_worker", lambda: False)
         try:
             return real(expr, option)
         finally:
-            monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 2.0)
+            monkeypatch.setattr(verify, "_start_worker", real_start)
 
     monkeypatch.setattr(pipeline, "check_math_tristate", slow_on_distractors)
     add_material(conn, 1, "v1")
@@ -1238,3 +1241,29 @@ def test_question_without_check_expr_skips_the_typed_check(conn, monkeypatch):
     a = analysis([q_with("mcq", ["1.41", "√2", "2", "1"])])
     res = process_material(conn, FakeProvider({"v1": a}, lambda s, o: 0), 1)
     assert res.kept == 1
+
+
+def test_old_analysis_json_without_segments_still_loads(conn):
+    add_material(conn, 1, "v1")
+    old = json.loads(analysis([q("A")]).model_dump_json())
+    del old["segments"]
+    conn.execute("UPDATE material SET analysis_json=? WHERE id=1", (json.dumps(old),))
+    conn.commit()
+    prov = FakeProvider({}, lambda s, o: 1)
+    assert process_pending(conn, prov) == 1
+    assert prov.analyzed_refs == []  # se reusó el guardado, no se pidió de nuevo
+    row = conn.execute("SELECT status, segments_json FROM material WHERE id=1").fetchone()
+    assert (row["status"], row["segments_json"]) == ("done", None)
+
+
+def test_segments_saved_on_done(conn):
+    add_material(conn, 1, "v1")
+    add_material(conn, 2, "v2")
+    segs = [Segment(start_s=0, end_s=60, title="Intro"), Segment(start_s=60, end_s=200, title="Recta")]
+    full = analysis([q("A")]).model_copy(update={"segments": segs})
+    prov = FakeProvider({"v1": full, "v2": analysis([q("B")])}, lambda s, o: 1)
+    assert process_pending(conn, prov) == 2
+    rows = {r["id"]: r["segments_json"] for r in conn.execute("SELECT id, segments_json FROM material")}
+    assert json.loads(rows[1]) == [{"start_s": 0, "end_s": 60, "title": "Intro"},
+                                   {"start_s": 60, "end_s": 200, "title": "Recta"}]
+    assert rows[2] is None

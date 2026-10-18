@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Practice from "./Practice";
@@ -380,5 +380,65 @@ describe("Práctica v2: ronda 2", () => {
     mockApi({ "POST /api/quiz": [item()], "GET /api/materials": [] });
     render(<Practice params={{}} onExit={() => {}} />);
     expect(await screen.findByText(/pregunta 1 de 1/)).toHaveClass("whitespace-nowrap");
+  });
+});
+
+describe("Explicá por qué", () => {
+  async function answerMeParece(fb: Feedback) {
+    const fetchMock = mockApi({
+      "POST /api/quiz": [item()],
+      "GET /api/materials": [],
+      "POST /api/answer": fb,
+      "POST /api/answers/77/explain": { ok: true },
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    await userEvent.click(screen.getByRole("button", { name: /^2/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Me parece/ }));
+    return fetchMock;
+  }
+  const explainCalls = (fetchMock: ReturnType<typeof mockApi>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).includes("/explain")).map(([url, init]) => [url, JSON.parse(String(init!.body))]);
+
+  it("Explicá por qué aparece solo cuando la API lo pide y manda Sí o No", async () => {
+    const fetchMock = await answerMeParece(feedback({ feedback_style: "doubt", answer_id: 77, explain_prompt: true }));
+    const field = await screen.findByRole("textbox", { name: "Explicá por qué: escribilo en una línea" });
+    // La explicación espera a que escriba o saltee.
+    expect(screen.queryByText(/En y = mx \+ b/)).not.toBeInTheDocument();
+    await userEvent.type(field, "porque m es el número que multiplica a x");
+    await userEvent.click(screen.getByRole("button", { name: "Listo" }));
+
+    expect(await screen.findByText(/En y = mx \+ b/)).toBeInTheDocument();
+    expect(screen.getByText("porque m es el número que multiplica a x")).toBeInTheDocument();
+    expect(screen.getByText("¿Dijiste lo mismo?")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Sí" }));
+    await waitFor(() => expect(explainCalls(fetchMock)).toEqual([["/api/answers/77/explain", { same: true }]]));
+    // Lo escrito no se manda.
+    expect(JSON.stringify(explainCalls(fetchMock))).not.toContain("multiplica");
+    expect(screen.queryByRole("button", { name: "Sí" })).not.toBeInTheDocument();
+    expect(screen.getByText("Anotado. Cuenta para el repaso.")).toBeInTheDocument();
+  });
+
+  it("No manda same: false", async () => {
+    const fetchMock = await answerMeParece(feedback({ feedback_style: "doubt", answer_id: 77, explain_prompt: true }));
+    await userEvent.type(await screen.findByRole("textbox", { name: /Explicá por qué/ }), "ni idea");
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(await screen.findByRole("button", { name: "No" }));
+    await waitFor(() => expect(explainCalls(fetchMock)).toEqual([["/api/answers/77/explain", { same: false }]]));
+  });
+
+  it("Saltear muestra la explicación sin llamar a nada", async () => {
+    const fetchMock = await answerMeParece(feedback({ feedback_style: "doubt", answer_id: 77, explain_prompt: true }));
+    await screen.findByRole("textbox", { name: /Explicá por qué/ });
+    await userEvent.click(screen.getByRole("button", { name: "Saltear" }));
+    expect(await screen.findByText(/En y = mx \+ b/)).toBeInTheDocument();
+    expect(screen.queryByText("¿Dijiste lo mismo?")).not.toBeInTheDocument();
+    expect(explainCalls(fetchMock)).toEqual([]);
+  });
+
+  it("sin explain_prompt no se pide", async () => {
+    await answerMeParece(feedback({ feedback_style: "doubt", answer_id: 77, explain_prompt: false }));
+    expect(await screen.findByText(/En y = mx \+ b/)).toBeInTheDocument();
+    expect(screen.queryByText(/Explicá por qué/)).not.toBeInTheDocument();
   });
 });

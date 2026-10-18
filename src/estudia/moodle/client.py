@@ -13,6 +13,13 @@ class TokenInvalid(MoodleError):
     """El token ya no sirve: hay que volver a iniciar sesión."""
 
 
+class MoodleUnreachable(MoodleError):
+    """No hubo respuesta de Moodle (red, timeout, HTTP de error o respuesta rota).
+
+    No dice nada del campus: puede andar más tarde.
+    """
+
+
 _TOKEN_ERRORS = {"invalidtoken", "accessexception"}
 
 
@@ -61,7 +68,7 @@ class MoodleClient:
             mensaje = _sanitized(exc)
         if mensaje is not None:
             # Se lanza fuera del except para no encadenar la excepción original.
-            raise MoodleError(mensaje)
+            raise MoodleUnreachable(mensaje)
         if isinstance(resultado, dict) and "errorcode" in resultado:
             codigo = resultado["errorcode"]
             if codigo in _TOKEN_ERRORS:

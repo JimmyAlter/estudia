@@ -119,3 +119,84 @@ def test_deck_name_never_nests(conn, tmp_path, fullname, deck):
     names = {d["name"] for d in decks.values()}
     assert deck in names
     assert not any("::" in n for n in names)
+
+
+# --- Mazo de la semana ---------------------------------------------------------------------------
+
+from estudia.study.anki import WEEK_DAYS, weekly_question_ids  # noqa: E402
+
+NOW = 1_800_000_000
+DAY = 86400
+
+
+def set_due(conn, qid, due):
+    conn.execute("INSERT INTO review_state(card_key, due) VALUES (?, ?)", (f"q:{qid}", due))
+    conn.commit()
+
+
+def add_exam(conn, at, topics, kind="parcial"):
+    conn.execute("INSERT INTO exam(course_id, name, opens_at, source, topics_json, kind) "
+                 "VALUES (10, 'Parcial', ?, 'manual', ?, ?)", (at, json.dumps(topics), kind))
+    conn.commit()
+
+
+def test_weekly_deck_due_in_7_days_plus_next_exam_topics(conn):
+    assert WEEK_DAYS == 7
+    add_q(conn, 1)                      # vence en 3 días
+    add_q(conn, 2)                      # sin review_state, tema fuera del examen
+    add_q(conn, 3, topic=2)             # tema del examen, sin review_state
+    set_due(conn, 1, NOW + 3 * DAY)
+    add_exam(conn, NOW + 20 * DAY, [2])
+    assert weekly_question_ids(conn, NOW) == {1, 3}
+
+
+def test_weekly_deck_excludes_retired_and_far_due(conn):
+    add_q(conn, 1)
+    add_q(conn, 2, retired=1)
+    add_q(conn, 3, verified=0)
+    add_q(conn, 4)
+    add_q(conn, 5)
+    set_due(conn, 1, NOW + 7 * DAY - 1)
+    set_due(conn, 2, NOW)
+    set_due(conn, 3, NOW)
+    set_due(conn, 4, NOW + 7 * DAY)     # justo en el borde: no entra
+    set_due(conn, 5, NOW + 30 * DAY)
+    assert weekly_question_ids(conn, NOW) == {1}
+
+
+def test_weekly_deck_ignores_enrollment_as_next_exam(conn):
+    add_q(conn, 1)
+    add_exam(conn, NOW + 2 * DAY, [1], kind="inscripcion")
+    assert weekly_question_ids(conn, NOW) == set()
+
+
+def test_weekly_deck_no_duplicates(conn, tmp_path):
+    add_q(conn, 1)
+    set_due(conn, 1, NOW + DAY)         # vence y además es del examen
+    add_exam(conn, NOW + 3 * DAY, [1])
+    ids = weekly_question_ids(conn, NOW)
+    assert ids == {1}
+    col = open_collection(build_apkg(conn, None, ids), tmp_path)
+    assert col.execute("SELECT count(*) FROM notes").fetchone()[0] == 1
+
+
+def test_weekly_deck_same_guids_as_full_deck(conn, tmp_path):
+    for i in (1, 2, 3):
+        add_q(conn, i)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    full = open_collection(build_apkg(conn, None), tmp_path / "a")
+    weekly = open_collection(build_apkg(conn, None, {2}), tmp_path / "b")
+    full_notes = {r[0]: r[1] for r in full.execute("SELECT guid, flds FROM notes")}
+    ((guid, flds),) = weekly.execute("SELECT guid, flds FROM notes").fetchall()
+    assert full_notes[guid] == flds           # mismo guid: reimportar no duplica
+    def deck_ids(col):
+        return set(json.loads(col.execute("SELECT decks FROM col").fetchone()[0])) - {"1"}
+    assert deck_ids(full) == deck_ids(weekly) and len(deck_ids(weekly)) == 1
+
+
+def test_weekly_deck_empty_raises(conn):
+    add_q(conn, 1)
+    assert weekly_question_ids(conn, NOW) == set()
+    with pytest.raises(LookupError):
+        build_apkg(conn, None, set())

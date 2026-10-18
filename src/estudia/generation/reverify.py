@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 from estudia.ai.base import AIAuthError, AIFormatError, AIProvider, AIQuotaError, AIUnavailableError
-from estudia.config import ANALYZE_MODELS
+from estudia import config
+from estudia.ai.quota import record_usage
 from estudia.generation.pipeline import blind_matches, load_exhausted, save_exhausted
 
 REVERIFIED_PREFIX = "reverified:"
@@ -43,7 +45,8 @@ def reverify_all(conn: sqlite3.Connection, provider: AIProvider) -> ReverifyResu
     """Repite la pasada a ciegas de cada material con preguntas activas; retira las que fallan.
 
     Sin modelo de análisis anotado no se sabe cuál fue: se excluye toda la cadena de
-    análisis, así la verificación nunca la hace el mismo modelo.
+    análisis, así la verificación nunca la hace el mismo modelo. Los pedidos hechos se suman
+    al uso del día de la cuota, también si la corrida se corta.
     """
     result = ReverifyResult()
     load_exhausted(conn, provider)
@@ -60,7 +63,9 @@ def reverify_all(conn: sqlite3.Connection, provider: AIProvider) -> ReverifyResu
                                 correct_index=r["correct_index"])
                 for r in rows
             ]
-            exclude = (material["analysis_model"],) if material["analysis_model"] else tuple(ANALYZE_MODELS)
+            # Sin modelo registrado se excluye toda la cadena de análisis vigente (lo conservador).
+            exclude = ((material["analysis_model"],) if material["analysis_model"]
+                       else tuple(config.MODEL_CHAINS["analysis"]))
             try:
                 matches = blind_matches(provider, questions, exclude)
             except AIFormatError:
@@ -83,4 +88,5 @@ def reverify_all(conn: sqlite3.Connection, provider: AIProvider) -> ReverifyResu
             result.kept += len(questions) - len(failed)
     finally:
         save_exhausted(conn, provider)
+        record_usage(conn, provider, time.time())
     return result

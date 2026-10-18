@@ -3,7 +3,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from estudia.study.exams import list_exams
+from estudia.study.exams import ENROLLMENT, list_exams
 from estudia.study.planner import sessions
 from estudia.study.schedule import TZ, list_slots
 
@@ -86,6 +86,15 @@ def build_ics(conn: sqlite3.Connection, now: int) -> str:
         lines.append("END:VEVENT")
 
     for e in list_exams(conn, now):
+        if e.kind == ENROLLMENT:
+            label = _with_course(e.name, e.course)
+            if e.at is not None and now <= e.at < horizon:
+                lines += _timed(f"estudia-enroll-open-{e.id}@estudia.local", stamp,
+                                f"Abre la inscripción: {label}", e.at, e.at + DEADLINE_MIN * 60)
+            if e.closes_at is not None and now <= e.closes_at < horizon:
+                lines += _timed(f"estudia-enroll-close-{e.id}@estudia.local", stamp,
+                                f"Cierra la inscripción: {label}", e.closes_at - DEADLINE_MIN * 60, e.closes_at)
+            continue
         if e.at is not None and now <= e.at < horizon:
             lines += _timed(f"estudia-exam-{e.id}@estudia.local", stamp,
                             f"Examen: {_with_course(e.name, e.course)}", e.at, e.at + EXAM_MIN * 60)

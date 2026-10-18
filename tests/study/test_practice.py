@@ -486,3 +486,84 @@ def test_typed_answer_to_a_flagged_question_points_to_the_options(conn):
     conn.commit()
     with pytest.raises(NotTypeable, match="Esta pregunta va con opciones. Tocá «Mostrame opciones»."):
         record_answer(conn, 1, None, NOW, mode="typed", typed_text="1.41")
+
+
+# --- "Explicá por qué" ---------------------------------------------------------------------------
+
+def test_explain_prompt_at_most_one_in_three_never_consecutive(conn):
+    add_q(conn, 1)
+    got = [record_answer(conn, 1, 1, NOW + i, confidence=1).explain_prompt for i in range(6)]
+    assert got == [True, False, False, True, False, False]
+
+
+def test_explain_only_after_unsure_correct(conn):
+    add_q(conn, 1)
+    fbs = [
+        record_answer(conn, 1, 1, NOW, confidence=2),                  # acierto seguro
+        record_answer(conn, 1, 0, NOW + 1, confidence=1),              # error dudando
+        record_answer(conn, 1, 1, NOW + 2, confidence=1, mode="mock"),
+        record_answer(conn, 1, 1, NOW + 3, confidence=1, mode="pretest"),
+    ]
+    assert [f.explain_prompt for f in fbs] == [False] * 4
+    # y no gastaron el cupo: el primer acierto dudoso de práctica sí lo pide
+    assert record_answer(conn, 1, 1, NOW + 4, confidence=1).explain_prompt is True
+
+
+def _review(conn, qid=1):
+    return dict(conn.execute("SELECT * FROM review_state WHERE card_key = ?", (f"q:{qid}",)).fetchone())
+
+
+def test_record_explain_match_rebuilds_card(conn):
+    from estudia.study.practice import record_explain_match
+    add_q(conn, 1)
+    fb = record_answer(conn, 1, 1, NOW, confidence=1)
+    assert fb.explain_prompt and fb.answer_id is not None
+    before = _review(conn)
+    record_explain_match(conn, fb.answer_id, same=True)
+    assert _review(conn) == before   # "Sí" no cambia nada: ya era Hard
+
+    add_q(conn, 2)
+    fb2 = record_answer(conn, 2, None, NOW, confidence=2, mode="typed", typed_text="x", typed_ok=True)
+    assert fb2.explain_prompt is False
+    # Con "No" un acierto que habría sido Good/Easy -> Again: forzamos el aviso en una respuesta guardada
+    conn.execute("UPDATE answer SET explain_prompted = 1 WHERE id = ?", (fb2.answer_id,))
+    conn.commit()
+    easy = _review(conn, 2)
+    record_explain_match(conn, fb2.answer_id, same=False)
+    capped = _review(conn, 2)
+    assert capped["stability"] < easy["stability"]
+    assert conn.execute("SELECT explain_match FROM answer WHERE id = ?", (fb2.answer_id,)).fetchone()[0] == 0
+
+
+def test_explain_no_still_counts_for_relearning(conn):
+    from estudia.study.practice import record_explain_match
+    add_q(conn, 1)
+    record_answer(conn, 1, 0, local(1, 10), confidence=2)   # error: reaprendizaje
+    for day in (2, 3, 4):
+        fb = record_answer(conn, 1, 1, local(day, 10), confidence=1)
+        if fb.explain_prompt:
+            record_explain_match(conn, fb.answer_id, same=False)
+    assert _review(conn)["state"] == 2   # STATE_REVIEW: 3 días locales distintos
+
+
+def test_explain_match_twice_raises(conn):
+    from estudia.study.practice import record_explain_match
+    add_q(conn, 1)
+    fb = record_answer(conn, 1, 1, NOW, confidence=1)
+    record_explain_match(conn, fb.answer_id, same=False)
+    with pytest.raises(ValueError):
+        record_explain_match(conn, fb.answer_id, same=True)
+    with pytest.raises(LookupError):
+        record_explain_match(conn, 999, same=True)
+    ok = record_answer(conn, 1, 1, NOW + 1, confidence=2)   # nunca se pidió
+    with pytest.raises(ValueError):
+        record_explain_match(conn, ok.answer_id, same=True)
+
+
+def test_explain_spacing_ignores_non_qualified_answers(conn):
+    add_q(conn, 1)
+    seq = [(1, 1), (1, 2), (1, 2), (1, 1), (1, 1), (1, 2), (1, 1), (1, 1), (1, 1)]  # (elegida, confianza)
+    got = [record_answer(conn, 1, ch, NOW + i, confidence=cf).explain_prompt for i, (ch, cf) in enumerate(seq)]
+    # Calificadas (acierto + Me parece): posiciones 0, 3, 4, 6, 7, 8 -> piden la 1.ª y la 4.ª
+    assert [g for g, (_, cf) in zip(got, seq) if cf == 1] == [True, False, False, True, False, False]
+    assert not any(g for g, (_, cf) in zip(got, seq) if cf == 2)

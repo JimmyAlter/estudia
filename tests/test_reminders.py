@@ -89,9 +89,9 @@ def test_failed_send_is_retried(conn):
     assert reminders.check_once(conn, now + 60, lambda t, x: True) == 1
 
 
-def test_sent_is_pruned_to_three_days(conn):
+def test_sent_is_pruned_to_five_days(conn):
     now = ts(2026, 10, 19, 19)
-    reminders.mark_sent(conn, ["old"], now - 4 * 86400)
+    reminders.mark_sent(conn, ["old"], now - 6 * 86400)
     reminders.mark_sent(conn, ["new"], now)
     assert set(reminders.load_sent(conn)) == {"new"}
 
@@ -194,3 +194,41 @@ def test_mixed_session_uses_the_planner_label(conn, kind, topics, text):
     conn.commit()
     (r,) = reminders.due_reminders(conn, ts(2026, 10, 19, 19, 3), set())
     assert (r.key, r.text) == ("session:6", text)
+
+
+def add_enrollment(conn, opens, closes, name="Inscripción a finales"):
+    cur = conn.execute(
+        "INSERT INTO exam(course_id, name, opens_at, closes_at, source, kind) "
+        "VALUES (10, ?, ?, ?, 'manual', 'inscripcion')", (name, opens, closes))
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_enrollment_reminder_three_days_before_close(conn):
+    eid = add_enrollment(conn, ts(2026, 10, 1), ts(2026, 10, 23, 18, 30))
+    assert reminders.due_reminders(conn, ts(2026, 10, 20, 8, 59), set()) == []
+    (r,) = reminders.due_reminders(conn, ts(2026, 10, 20, 9, 0), set())
+    assert r.key == f"enroll:{eid}:{ts(2026, 10, 23, 18, 30)}"
+    assert r.text == "Cierra la inscripción: Inscripción a finales, el 23/10 a las 18:30"
+    sent = []
+    assert reminders.check_once(conn, ts(2026, 10, 20, 9, 0), lambda t, x: sent.append(x) or True) == 1
+    assert reminders.check_once(conn, ts(2026, 10, 20, 9, 1), lambda t, x: sent.append(x) or True) == 0
+    assert f"enroll:{eid}:{ts(2026, 10, 23, 18, 30)}" in reminders.load_sent(conn)
+    # Todavía dentro de la ventana, cuatro días después del primer aviso no se repite.
+    assert reminders.due_reminders(conn, ts(2026, 10, 23, 18, 0), set(reminders.load_sent(conn))) == []
+    assert reminders.due_reminders(conn, ts(2026, 10, 23, 18, 30), set()) == []  # ya cerró
+
+
+def test_enrollment_has_no_exam_eve_reminder(conn):
+    add_enrollment(conn, ts(2026, 10, 20, 9), ts(2026, 10, 30))
+    assert reminders.due_reminders(conn, ts(2026, 10, 19, 18, 0), set()) == []
+
+
+def test_enrollment_reminder_rearms_when_close_date_moves(conn):
+    eid = add_enrollment(conn, ts(2026, 10, 1), ts(2026, 10, 23, 18, 30))
+    now = ts(2026, 10, 22, 10)
+    (first,) = reminders.due_reminders(conn, now, set())
+    conn.execute("UPDATE exam SET closes_at = ? WHERE id = ?", (ts(2026, 10, 25, 18, 30), eid))
+    conn.commit()
+    (second,) = reminders.due_reminders(conn, now, {first.key})
+    assert second.key != first.key and "el 25/10" in second.text

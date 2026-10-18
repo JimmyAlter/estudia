@@ -9,8 +9,8 @@ import platformdirs
 # a cada modelo: cuando uno se agota se pasa al siguiente. Al usarlas se cruzan con
 # client.models.list() (lo que esa clave puede usar de verdad).
 # El análisis manda video: solo modelos que lo aceptan.
-ANALYZE_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
-                  "gemini-2.5-flash-lite"]
+_ANALYSIS_CHAIN = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+                   "gemini-2.5-flash-lite"]
 # Tope de una marca de "modelo agotado por hoy": la cuota diaria vuelve como mucho
 # en un día (más una hora de margen). Una marca más lejana es un error y no se usa.
 MAX_EXHAUSTED_S = 86400 + 3600
@@ -20,8 +20,14 @@ MAX_EXHAUSTED_S = 86400 + 3600
 LEGACY_ANALYSIS_MODEL = "gemini-2.5-flash"
 # La pasada a ciegas usa otra familia o gama que el análisis (y nunca el mismo modelo
 # que analizó ese material): el control es independiente y reparte la cuota.
-BLIND_MODELS = ["gemini-3.5-flash-lite", "gemma-4-31b-it", "gemini-2.5-flash-lite",
+_BLIND_CHAIN = ["gemini-3.5-flash-lite", "gemma-4-31b-it", "gemini-2.5-flash-lite",
                 "gemini-3.1-flash-lite"]
+# Las cadenas como datos, por función: agregar un modelo es tocar esta tabla, no la lógica.
+# GeminiProvider la lee al construirse.
+MODEL_CHAINS: dict[str, list[str]] = {"analysis": _ANALYSIS_CHAIN, "blind": _BLIND_CHAIN}
+# Pedidos por día del Pacífico para cada función de IA (se pisa con kv `ai_budget:<función>`).
+# `pdf` y `photo` quedan reservados para las etapas 3b y 3c.
+DAILY_BUDGET: dict[str, int] = {"analysis": 40, "blind": 20, "pdf": 0, "photo": 0}
 
 # Si Gemini no acepta enlaces de YouTube con una clave (403 en toda la cadena), no se
 # vuelve a probar el enlace durante 7 días; después se prueba de nuevo.

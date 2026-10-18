@@ -6,6 +6,7 @@ import httpx
 import pytest
 from google.genai import errors, types
 
+from estudia import config
 from estudia.ai.base import (
     AIAuthError,
     AINeedsPublicLinkError,
@@ -975,3 +976,118 @@ def test_rejected_link_is_not_a_link_send():
     with pytest.raises(AINeedsPublicLinkError):
         p.analyze_video("aaaaaaaaaa1", "Clase 1")
     assert p.last_link_sent is False
+
+
+def test_new_model_in_chain_is_used_without_code_change(monkeypatch):
+    monkeypatch.setitem(config.MODEL_CHAINS, "analysis", ["gemini-3.6-flash"])
+    client = FakeClient(text=json.dumps(_analysis()), listed=("gemini-3.6-flash",))
+    p = GeminiProvider("clave-falsa", client=client, sleep=_no_sleep, download=_no_download)
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert [c.model for c in client.calls] == ["gemini-3.6-flash"]
+    assert p.last_analysis_model == "gemini-3.6-flash"
+
+
+def test_requests_counted_per_function_excluding_429():
+    p, client = _provider(outcomes=[_rate_limited("20s"), json.dumps(_analysis()), _answers(1)],
+                          sleeps=[])
+    assert p.requests == {"analysis": 0, "blind": 0}
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    p.answer_blind_batch(ITEMS)
+    assert len(client.calls) == 3  # el 429 llegó a Gemini pero no se cuenta
+    assert p.requests == {"analysis": 1, "blind": 1}
+
+
+def test_blind_never_uses_excluded_model():
+    flite = "gemini-3.5-flash-lite"
+    p, client = _provider(_answers(1), blind_models=(flite, "b"))
+    assert p.answer_blind_batch(ITEMS, exclude_models={flite}) == [1]
+    assert [c.model for c in client.calls] == ["b"]
+
+
+def test_blind_chain_empty_after_exclusion_raises_quota():
+    p, client = _provider(_answers(1), blind_models=("b", "c"))
+    with pytest.raises(AIQuotaError):
+        p.answer_blind_batch(ITEMS, exclude_models={"b", "c"})
+    assert client.calls == []
+    assert p.requests == {"analysis": 0, "blind": 0}
+
+
+def test_5xx_retried_then_next_model_counts_every_request():
+    p, client = _provider(outcomes=[_overloaded(), _overloaded(), json.dumps(_analysis())],
+                          sleeps=[], analyze_models=("m", "m2"))
+    p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert [c.model for c in client.calls] == ["m", "m", "m2"]
+    assert p.requests == {"analysis": 3, "blind": 0}
+
+
+def test_blind_fallback_across_two_models_counts_two():
+    p, client = _provider(outcomes=["no es json", _answers(1)], blind_models=("b", "b2"))
+    assert p.answer_blind_batch(ITEMS) == [1]
+    assert p.requests == {"analysis": 0, "blind": 2}
+
+
+def test_transport_error_is_not_counted():
+    p, _ = _provider(error=httpx.ConnectError("x"))
+    with pytest.raises(AIUnavailableError):
+        p.answer_blind_batch(ITEMS)
+    assert p.requests == {"analysis": 0, "blind": 0}
+
+
+def test_requests_read_and_reset_through_the_gate_and_age_gate_still_blocks():
+    from estudia.ai.gate import AIBlocked, GatedProvider
+
+    real, _ = _provider(_answers(1))
+    allowed = [True]
+    gated = GatedProvider(real, lambda: allowed[0])
+    gated.answer_blind_batch(ITEMS)
+    assert gated.requests == {"analysis": 0, "blind": 1} == real.requests
+    gated.requests = {"analysis": 0, "blind": 0}
+    assert real.requests == {"analysis": 0, "blind": 0}
+    allowed[0] = False
+    with pytest.raises(AIBlocked):
+        gated.answer_blind_batch(ITEMS)
+    assert real.requests == {"analysis": 0, "blind": 0}
+
+
+def _seg(start, end, title="Tramo"):
+    return {"start_s": start, "end_s": end, "title": title}
+
+
+def _segments_provider(segments, audio_tokens=32 * 600):
+    """Análisis de 600 s (según los tokens de audio) con los tramos dados."""
+    client = UsageClient(_usage(json.dumps(_analysis(segments=segments)), audio_tokens))
+    return GeminiProvider("clave-falsa", analyze_models=["m"], blind_models=["b"], client=client,
+                          sleep=_no_sleep, download=_no_download)
+
+
+def test_segments_kept_when_valid():
+    p = _segments_provider([_seg(0, 100), _seg(100, 300, "Parábola"), _seg(310, 620)])
+    result = p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert [(s.start_s, s.end_s) for s in result.segments] == [(0, 100), (100, 300), (310, 620)]
+    assert result.segments[1].title == "Parábola"
+
+
+@pytest.mark.parametrize("segments", [
+    [_seg(0, 100), _seg(100, 631)],                # más de 30 s de margen sobre 600 s
+    [_seg(0, 100), _seg(90, 200)],                 # superpuestos
+    [_seg(200, 300), _seg(0, 100)],                # desordenados
+    [_seg(0, 100), _seg(100, 200, "   ")],         # título en blanco
+    [_seg(0, 100), _seg(150, 150)],                # end_s <= start_s
+])
+def test_invalid_segments_dropped_but_analysis_kept(segments):
+    p = _segments_provider(segments)
+    result = p.analyze_video("aaaaaaaaaa1", "Clase 1")
+    assert result.segments == []
+    assert result.topics == ["Funciones"] and len(result.questions) == 1
+
+
+def test_segments_without_duration_checked_for_order_only():
+    p, _ = _provider(json.dumps(_analysis(segments=[_seg(0, 100), _seg(100, 99999)])))
+    assert len(p.analyze_video("aaaaaaaaaa1", "Clase 1").segments) == 2
+    p, _ = _provider(json.dumps(_analysis(segments=[_seg(0, 100), _seg(50, 200)])))
+    assert p.analyze_video("aaaaaaaaaa1", "Clase 1").segments == []
+
+
+def test_analysis_without_segments_is_valid():
+    p, _ = _provider(json.dumps(_analysis()))
+    assert p.analyze_video("aaaaaaaaaa1", "Clase 1").segments == []

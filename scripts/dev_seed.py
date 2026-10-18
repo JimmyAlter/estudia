@@ -14,6 +14,24 @@ Con examen (lo normal) también siembra la agenda y el plan, para ver todas las 
 horarios de cursada (y una sugerencia de horario), entregas y un evento, un examen cargado a
 mano en 5 días (sesiones de repaso mezclado), un examen pasado sin nota ("¿Cómo te fue?"),
 disponibilidad, sesiones del plan (de foco y mezcladas) y un simulacro terminado.
+
+Para lo de la etapa 3a: una clase recién preparada que se ofrece como "3 preguntas para arrancar",
+resúmenes con títulos ("Contá lo que te acordás"), 26 respuestas con confianza ("Cómo vengo") en
+las que ningún acierto con "Me parece" pidió "Explicá por qué" (así el próximo lo pide), y con
+examen, uno ya rendido con simulacro, nota prevista y nota real.
+
+Para "En el celular" (Agenda): el enlace del calendario del campus guardado (de mentira, en el
+keyring en memoria) y preguntas que vencen en la semana, así el mazo de la semana sale. Con
+examen, además, una inscripción abierta desde ayer que cierra en 2 días.
+
+Para recuperatorio y final (con examen): un recuperatorio cargado hace 3 días, con el simulacro
+corto sugerido para hoy, y un final en 20 días (menos de 4 semanas). "Armar el recuperatorio"
+aparece en el parcial ya rendido con nota, en la semana anterior de la Agenda. El tema
+"Ecuación de la recta" está firme (P ≥ 0,7 el día del recuperatorio): el recuperatorio no lo programa.
+
+Con la app lista, el curso tiene 10 preguntas verificadas y una clase pendiente ("Ya hay 10
+preguntas…"), y el procesamiento quedó frenado por el tope del día (`ai_stop_reason = "budget"`).
+La pantalla de cada cosa está en el informe de la Tarea 19 (`.superpowers/sdd/2026-10-18-etapa3a/`).
 """
 from __future__ import annotations
 
@@ -21,7 +39,7 @@ import argparse
 import json
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,16 +49,25 @@ from keyring.backend import KeyringBackend
 
 from estudia.ai.base import AIQuotaError
 from estudia.db import connect
+from estudia.generation.pipeline import BUDGET, STOP_KEY
+from estudia.moodle.calendar_feed import export_url, feed_secret_name, feed_status_key
 from estudia.secrets import set_secret
 from estudia.server.app import GEMINI_KEY, HOST, SITE_KEY, create_app, moodle_token_name
-from estudia.study.exams import create_manual_exam
+from estudia.study.exams import ENROLLMENT, FINAL, RETAKE, create_manual_exam, set_exam_result
 from estudia.study.mock_exam import finish_mock, start_mock
 from estudia.study.planner import replan, set_availability
 from estudia.study.schedule import add_slot
 
 SITE_ID = "utn-frba"
+SITE_URL = "https://aulasvirtuales.frba.utn.edu.ar"
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 DAY = 86400
+
+
+def local_at(now: int, days: int, hour: int, minute: int = 0) -> int:
+    """Epoch de las hour:minute locales, `days` días después de hoy: horas redondas en la Agenda."""
+    day = datetime.fromtimestamp(now, TZ).date() + timedelta(days=days)
+    return int(datetime(day.year, day.month, day.day, hour, minute, tzinfo=TZ).timestamp())
 
 
 class MemoryKeyring(KeyringBackend):
@@ -85,8 +112,11 @@ class QuotaProvider:
 
 SUMMARY_1 = """# Rectas
 La ecuación explícita de la recta es y = mx + b, donde m es la pendiente y b la ordenada al origen.
+## Pendiente
 - La pendiente mide cuánto sube y por cada unidad que avanza x: m = (y₂ − y₁) / (x₂ − x₁).
 - Si m > 0 la recta crece; si m < 0, decrece; si m = 0, es horizontal.
+## Ordenada al origen
+Es el valor de y cuando x = 0: el punto (0, b) donde la recta corta al eje y.
 ## Recta que pasa por un punto
 Con un punto (x₀, y₀) y la pendiente m: y − y₀ = m(x − x₀). Despejando se obtiene **b = y₀ − m·x₀**.
 """
@@ -119,11 +149,40 @@ QUESTIONS = [
 ]
 
 
+SUMMARY_5 = """# Distancia y punto medio
+## Distancia entre dos puntos
+La distancia entre (x₁, y₁) y (x₂, y₂) es d = √((x₂ − x₁)² + (y₂ − y₁)²): sale del teorema de Pitágoras.
+## Punto medio
+El punto medio de un segmento promedia las coordenadas: M = ((x₁ + x₂)/2, (y₁ + y₂)/2).
+## Circunferencia
+Los puntos a distancia r de un centro (h, k) cumplen (x − h)² + (y − k)² = r².
+"""
+
+# La clase recién preparada que se ofrece como "3 preguntas para arrancar" (sin respuestas).
+PRETEST_QUESTIONS = [
+    (7, "¿Cuál es la distancia entre (0, 0) y (3, 4)?", ["5", "7", "1", "25"], 0,
+     "d = √((3 − 0)² + (4 − 0)²) = √(9 + 16) = √25 = 5.", "Sumar las diferencias sin elevar al cuadrado: 3 + 4 = 7.", 240),
+    (8, "¿Cuál es el punto medio entre (2, 6) y (4, 10)?", ["(6, 16)", "(3, 8)", "(1, 2)", "(2, 4)"], 1,
+     "Se promedian las coordenadas: ((2 + 4)/2, (6 + 10)/2) = (3, 8).", "Sumar las coordenadas sin dividir por 2.", 610),
+    (9, "¿Qué radio tiene la circunferencia (x − 1)² + (y + 2)² = 9?", ["9", "−3", "3", "81"], 2,
+     "La forma es (x − h)² + (y − k)² = r², así que r² = 9 y r = 3.", "Tomar el 9 como radio en vez de r².", 1130),
+]
+
+# Respuestas de práctica con confianza, de más vieja a más nueva: (pregunta, correcta, confianza).
+# 2 = Seguro (10 de 14, 71 %), 1 = Me parece (5 de 8), 0 = Adiviné (1 de 4). Ninguna pidió
+# "Explicá por qué": el próximo acierto con "Me parece" en la práctica lo pide.
+CONFIDENCE_ANSWERS = (
+    [(q, 1, 2) for q in (1, 2, 3, 5, 6, 1, 2, 3, 5, 6)] + [(q, 0, 2) for q in (4, 4, 6, 1)]
+    + [(q, 1, 1) for q in (2, 3, 5, 6, 1)] + [(q, 0, 1) for q in (4, 6, 2)]
+    + [(3, 1, 0)] + [(q, 0, 0) for q in (4, 5, 6)]
+)
+
+
 def seed(db_path: Path, *, with_exam: bool) -> None:
     now = int(time.time())
     conn = connect(db_path)
     conn.execute("INSERT INTO site VALUES (?, ?, 1, 'Estudiante de prueba')",
-                 (SITE_ID, "https://aulasvirtuales.frba.utn.edu.ar"))
+                 (SITE_ID, SITE_URL))
     conn.execute("INSERT INTO course VALUES (101, ?, 'Matemática', 'AM1')", (SITE_ID,))
     conn.executemany("INSERT INTO section VALUES (?, 101, ?, ?, ?)", [
         (10, 2, "NÚMEROS REALES, FUNCIÓN LINEAL Y CUADRÁTICA", 1),
@@ -161,16 +220,65 @@ def seed(db_path: Path, *, with_exam: bool) -> None:
         (1, 2, 1, now - 2 * DAY), (2, 1, 1, now - 2 * DAY), (3, 0, 1, now - DAY), (3, 1, 0, now - 3 * DAY),
         (4, 2, 0, now - DAY), (5, 0, 1, now - DAY),
     ])
+    for n, (qid, correct, confidence) in enumerate(CONFIDENCE_ANSWERS):
+        conn.execute(
+            "INSERT INTO answer(question_id, chosen_index, correct, at, confidence, mode, explain_prompted)"
+            " VALUES (?, ?, ?, ?, ?, 'mcq', 0)",
+            (qid, QUESTIONS[qid - 1][4] if correct else (QUESTIONS[qid - 1][4] + 1) % 4, correct,
+             now - 6 * DAY + n * 3600, confidence),
+        )
+    # Un tema bien sabido (una pregunta acertada cuatro veces, espaciadas): su P el día del
+    # recuperatorio queda en 0,7 o más, así que el recuperatorio no lo programa. Con esta, el
+    # curso llega a 10 preguntas verificadas (con la clase 3 pendiente: "Ya hay 10 preguntas").
+    conn.execute("INSERT INTO topic VALUES (5, 101, 'ecuacion-recta', 'Ecuación de la recta')")
+    conn.execute("INSERT INTO material_topic VALUES (1, 5)")
+    # Correcta en el índice 0: el simulacro sembrado la contesta bien (ver `seed_agenda`).
+    conn.execute(
+        "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
+        " explanation, common_error, source_seconds, verified, dedupe_key)"
+        " VALUES (10, 1, 5, ?, ?, 0, ?, ?, 1180, 1, 'q10')",
+        ("¿Qué ecuación tiene la recta de pendiente 2 que pasa por (0, 3)?",
+         json.dumps(["y = 2x + 3", "y = 3x + 2", "y = 2x − 3", "y = −2x + 3"], ensure_ascii=False),
+         "Con pendiente m = 2 y ordenada al origen b = 3 (el punto (0, 3)): y = 2x + 3.",
+         "Cambiar de lugar la pendiente y la ordenada al origen."),
+    )
+    conn.executemany("INSERT INTO answer(question_id, chosen_index, correct, at) VALUES (10, 0, 1, ?)",
+                     [(now - days * DAY,) for days in (40, 25, 12, 4)])
     if with_exam:
-        opens = now + 21 * DAY
+        opens = local_at(now, 21, 8)
         conn.execute("INSERT INTO exam(id, course_id, cmid, name, opens_at, closes_at, attempts, time_limit_s, "
                      "max_grade) VALUES (1, 101, 600, 'PRIMER CUESTIONARIO', ?, ?, 1, 7200, 12)",
                      (opens, opens + 7 * DAY))
     conn.execute("INSERT INTO kv VALUES ('last_sync_at', ?)", (str(now - 2 * 3600),))
+    # El tope de pedidos del día frenó la clase pendiente: Inicio lo dice con calma ("Lo de hoy ya está…").
+    conn.execute("INSERT INTO kv VALUES (?, ?)", (STOP_KEY, BUDGET))
     conn.commit()
     conn.close()
     if with_exam:
         seed_agenda(db_path, now)
+    # Después del plan y los simulacros, para que ninguno use sus preguntas (la oferta pide cero respuestas).
+    seed_pretest(db_path, now)
+
+
+def seed_pretest(db_path: Path, now: int) -> None:
+    """Una clase preparada hace una hora, con 3 preguntas verificadas y ninguna respuesta."""
+    conn = connect(db_path)
+    conn.execute(
+        "INSERT INTO material(id, section_id, cmid, kind, title, ref, status, summary_md, updated_at)"
+        " VALUES (5, 10, 505, 'youtube', 'Video-clase 4: Distancia y punto medio.', 'ysz5S6PUM-U', 'done', ?, ?)",
+        (SUMMARY_5, now - 3600),
+    )
+    conn.execute("INSERT INTO topic VALUES (4, 101, 'distancia', 'Distancia y punto medio')")
+    conn.execute("INSERT INTO material_topic VALUES (5, 4)")
+    for qid, stem, options, correct, expl, err, sec in PRETEST_QUESTIONS:
+        conn.execute(
+            "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
+            " explanation, common_error, source_seconds, verified, dedupe_key)"
+            " VALUES (?, 5, 4, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (qid, stem, json.dumps(options, ensure_ascii=False), correct, expl, err, sec, f"q{qid}"),
+        )
+    conn.commit()
+    conn.close()
 
 
 def seed_agenda(db_path: Path, now: int) -> None:
@@ -185,29 +293,44 @@ def seed_agenda(db_path: Path, now: int) -> None:
     conn.executemany(
         "INSERT INTO deadline(course_id, kind, ext_id, name, due_at, url) VALUES (101, ?, ?, ?, ?, ?)",
         [
-            ("assign", 1, "Trabajo práctico 1: rectas", now + 2 * DAY,
+            ("assign", 1, "Trabajo práctico 1: rectas", local_at(now, 2, 23, 59),
              "https://aulasvirtuales.frba.utn.edu.ar/mod/assign/view.php?id=901"),
-            ("event", 2, "Clase de consulta", now + 4 * DAY, None),
+            ("event", 2, "Clase de consulta", local_at(now, 4, 18), None),
         ],
     )
     conn.commit()
     set_availability(conn, {0: 90, 1: 90, 2: 90, 3: 50, 4: 90, 5: 120, 6: 0})
     # Examen a mano en 5 días: sus sesiones son de repaso mezclado. Y uno ya rendido, sin nota.
-    create_manual_exam(conn, 101, "Parcialito de rectas", now + 5 * DAY, [1, 2], 10)
-    create_manual_exam(conn, 101, "Evaluación diagnóstica", now - 3 * DAY, [], 10)
+    create_manual_exam(conn, 101, "Parcialito de rectas", local_at(now, 5, 18), [1, 2], 10)
+    create_manual_exam(conn, 101, "Evaluación diagnóstica", local_at(now, -3, 18), [], 10)
     # Dos sesiones de foco hechas por tema: las próximas de esos temas ya van mezcladas.
     for days_ago, topic in ((6, 1), (5, 2), (4, 1), (3, 2)):
         conn.execute(
             "INSERT INTO plan_session(course_id, topic_id, exam_id, starts_at, minutes, done, kind, topics_json) "
             "VALUES (101, ?, 1, ?, 50, 1, 'focus', ?)",
-            (topic, now - days_ago * DAY, json.dumps([topic])),
+            (topic, local_at(now, -days_ago, 19), json.dumps([topic])),
         )
     conn.commit()
+    # Un recuperatorio cargado hace 3 días (el simulacro corto se sugiere hoy) y un final a menos
+    # de 4 semanas ("el plan usa el tiempo que hay").
+    create_manual_exam(conn, 101, "Recuperatorio de funciones lineales", local_at(now, 9, 18), [], 10,
+                       kind=RETAKE, now=now - 3 * DAY)
+    create_manual_exam(conn, 101, "Final de Matemática", local_at(now, 20, 9), [], 10, kind=FINAL, now=now)
     replan(conn, now)
     # Un simulacro terminado: 2 de 6 bien (nota 4 de 12), con una predicción de 9.
     attempt = start_mock(conn, 1, now - DAY, predicted_grade=9)
     answers = {item.question_id: (0 if item.question_id % 3 else 1) for item in attempt.items}
     finish_mock(conn, attempt.attempt_id, answers, now - DAY + 600)
+    # Un examen ya rendido, con simulacro antes (esperaba 8) y la nota real cargada: "Cómo vengo".
+    graded = create_manual_exam(conn, 101, "Parcialito de funciones lineales", local_at(now, -10, 18), [1, 2], 10)
+    attempt = start_mock(conn, graded, now - 12 * DAY, predicted_grade=8)
+    answers = {item.question_id: (0 if item.question_id % 2 else 1) for item in attempt.items}
+    finish_mock(conn, attempt.attempt_id, answers, now - 12 * DAY + 900)
+    set_exam_result(conn, graded, 6, now - 9 * DAY)
+    # Una inscripción abierta desde ayer que cierra en 2 días a las 23:59: entra en el aviso de
+    # los 3 días antes del cierre.
+    opens, closes = local_at(now, -1, 9), local_at(now, 2, 23, 59)
+    create_manual_exam(conn, 101, "Inscripción a finales", opens, [], None, kind=ENROLLMENT, closes_at=closes, now=now)
     conn.close()
 
 
@@ -235,6 +358,13 @@ def main() -> None:
     conn.close()
     if args.step in ("ia", "listo"):
         set_secret(moodle_token_name(SITE_ID), "token-de-prueba")
+    if args.step == "listo":
+        # El enlace del calendario del campus, ya buscado y guardado ("Mostrar enlace" en la Agenda).
+        set_secret(feed_secret_name(SITE_ID), export_url(SITE_URL, 1, "token-del-calendario-de-prueba"))
+        conn = connect(db_path)
+        conn.execute("INSERT OR REPLACE INTO kv VALUES (?, 'saved')", (feed_status_key(SITE_ID),))
+        conn.commit()
+        conn.close()
     if args.step in ("listo", "vencida"):
         set_secret(GEMINI_KEY, "clave-de-prueba")
 
