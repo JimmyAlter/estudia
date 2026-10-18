@@ -1,4 +1,5 @@
 """Rutas y constantes de la aplicación."""
+import os
 import sys
 from pathlib import Path
 
@@ -42,8 +43,16 @@ SYNC_EVERY_S = 21600
 SECRETS_SERVICE = "estudia"
 
 
+# Variable de entorno que fija la carpeta de datos (los tests la usan para no tocar
+# nunca los datos reales; en Windows platformdirs no lee APPDATA sino la API del sistema).
+DATA_DIR_ENV = "ESTUDIA_DATA_DIR"
+
+
 def data_path() -> Path:
     """Dónde van los datos del usuario, sin crear nada."""
+    override = os.environ.get(DATA_DIR_ENV)
+    if override:
+        return Path(override)
     return Path(platformdirs.user_data_dir("estudia"))
 
 

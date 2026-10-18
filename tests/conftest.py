@@ -60,6 +60,7 @@ def isolated_data_dir(tmp_path_factory, monkeypatch):
         monkeypatch.setenv(name, str(home / name.lower()))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("ESTUDIA_DATA_DIR", str(home / "estudia-data"))
     yield home
 
 
