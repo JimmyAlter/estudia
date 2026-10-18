@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Mock from "./Mock";
@@ -146,6 +146,17 @@ describe("Simulacro", () => {
     expect(perQuestion.parentElement!.textContent).not.toMatch(/·\s*90 segundos/);
     await userEvent.click(screen.getByRole("button", { name: "Empezar" }));
     expect(bodyOf(fetchMock, "/api/mock/start")).toEqual({ exam_id: 7, predicted_grade: null, short: true });
+  });
+
+  it("en la materia de ejemplo no se pide la nota que creés", async () => {
+    const fetchMock = routes({ "GET /api/exams": [EXAM] });
+    render(<Mock start={{ examId: EXAM.id, short: true }} demo onPractice={() => {}} onExit={() => {}} />);
+    const begin = await screen.findByRole("button", { name: "Empezar" });
+    expect(screen.queryByLabelText("¿Cuánto creés que te sacás?")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Si no sabés, dejalo vacío/)).not.toBeInTheDocument();
+    await userEvent.click(begin);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url === "/api/mock/start")).toBe(true));
+    expect(bodyOf(fetchMock, "/api/mock/start")).toMatchObject({ predicted_grade: null });
   });
 
   it("sin preguntas de los temas flojos, el simulacro corto lo dice con calma", async () => {

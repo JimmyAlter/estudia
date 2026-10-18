@@ -334,3 +334,73 @@ def test_explain_route_saves_match_and_rejects_repeat(env):
     assert conn.execute("SELECT explain_match FROM answer").fetchone()[0] == 0
     assert c.post(url, json={"same": True}).status_code == 400
     assert c.post("/api/answers/999/explain", json={"same": True}).status_code == 404
+
+
+def test_answer_returns_requeue_item_json(env):
+    c, conn = env["client"], env["conn"]
+    for qid in (1, 2, 3):
+        add_question(conn, qid)
+    conn.execute("UPDATE question SET variant_group = 1 WHERE id IN (1, 2, 3)")
+    conn.commit()
+    (item,) = c.post("/api/quiz", json={"topic_id": 1}).json()
+    assert item["card_key"] == "v:1"
+    fb = c.post("/api/answer", json={"question_id": item["question_id"], "chosen_index": 1}).json()
+    assert fb["requeue"] is True
+    again = fb["requeue_item"]
+    assert again["card_key"] == "v:1"
+    assert again["question_id"] != item["question_id"]
+    assert again["stem"] != item["stem"]
+    assert set(again) >= {"question_id", "stem", "options", "topic", "format", "phase", "relearning"}
+    assert "correct_index" not in again
+    add_question(conn, 9)
+    alone = c.post("/api/answer", json={"question_id": 9, "chosen_index": 1}).json()
+    assert alone["requeue"] is True and alone["requeue_item"] is None
+
+
+@pytest.mark.parametrize("error", [RuntimeError("worker roto"), ValueError("dato raro")])
+def test_answer_survives_a_failing_requeue_item(env, monkeypatch, caplog, error):
+    """Si armar la otra variante falla, la respuesta ya guardada vuelve igual (sin 500 ni 400),
+    sin `requeue_item`, y el plan se refresca como siempre. El log dice solo el tipo."""
+    from estudia.server import app as app_module
+    from estudia.study import practice
+
+    c, conn = env["client"], env["conn"]
+    for qid in (1, 2):
+        add_question(conn, qid)
+    conn.execute("UPDATE question SET variant_group = 1 WHERE id IN (1, 2)")
+    conn.commit()
+
+    def broken(*args, **kwargs):
+        raise error
+
+    refreshed = []
+    real_refresh = app_module.refresh_plan_throttled
+    monkeypatch.setattr(practice, "next_variant_item", broken)
+    monkeypatch.setattr(app_module, "refresh_plan_throttled",
+                        lambda conn, now: (refreshed.append(now), real_refresh(conn, now)))
+    r = c.post("/api/answer", json={"question_id": 2, "chosen_index": 1})
+    assert r.status_code == 200, r.text
+    fb = r.json()
+    assert (fb["correct"], fb["requeue"], fb["requeue_item"]) == (False, True, None)
+    assert [(a["question_id"], a["correct"]) for a in answers(conn)] == [(2, 0)]
+    assert len(refreshed) == 1
+    assert type(error).__name__ in caplog.text
+    assert str(error) not in caplog.text
+
+
+def test_variant_is_graded_against_its_own_row(env):
+    """Cada variante se corrige con su propia clave: opciones, correcta y `check_expr` propios."""
+    c, conn = env["client"], env["conn"]
+    add_question(conn, 1, check_expr="6", options=("6", "5", "7"), correct=0)
+    add_question(conn, 2, check_expr="9", options=("8", "10", "9"), correct=2)
+    conn.execute("UPDATE question SET variant_group = 1, typed_safe = 1 WHERE id IN (1, 2)")
+    conn.commit()
+    # Opciones: la posición 2 es la correcta de la variante y un error en la original.
+    fb = c.post("/api/answer", json={"question_id": 2, "chosen_index": 2}).json()
+    assert (fb["correct"], fb["correct_index"]) == (True, 2)
+    fb = c.post("/api/answer", json={"question_id": 2, "chosen_index": 0}).json()
+    assert (fb["correct"], fb["correct_index"]) == (False, 2)
+    # Escrita: vale el 9 de la variante, no el 6 de la original.
+    assert typed(c, "9", qid=2).json()["correct"] is True
+    assert typed(c, "6", qid=2).json()["correct"] is False
+    assert [(a["question_id"], a["correct"]) for a in answers(conn)] == [(2, 1), (2, 0), (2, 1), (2, 0)]

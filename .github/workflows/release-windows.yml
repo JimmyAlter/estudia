@@ -17,6 +17,7 @@ on:
     paths:
       - "packaging/**"
       - "scripts/version_from_tag.py"
+      - "scripts/render_release_notes.py"
       - ".github/workflows/release-windows.yml"
   workflow_dispatch:
     inputs:
@@ -171,12 +172,35 @@ jobs:
             throw ("El instalador pesa {0:N1} MB y el máximo es {1} MB" -f $mb, $env:MAX_INSTALLER_MB)
           }
           "SETUP=$((Resolve-Path $setup).Path)" >> $env:GITHUB_ENV
+          $hash = (Get-FileHash -Path $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "SHA-256: $hash"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: instalador
         with:
           name: EstudiaSetup-${{ env.VERSION }}
           path: dist/EstudiaSetup-${{ env.VERSION }}.exe
           if-no-files-found: error
+
+      # Firma con SignPath Foundation (D3). APAGADO hasta que el dueño tenga la cuenta.
+      # Para prenderlo:
+      #  1. En SignPath: proyecto "estudia", política "release-signing" y este repo como origen confiable.
+      #  2. En el repo: secreto SIGNPATH_API_TOKEN y variable SIGNPATH_ORGANIZATION_ID.
+      #  3. Cambiar `if: ${{ false }}` por `if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}`.
+      #  4. Apuntar SETUP al .exe firmado (dist/firmado) antes de las pruebas: lo que se prueba,
+      #     se sube y se le calcula el SHA-256 tiene que ser el firmado.
+      # La acción está fijada al commit del tag v1.3 (último v1.x). Existe una v2: revisarla al prenderlo.
+      - name: Firmar con SignPath (apagado, D3)
+        if: ${{ false }}
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: estudia
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.instalador.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/firmado
 
       - name: "Prueba: instalar"
         run: |
@@ -500,7 +524,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-          sparse-checkout: packaging/windows/release-notes.md
+          sparse-checkout: |
+            packaging/windows/release-notes.md
+            scripts/render_release_notes.py
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -529,6 +555,19 @@ jobs:
           }
           Write-Host "El tag $env:TAG apunta a $sha, el commit que se armó"
 
+      - name: Notas con el SHA-256
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $setup = Join-Path 'release' "EstudiaSetup-$env:VERSION.exe"
+          if (-not (Test-Path $setup)) { throw "No llegó $setup desde el job build" }
+          # El hash es del .exe que llegó de build: el mismo que se sube al release.
+          $hash = (Get-FileHash -Path $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "SHA-256: $hash"
+          python3 scripts/render_release_notes.py --template packaging/windows/release-notes.md --version $env:VERSION --sha256 $hash --out release-notes.rendered.md
+
       - name: Crear o actualizar el release
         env:
           VERSION: ${{ needs.build.outputs.version }}
@@ -540,10 +579,14 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "El release $env:TAG ya existe: se reemplaza el instalador"
             gh release upload "$env:TAG" "$setup" --clobber
+            if ($LASTEXITCODE -eq 0) {
+              # Que las notas lleven el hash del instalador nuevo.
+              gh release edit "$env:TAG" --notes-file release-notes.rendered.md
+            }
           } else {
             Write-Host "Creando el release $env:TAG"
             gh release create "$env:TAG" "$setup" --target "$env:GITHUB_SHA" `
-              --title "Estudia $env:VERSION" --notes-file packaging/windows/release-notes.md
+              --title "Estudia $env:VERSION" --notes-file release-notes.rendered.md
           }
           if ($LASTEXITCODE -ne 0) { throw "gh terminó con código $LASTEXITCODE" }
           Write-Host "Publicado: https://github.com/$env:GH_REPO/releases/tag/$env:TAG"

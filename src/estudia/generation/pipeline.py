@@ -6,6 +6,12 @@ distintas, la respuesta a ciegas coincide con `correct_index` y, cuando hay
 descarta y no se guarda. La pasada a ciegas va en un pedido por lote de hasta
 BLIND_BATCH_MAX clases y nunca con un modelo que haya analizado alguna de ellas.
 Un documento pasa exactamente por la misma verificación que un video.
+
+Variantes numéricas (etapa 3c): de una original con plantilla se arman hasta 4 variantes en
+el worker de SymPy; cada una pasa `_passes_local_checks` y va en el mismo pedido a ciegas que
+las originales. Se guardan solo si la original pasó y el modelo acertó todas las del grupo.
+Ante cualquier duda (worker caído, respuesta ilegible, una variante errada) no se guarda
+ninguna variante del grupo; la original sigue su camino de siempre.
 """
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import random
 import re
 import sqlite3
 import time
@@ -40,6 +47,7 @@ from estudia.ai.base import (
 )
 from estudia.ai.quota import (
     BLIND_BATCH_MAX,
+    BLIND_ITEMS_MAX,
     can_analyze,
     can_analyze_document,
     prune_usage,
@@ -57,7 +65,9 @@ from estudia.config import (
 )
 from estudia.generation.notation import sentence_case, student_math
 from estudia.ai.gate import AIBlocked
-from estudia.generation.verify import check_math_tristate, typed_accepts_option
+from estudia.generation import verify
+from estudia.generation.variants import VariantQuestion, build_variants
+from estudia.generation.verify import WorkerUnavailable, check_math_tristate, typed_accepts_option
 from estudia.material.documents import DocumentBusy, pdf_pages_bytes, slides_text
 from estudia.material.files import (
     FAIL_DOWNLOAD,
@@ -197,20 +207,38 @@ def _passes_local_checks(question) -> bool:
     return True
 
 
-def blind_matches(provider: AIProvider, questions: list, exclude_models) -> list[bool]:
+def _blind_rng(items: list[tuple[str, list[str]]]) -> random.Random:
+    """El sorteo que mezcla las opciones de un pedido a ciegas. Reproducible: la semilla sale
+    del pedido (el mismo pedido se manda igual)."""
+    seed = hashlib.sha256(json.dumps(items, ensure_ascii=False).encode()).hexdigest()
+    return random.Random(seed)
+
+
+def blind_matches(provider: AIProvider, questions: list, exclude_models,
+                  rng: random.Random | None = None) -> list[bool]:
     """Pasada a ciegas en un pedido: True para cada pregunta que el modelo acierta.
 
-    Solo enunciado y opciones. Si no vuelve una respuesta por pregunta no se puede
+    Solo enunciado y opciones, con las opciones de cada pregunta mezcladas: el lugar de la
+    correcta (el mismo en una original y en sus variantes) no da pistas. La respuesta se lleva
+    de vuelta al orden de la pregunta. Si no vuelve una respuesta por pregunta no se puede
     saber cuál es cuál: ninguna pasa. Deja pasar Quota/Unavailable/Auth/Format.
     """
     if not questions:
         return []
-    answers = provider.answer_blind_batch(
-        [(q.stem, list(q.options)) for q in questions], exclude_models=exclude_models
-    )
+    plain = [(q.stem, list(q.options)) for q in questions]
+    rng = rng if rng is not None else _blind_rng(plain)
+    orders, items = [], []
+    for stem, options in plain:
+        order = list(range(len(options)))
+        rng.shuffle(order)
+        orders.append(order)
+        items.append((stem, [options[i] for i in order]))
+    answers = provider.answer_blind_batch(items, exclude_models=exclude_models)
     if len(answers) != len(questions):
         return [False] * len(questions)
-    return [a is not None and a == q.correct_index for q, a in zip(questions, answers)]
+    # Solo un entero dentro de las opciones cuenta (ni True, ni "0", ni un lugar que no existe).
+    return [type(a) is int and 0 <= a < len(order) and order[a] == q.correct_index
+            for q, a, order in zip(questions, answers, orders)]
 
 
 def _local_candidates(analysis: VideoAnalysis | DocumentAnalysis) -> list:
@@ -521,18 +549,52 @@ def _shift_pages(summary_md: str, offset: int, first: int = 1, last: int | None 
     return _PAGE_MARK.sub(replace, summary_md)
 
 
+def _insert_variants(conn, material_id: int, tid: int, head_id: int, row, document: bool,
+                     variants: list[VariantQuestion]) -> int:
+    """Guarda las variantes de un grupo (ya verificadas a ciegas); devuelve cuántas entraron."""
+    stored = 0
+    for v in variants:
+        text = student_question(v.stem, v.options, v.explanation, v.common_error)
+        if text is None:
+            continue
+        source_page = _document_page(row, v.source_page) if document else None
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO question(material_id, topic_id, stem, options_json,"
+            " correct_index, explanation, common_error, source_seconds, source_page,"
+            " check_expr, verified, retired, dedupe_key, variant_group, variant_values_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,1,0,?,?,?)",
+            (
+                material_id, tid, text.stem, json.dumps(text.options, ensure_ascii=False),
+                v.correct_index, text.explanation, text.common_error,
+                None if document else v.source_seconds, source_page,
+                v.check_expr, dedupe_key(material_id, text.stem),
+                head_id, json.dumps(v.values),
+            ),
+        )
+        stored += cur.rowcount
+    return stored
+
+
 def _finalize(conn, material_id: int, analysis: VideoAnalysis | DocumentAnalysis,
-              kept: list) -> ProcessResult:
+              kept: list, variants: list[list[VariantQuestion]] | None = None) -> ProcessResult:
     """Escribe temas, preguntas verificadas, tramos y `done` en una sola transacción.
 
     Un documento guarda la página citada (la del documento entero) y no tiene segundos
-    ni tramos; un video, al revés.
+    ni tramos; un video, al revés. `variants` va alineado con `kept`: las variantes ya
+    verificadas de cada original. Se guardan solo si la original entró recién; la original
+    queda como cabeza del grupo (`variant_group` = su id) si entró al menos una variante.
+    `ProcessResult` cuenta solo las originales.
     """
+    if variants is None:
+        variants = [[] for _ in kept]
     row = _material_row(conn, material_id)
     course_id = row["course_id"]
     document = is_document(row["kind"])
     stored = 0
     try:
+        if len(variants) != len(kept):
+            raise ValueError("variants no está alineado con kept")
+        heads = []   # (original, tema, id, variantes) de las originales que entraron recién
         analysis_tids = []
         for name in analysis.topics:
             tid = _topic_id(conn, course_id, name)
@@ -542,7 +604,7 @@ def _finalize(conn, material_id: int, analysis: VideoAnalysis | DocumentAnalysis
                     "INSERT OR IGNORE INTO material_topic(material_id, topic_id) VALUES (?, ?)",
                     (material_id, tid),
                 )
-        for q in kept:
+        for q, group in zip(kept, variants):
             tid = _topic_id(conn, course_id, q.topic)
             if tid is not None:
                 # El tema de la pregunta puede no estar en `topics`: igual queda ligado a la clase.
@@ -573,6 +635,15 @@ def _finalize(conn, material_id: int, analysis: VideoAnalysis | DocumentAnalysis
                 ),
             )
             stored += cur.rowcount  # 0 si ya estaba (mismo enunciado)
+            if cur.rowcount == 1 and group:
+                heads.append((q, tid, cur.lastrowid, group))
+        # Las variantes van después de todas las originales: una variante con el enunciado de
+        # otra original de la clase no le gana el lugar.
+        for q, tid, head_id, group in heads:
+            if _insert_variants(conn, material_id, tid, head_id, row, document, group):
+                original_values = dict(zip((p.name for p in q.variant.params), q.variant.original))
+                conn.execute("UPDATE question SET variant_group=?, variant_values_json=? WHERE id=?",
+                             (head_id, json.dumps(original_values), head_id))
         segments = getattr(analysis, "segments", None)
         segments_json = (json.dumps([s.model_dump() for s in segments], ensure_ascii=False)
                          if segments else None)
@@ -610,8 +681,59 @@ def paid_batches(conn: sqlite3.Connection, material_ids: list[int]) -> list[list
             for i in range(0, len(ids), BLIND_BATCH_MAX)]
 
 
+def _candidate_variants(loaded: list) -> list[list[list[VariantQuestion]]]:
+    """Las variantes (todavía sin pasada a ciegas) de cada candidata de cada clase, alineadas.
+
+    Corre después de los controles locales de todas las originales: un tiempo agotado del
+    worker acá (que lo deja en backoff) no puede tumbar a ninguna original. Con el worker en
+    backoff no se arma ninguna, y el primer `WorkerUnavailable` corta las del resto del lote.
+    El pedido a ciegas lleva como mucho BLIND_ITEMS_MAX preguntas: las originales van todas y
+    las variantes ocupan solo el lugar que sobra (un grupo puede quedar recortado).
+    """
+    room = max(0, BLIND_ITEMS_MAX - sum(len(candidates) for _, _, candidates in loaded))
+    healthy = True
+    result = []
+    for _, _, candidates in loaded:
+        own = []
+        for q in candidates:
+            group: list[VariantQuestion] = []
+            if healthy and room > 0 and getattr(q, "variant", None) is not None:
+                if not verify.worker_available():
+                    healthy = False
+                else:
+                    try:
+                        group = build_variants(q, _passes_local_checks)[:room]
+                    except WorkerUnavailable:
+                        log.info("El worker de SymPy no anda: este lote queda sin variantes")
+                        healthy = False
+                    except Exception as exc:  # noqa: BLE001 - una plantilla rara no tumba la clase
+                        log.warning("No se pudieron armar variantes (%s)", type(exc).__name__)
+            room -= len(group)
+            own.append(group)
+        result.append(own)
+    return result
+
+
+def _no_variants(loaded: list) -> list[list[list[VariantQuestion]]]:
+    return [[[] for _ in candidates] for _, _, candidates in loaded]
+
+
+def _load_candidates(conn: sqlite3.Connection, material_ids: list[int]) -> list:
+    """(material, análisis, candidatas) de cada clase: las candidatas ya pasaron los controles
+    locales. Se calcula una sola vez por lote: después de los trabajos de variantes el worker
+    puede quedar en backoff y una segunda revisión rechazaría originales que sí valen."""
+    loaded = []
+    for material_id in material_ids:
+        row = _material_row(conn, material_id)
+        if not row["analysis_json"]:
+            raise LookupError(f"material {material_id} sin análisis guardado")
+        analysis = load_analysis(row["kind"], row["analysis_json"])
+        loaded.append((material_id, analysis, _local_candidates(analysis)))
+    return loaded
+
+
 def verify_batch(conn: sqlite3.Connection, provider: AIProvider,
-                 material_ids: list[int]) -> list[ProcessResult]:
+                 material_ids: list[int], with_variants: bool = True) -> list[ProcessResult]:
     """Pasada a ciegas de un lote de clases ya analizadas, en un solo pedido.
 
     El pedido excluye el modelo de análisis de todas las clases del lote (si no queda
@@ -620,25 +742,65 @@ def verify_batch(conn: sqlite3.Connection, provider: AIProvider,
     candidatos se cierra sin pedido. Quota/Unavailable/Auth se propagan sin escribir nada.
     Una respuesta inservible con más de una clase en el pedido se reintenta clase por
     clase; con una sola, la clase queda `failed` (formato).
+
+    Las variantes de las candidatas van en el mismo pedido, después de todas las originales
+    (hasta BLIND_ITEMS_MAX preguntas en total). Un grupo guarda sus variantes solo si el
+    modelo acertó la original y cada variante. Los controles locales de las originales
+    corren una sola vez: todo reintento (sin variantes, de a una clase o tras un error
+    inesperado en un lote) usa las mismas candidatas, sin variantes.
     """
-    loaded = []
-    for material_id in material_ids:
-        row = _material_row(conn, material_id)
-        if not row["analysis_json"]:
-            raise LookupError(f"material {material_id} sin análisis guardado")
-        analysis = load_analysis(row["kind"], row["analysis_json"])
-        loaded.append((material_id, analysis, _local_candidates(analysis)))
-    exclude = tuple(dict.fromkeys(_analysis_model_of(conn, mid) for mid in material_ids))
-    questions = [q for _, _, candidates in loaded for q in candidates]
+    loaded = _load_candidates(conn, material_ids)
+    built = _candidate_variants(loaded) if with_variants else _no_variants(loaded)
+    if len(loaded) == 1:
+        return _blind_pass(conn, provider, loaded, built)
     try:
-        matches = blind_matches(provider, questions, exclude)
+        return _blind_pass(conn, provider, loaded, built)
+    except (AIQuotaError, AIUnavailableError, AIAuthError, AIBlocked):
+        raise
+    except Exception as exc:  # noqa: BLE001 - una clase rota no traba a las demás
+        conn.rollback()
+        log.warning("Falló un lote a ciegas (%s); se reintenta de a una clase", type(exc).__name__)
+        pending = set(_still_pending(conn, [mid for mid, _, _ in loaded]))
+        return [result for entry in loaded if entry[0] in pending
+                for result in _blind_pass_alone(conn, provider, entry)]
+
+
+def _blind_pass_alone(conn: sqlite3.Connection, provider: AIProvider, entry) -> list[ProcessResult]:
+    """Una clase ya cargada, sola y sin variantes: un error inesperado la deja `failed` sin
+    trabar a las demás. Quota/Unavailable/Auth y la puerta de edad se propagan."""
+    try:
+        return _blind_pass(conn, provider, [entry], _no_variants([entry]))
+    except (AIQuotaError, AIUnavailableError, AIAuthError):
+        raise
+    except AIBlocked:
+        conn.rollback()
+        raise
+    except Exception as exc:  # noqa: BLE001 - un material roto no traba la cola
+        conn.rollback()
+        _fail_unexpected(conn, entry[0], exc)
+        return [ProcessResult(0, 0, "failed")]
+
+
+def _blind_pass(conn: sqlite3.Connection, provider: AIProvider, loaded: list,
+                built: list[list[list[VariantQuestion]]]) -> list[ProcessResult]:
+    """El pedido a ciegas y el cierre de cada clase, con candidatas ya revisadas (`loaded`) y
+    sus variantes (`built`, alineadas)."""
+    exclude = tuple(dict.fromkeys(_analysis_model_of(conn, mid) for mid, _, _ in loaded))
+    questions = [q for _, _, candidates in loaded for q in candidates]
+    variant_questions = [v for own in built for group in own for v in group]
+    try:
+        matches = blind_matches(provider, questions + variant_questions, exclude)
     except AIFormatError:
+        if variant_questions:
+            # Las originales no se pierden por las variantes: se repite una vez sin ellas.
+            log.info("Pasada a ciegas ilegible con variantes; se repite sin ellas")
+            return _blind_pass(conn, provider, loaded, _no_variants(loaded))
         asked = [mid for mid, _, candidates in loaded if candidates]
         if len(asked) > 1:
             # No se sabe qué clase rompió la respuesta: cada una va sola.
             log.info("Pasada a ciegas ilegible para %d clases; se reintenta de a una", len(asked))
-            # Por la cola: un error inesperado deja esa clase `failed` y no la vuelve a pedir.
-            return [result for mid in material_ids for result in _verify_in_queue(conn, provider, [mid])]
+            # Un error inesperado deja esa clase `failed` y no la vuelve a pedir.
+            return [result for entry in loaded for result in _blind_pass_alone(conn, provider, entry)]
         results = []
         for mid, analysis, candidates in loaded:
             if candidates:
@@ -648,13 +810,23 @@ def verify_batch(conn: sqlite3.Connection, provider: AIProvider,
             else:
                 results.append(_finalize(conn, mid, analysis, []))
         return results
+    original_matches = matches[:len(questions)]
+    variant_matches = iter(matches[len(questions):])
     results = []
     offset = 0
-    for material_id, analysis, candidates in loaded:
-        own = matches[offset:offset + len(candidates)]
+    for (material_id, analysis, candidates), own_variants in zip(loaded, built):
+        own = original_matches[offset:offset + len(candidates)]
         offset += len(candidates)
-        kept = [q for q, ok in zip(candidates, own) if ok]
-        results.append(_finalize(conn, material_id, analysis, kept))
+        kept, kept_variants = [], []
+        for q, ok, group in zip(candidates, own, own_variants):
+            # Se consumen siempre, para no correr las respuestas de los grupos siguientes.
+            group_ok = [next(variant_matches) for _ in group]
+            if not ok:
+                continue
+            kept.append(q)
+            # Una variante errada (o sin respuesta) pone en duda la plantilla: ninguna del grupo.
+            kept_variants.append(group if all(group_ok) else [])
+        results.append(_finalize(conn, material_id, analysis, kept, kept_variants))
     return results
 
 
@@ -768,7 +940,7 @@ def _fail_unexpected(conn: sqlite3.Connection, material_id: int, exc: Exception)
 
 
 def _verify_in_queue(conn: sqlite3.Connection, provider: AIProvider,
-                     material_ids: list[int]) -> list[ProcessResult]:
+                     material_ids: list[int], with_variants: bool = True) -> list[ProcessResult]:
     """`verify_batch` dentro de la cola: un error inesperado no traba a las demás clases.
 
     Con un lote de varias, las que siguen pendientes se reintentan de a una; una sola
@@ -776,7 +948,7 @@ def _verify_in_queue(conn: sqlite3.Connection, provider: AIProvider,
     propagan.
     """
     try:
-        return verify_batch(conn, provider, material_ids)
+        return verify_batch(conn, provider, material_ids, with_variants)
     except (AIQuotaError, AIUnavailableError, AIAuthError):
         raise
     except AIBlocked:
@@ -789,8 +961,9 @@ def _verify_in_queue(conn: sqlite3.Connection, provider: AIProvider,
             _fail_unexpected(conn, material_ids[0], exc)
             return [ProcessResult(0, 0, "failed")]
         log.warning("Falló un lote a ciegas (%s); se reintenta de a una clase", type(exc).__name__)
+        # Sin variantes: no se arman trabajos nuevos que dejen el worker en backoff.
         return [result for material_id in _still_pending(conn, material_ids)
-                for result in _verify_in_queue(conn, provider, [material_id])]
+                for result in _verify_in_queue(conn, provider, [material_id], with_variants=False)]
 
 
 def _still_pending(conn: sqlite3.Connection, material_ids: list[int]) -> list[int]:

@@ -1,13 +1,13 @@
 """Dominio por tema: probabilidad estimada de recordar sus preguntas en un instante dado.
 
 `P(tema, t) = Σ R_q(t) / max(vistas, min(total, 8))`, con R_q la recuperabilidad FSRS de cada
-pregunta vista. Las no vistas cuentan 0, así que hacen falta al menos 8 preguntas vistas (o
+tarjeta vista. Un grupo de variantes es una sola tarjeta: cuenta una vez, en el total y en las vistas. Las no vistas cuentan 0, así que hacen falta al menos 8 preguntas vistas (o
 todas, si el tema tiene menos) para llegar a 100 %. Una pregunta en reaprendizaje aporta como
 mucho 0,5 hasta graduarse. Solo cuentan las preguntas verificadas y no retiradas.
 """
 import sqlite3
 
-from estudia.study.srs import STATE_RELEARNING, exam_dates_by_topic, retrievability
+from estudia.study.srs import CARD_KEY_SQL, HEAD, STATE_RELEARNING, exam_dates_by_topic, retrievability
 
 MIN_SEEN = 8            # preguntas vistas que hacen falta para poder llegar a 100 %
 RELEARNING_CAP = 0.5    # tope de lo que aporta una pregunta en reaprendizaje
@@ -23,12 +23,13 @@ def topic_probability(conn: sqlite3.Connection, topic_id: int, at: int) -> float
     Solo lee `review_state`, que `connect` y cada respuesta registrada mantienen al día.
     """
     total = conn.execute(
-        f"SELECT COUNT(*) FROM question q WHERE q.topic_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}",
+        f"SELECT COUNT(*) FROM question q WHERE q.topic_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}"
+        f" AND {HEAD}",
         (topic_id,),
     ).fetchone()[0]
     rows = conn.execute(
         "SELECT rs.stability, rs.last_review, rs.state FROM review_state rs "
-        "JOIN question q ON rs.card_key = 'q:' || q.id "
+        f"JOIN question q ON rs.card_key = {CARD_KEY_SQL} AND {HEAD} "
         f"WHERE q.topic_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}",
         (topic_id,),
     ).fetchall()

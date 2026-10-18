@@ -253,3 +253,51 @@ def test_predictions_use_the_style_mock_in_the_real_scale(conn):
 def test_style_not_ready_text_says_singular():
     assert style_not_ready_text(1) == "Todavía falta 1 pregunta con el formato de tu cátedra. Se prepara sola."
     assert style_not_ready_text(3) == "Todavía faltan 3 preguntas con el formato de tu cátedra. Se preparan solas."
+
+
+def test_style_mock_takes_one_variant_per_group_and_agrees_with_gaps(conn):
+    """Un grupo de variantes del campus llena un solo lugar, como lo cuenta `style_gaps`."""
+    exam_id = make_exam(conn, [("opcion_multiple", 4, 1)])
+    for qid in (1, 2, 3):
+        add_campus(conn, qid)
+    conn.execute("UPDATE question SET variant_group = 1 WHERE id IN (1, 2, 3)")
+    conn.commit()
+    add_campus(conn, 4)
+    add_campus(conn, 5, topic_id=2)
+    add_style(conn, 50, exam_id, "opcion_multiple")
+    assert style_gaps(conn, exam_id) == {"opcion_multiple": 0}   # 3 tarjetas del campus + 1 de estilo
+    for now in (NOW, NOW + 1, NOW + 2, NOW + 3):
+        items = start_mock(conn, exam_id, now, style=True).items
+        assert len(items) == 4
+        assert len({i.card_key for i in items}) == 4
+        assert len({i.question_id for i in items} & {1, 2, 3}) == 1
+    # Con un lugar más ya falta 1, y el simulacro lo dice igual que `style_gaps`.
+    exam_2 = make_exam(conn, [("opcion_multiple", 5, 1)])
+    add_style(conn, 51, exam_2, "opcion_multiple")
+    assert style_gaps(conn, exam_2) == {"opcion_multiple": 1}
+    with pytest.raises(NotEnoughQuestions, match="falta 1 pregunta"):
+        start_mock(conn, exam_2, NOW, style=True)
+
+
+def test_style_mock_one_member_per_card_across_groups(conn, monkeypatch):
+    """Una tarjeta llena un solo lugar en todo el simulacro, también entre dos grupos que aceptan las
+    mismas preguntas. Hoy `ExamStyle` no deja repetir un tipo; el estilo se arma sin validar para
+    probar la defensa de `_pick_style`."""
+    from estudia.study import mock_exam
+
+    exam_id = make_exam(conn, [("opcion_multiple", 4, 1)])
+    for qid in (1, 2, 3, 4, 5):
+        add_campus(conn, qid)
+    conn.execute("UPDATE question SET variant_group = 1 WHERE id IN (1, 2, 3, 4, 5)")
+    conn.commit()
+    for qid in (6, 7, 8):
+        add_campus(conn, qid, topic_id=2)
+    twice = ExamStyle.model_construct(
+        groups=[StyleGroup(kind="opcion_multiple", count=2, points_each=1),
+                StyleGroup(kind="opcion_multiple", count=2, points_each=1)],
+        minutes=None, max_grade=None, topic_ids=[1, 2])
+    monkeypatch.setattr(mock_exam, "saved_style", lambda conn, exam_id: twice)
+    monkeypatch.setattr(mock_exam, "style_gaps", lambda conn, exam_id: {})
+    for now in range(NOW, NOW + 12):
+        items = start_mock(conn, exam_id, now, style=True).items
+        assert len(items) == len({i.card_key for i in items}) == 4

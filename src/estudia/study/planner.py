@@ -31,7 +31,7 @@ from estudia.study.sessions import (
     session_topics,
     split_minutes,
 )
-from estudia.study.srs import GUESS, NEAR_EXAM_DAYS, sync_review_state
+from estudia.study.srs import CARD_KEY_SQL, GUESS, HEAD, NEAR_EXAM_DAYS, sync_review_state
 
 DEFAULT_START_MIN = 1140   # 19:00
 BREAK_MIN = 10             # descanso entre bloques seguidos
@@ -522,14 +522,15 @@ def mark_done_from_answers(conn: sqlite3.Connection, now: int) -> int:
 # --- ¿Llegás? ----------------------------------------------------------------------------------
 
 def _due_before(conn: sqlite3.Connection, topic_ids: list[int], at: int) -> dict[int, int]:
-    """Tema → preguntas (verificadas, no retiradas) cuyo repaso vence antes de `at`."""
+    """Tema → tarjetas (de preguntas verificadas y no retiradas) cuyo repaso vence antes de `at`.
+    Un grupo de variantes cuenta una vez."""
     if not topic_ids:
         return {}
     return {
         r["topic_id"]: r["n"]
         for r in conn.execute(
-            f"SELECT q.topic_id, COUNT(*) AS n FROM review_state rs JOIN question q ON rs.card_key = 'q:' || q.id "
-            f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} AND rs.due < ? "
+            f"SELECT q.topic_id, COUNT(*) AS n FROM review_state rs JOIN question q ON rs.card_key = {CARD_KEY_SQL} "
+            f"WHERE {HEAD} AND q.verified = 1 AND q.retired = 0 AND {REGULAR} AND rs.due < ? "
             f"AND q.topic_id IN ({','.join('?' * len(topic_ids))}) GROUP BY q.topic_id",
             (at, *topic_ids),
         )

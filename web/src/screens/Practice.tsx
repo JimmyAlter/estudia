@@ -25,6 +25,8 @@ interface Props {
   /** Si la práctica es una sesión del plan: para el encabezado de cada fase. */
   session?: SessionInfo;
   onExit: () => void;
+  /** La materia de ejemplo no tiene clases: no se piden los materiales, que son de las materias reales. */
+  demo?: boolean;
 }
 
 /** Pregunta con sus opciones en el orden en que se muestran (`order[i]` = índice original). */
@@ -56,6 +58,11 @@ export function shuffled(length: number): number[] {
   return order;
 }
 
+/** La tarjeta de repaso de un ítem: `v:<grupo>` o `q:<id>`. */
+function cardKeyOf(q: QuizItem): string {
+  return q.card_key || `q:${q.question_id}`;
+}
+
 /** Cada intento mezcla las opciones de nuevo, también al repetir lo fallado. */
 function withShuffledOptions(quiz: QuizItem[]): Shown[] {
   return quiz.map((q) => ({ ...q, order: shuffled(q.options.length), key: nextKey++ }));
@@ -78,7 +85,7 @@ function markSeen(name: string) {
   }
 }
 
-export default function Practice({ params, session, onExit }: Props) {
+export default function Practice({ params, session, onExit, demo = false }: Props) {
   const [items, setItems] = useState<Shown[] | null>(null);
   const [index, setIndex] = useState(0);
   /** Las opciones están a la vista (en "pensalo primero" y en las escritas, recién al pedirlas). */
@@ -105,6 +112,8 @@ export default function Practice({ params, session, onExit }: Props) {
    * `compare` con lo escrito a la vista, `done` cuando ya contestó o salteó.
    */
   const [explain, setExplain] = useState<{ step: "ask" | "compare" | "done"; text: string } | null>(null);
+  /** La que vuelve al final después de un error: entra en la ronda recién al seguir, así la cuenta no se mueve mientras se lee. */
+  const requeued = useRef<Shown | null>(null);
   const shownAt = useRef(Date.now());
   const revealedMs = useRef<number | null>(null);
   const feedbackRef = useRef<HTMLElement>(null);
@@ -119,6 +128,7 @@ export default function Practice({ params, session, onExit }: Props) {
     const shown = withShuffledOptions(quiz);
     setItems(shown);
     setIndex(0);
+    requeued.current = null;
     setFeedback(null);
     setResults([]);
     setReported([]);
@@ -144,6 +154,7 @@ export default function Practice({ params, session, onExit }: Props) {
 
   // Nombres de las clases, para citar la fuente de cada pregunta.
   useEffect(() => {
+    if (demo) return;
     let alive = true;
     api
       .materials()
@@ -158,7 +169,7 @@ export default function Practice({ params, session, onExit }: Props) {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [demo]);
 
   // Cada pregunta nueva empieza de cero (en el mismo render, para que no se vean las opciones
   // de "pensalo primero" ni un instante): opciones según el formato, nada marcado, reloj en cero.
@@ -244,10 +255,13 @@ export default function Practice({ params, session, onExit }: Props) {
         setFeedback(fb);
         setExplain(fb.explain_prompt && fb.answer_id != null ? { step: "ask", text: "" } : null);
         setAnsweredText(typing ? typed : null);
-        setResults((r) => (r.some((x) => x.item.question_id === item.question_id) ? r : [...r, { item, correct: fb.correct }]));
+        // Cada tarjeta cuenta una vez: una variante que vuelve es la misma tarjeta.
+        const card = cardKeyOf(item);
+        setResults((r) => (r.some((x) => cardKeyOf(x.item) === card) ? r : [...r, { item, correct: fb.correct }]));
         if (fb.requeue) {
-          // Vuelve al final de la sesión, con las opciones mezcladas de nuevo.
-          setItems((list) => [...list!, ...withShuffledOptions([item])]);
+          // Vuelve al final de la sesión: otra variante si la API la mandó, con sus propias opciones mezcladas.
+          const again = fb.requeue_item ? { ...fb.requeue_item, phase: item.phase } : item;
+          requeued.current = withShuffledOptions([again])[0];
         }
         if (fb.relearn_progress && firstTime("relearn")) {
           setRelearnNote(true);
@@ -278,6 +292,9 @@ export default function Practice({ params, session, onExit }: Props) {
   );
 
   const next = useCallback(() => {
+    const again = requeued.current;
+    requeued.current = null;
+    if (again) setItems((list) => [...list!, again]);
     setFeedback(null);
     setExplain(null);
     setError(null);
@@ -291,9 +308,12 @@ export default function Practice({ params, session, onExit }: Props) {
     setError(null);
     try {
       await api.retire(item.question_id);
-      // Sale de la ronda y no cuenta para el resultado; la siguiente queda en su lugar.
-      setItems((list) => list!.filter((q) => q.question_id !== item.question_id));
-      setResults((r) => r.filter((x) => x.item.question_id !== item.question_id));
+      // Se retira la tarjeta entera (todo el grupo de variantes): sale de lo que queda de la ronda
+      // y no cuenta para el resultado. Lo ya pasado no se toca, así la siguiente queda en su lugar.
+      const card = cardKeyOf(item);
+      setItems((list) => [...list!.slice(0, index), ...list!.slice(index).filter((q) => cardKeyOf(q) !== card)]);
+      if (requeued.current && cardKeyOf(requeued.current) === card) requeued.current = null;
+      setResults((r) => r.filter((x) => cardKeyOf(x.item) !== card));
       setReported((r) => [...r, item.question_id]);
       setFeedback(null);
       setUndo(item);
@@ -427,7 +447,10 @@ export default function Practice({ params, session, onExit }: Props) {
       {phase && <p className="mb-2 text-sm font-medium">{phase}</p>}
       {mixNote && current.phase === "review" && <p className="mb-5 max-w-xl text-sm text-muted">{MIX_NOTE}</p>}
       <Label className="mb-4">
-        {current.topic} · <span className="whitespace-nowrap">{number}</span>
+        {current.topic}
+        {/* A 360 px la cuenta va en su renglón: sin el punto, que quedaría suelto al final. */}
+        <span className="hidden sm:inline"> · </span>
+        <span className="block whitespace-nowrap sm:inline">{number}</span>
       </Label>
 
       <h1 className="math mb-7 text-[1.45rem] leading-snug tracking-[-0.01em]">{keepMath(current.stem)}</h1>
@@ -567,12 +590,18 @@ export default function Practice({ params, session, onExit }: Props) {
           )}
           {explain?.step !== "ask" && (feedback.next_label || feedback.relearn_progress) && (
             <p className="mt-6 text-sm text-muted">
-              {[feedback.next_label, feedback.relearn_progress].filter(Boolean).join(" · ")}
+              {feedback.next_label}
+              {feedback.next_label && feedback.relearn_progress && <span className="hidden sm:inline"> · </span>}
+              {feedback.relearn_progress && (
+                <span className={feedback.next_label ? "block whitespace-nowrap sm:inline" : "whitespace-nowrap"}>
+                  {feedback.relearn_progress}
+                </span>
+              )}
             </p>
           )}
           {relearnNote && explain?.step !== "ask" && <p className="mt-1 text-sm text-muted">{RELEARN_NOTE}</p>}
           <div className={`mt-8 flex flex-wrap items-baseline gap-x-6 gap-y-3 ${explain?.step === "ask" ? "hidden" : ""}`}>
-            <Button onClick={next}>{index + 1 < items.length ? "Siguiente" : "Ver resultado"}</Button>
+            <Button onClick={next}>{index + 1 < items.length || requeued.current ? "Siguiente" : "Ver resultado"}</Button>
             {undoLine ?? (
               <Button variant="quiet" className="text-sm" onClick={report} disabled={busy}>
                 Reportar un error
@@ -720,9 +749,17 @@ function FeedbackBody({
 
   switch (feedback.feedback_style) {
     case "alarm":
-      return (
+      // Escrita: "Escribiste …: no es correcta" ya dice que era otra; primero va la correcta.
+      return typed ? (
         <>
-          <p className="mb-4 font-semibold text-bad">Estabas seguro y era otra. Fijate bien por qué.</p>
+          <p className="mb-4 font-semibold text-bad">Estabas seguro. Mirá por qué.</p>
+          {why}
+          {commonError && <div className="mt-4">{commonError}</div>}
+          {source}
+        </>
+      ) : (
+        <>
+          <p className="mb-4 font-semibold text-bad">Estabas seguro y era otra. Mirá por qué.</p>
           {commonError && <div className="mb-5">{commonError}</div>}
           {why}
           {source}

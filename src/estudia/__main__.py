@@ -107,14 +107,38 @@ def _report_busy() -> None:
 CHECK_WORKER_FLAG = "--check-worker"
 
 
+# Plantilla lineal de prueba para el modo de variantes: f(x) = 2x + 3, ¿f(4)? Está escrita acá
+# (no se importa de los tests) para que `--check-worker` la pruebe en el .exe. Un test comprueba
+# que coincide con `tests/variant_fixtures.py`.
+_CHECK_VARIANTS_PAYLOAD = {
+    "params": [{"name": "a", "low": 2, "high": 9}, {"name": "b", "low": 1, "high": 9},
+               {"name": "c", "low": 2, "high": 9}],
+    "original": [2, 3, 4],
+    "answer_expr": "a*c + b",
+    "distractor_exprs": ["a*(c + b)", "a + b", "a*c"],
+    "explanation": "f({c}) = {a}·{c} + {b} = {respuesta}.",
+    "common_error": "Olvidarse de sumar {b} a {a}·{c}.",
+    "check_expr": "11",
+    "original_options": ["11", "14", "5", "8"],
+    "original_explanation": "f(4) = 2·4 + 3 = 11.",
+    "original_common_error": "Olvidarse de sumar 3 a 2·4.",
+    "correct_index": 0,
+    "fractions": False,
+    "seed": "check-worker",
+    "limit": 4,
+}
+
+
 def _worker_works() -> bool:
-    """El worker de SymPy arranca (forkserver o spawn, también congelado) y corrige bien."""
-    from estudia.generation.verify import check_math_tristate, grade_typed
+    """El worker de SymPy arranca (forkserver o spawn, también congelado), corrige bien y calcula
+    variantes."""
+    from estudia.generation import verify
 
     try:
-        return (check_math_tristate("sqrt(2)", "√2") is True
-                and grade_typed("sqrt(2)", "1.41") is True
-                and grade_typed("sqrt(2)", "1.4") is False)
+        return (verify.check_math_tristate("sqrt(2)", "√2") is True
+                and verify.grade_typed("sqrt(2)", "1.41") is True
+                and verify.grade_typed("sqrt(2)", "1.4") is False
+                and bool(verify.compute_variant_values(_CHECK_VARIANTS_PAYLOAD)))
     except Exception:
         return False
 

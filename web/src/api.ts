@@ -14,6 +14,8 @@ export interface AppState {
   syncing: boolean;
   last_sync_at: number | null;
   last_sync_error: string | null;
+  /** La materia de ejemplo está abierta: solo Inicio y Práctica, sobre su propia base. */
+  demo: boolean;
 }
 
 export interface VersionInfo {
@@ -158,6 +160,8 @@ export interface QuizItem {
   relearning: { day: 1 | 2 | 3 } | null;
   /** En el simulacro con el formato de la cátedra: lo que vale. */
   points?: number | null;
+  /** La tarjeta de repaso: `q:<id>`, o `v:<id de la original>` en un grupo de variantes. */
+  card_key?: string;
 }
 
 /**
@@ -180,6 +184,8 @@ export interface Feedback {
   typed_ok: boolean | null;
   /** Vuelve al final de la sesión. */
   requeue: boolean;
+  /** Con `requeue` en un grupo: otra variante para el final de la sesión (null: vuelve la misma). */
+  requeue_item?: QuizItem | null;
   /** "Vuelve mañana", "Vuelve en 2 días", "La sabés: vuelve en 9 días". */
   next_label: string | null;
   /** "1 de 3 días" mientras está en reaprendizaje. */
@@ -507,6 +513,8 @@ export const api = {
   state: () => request<AppState>("/api/state"),
   version: () => request<VersionInfo>("/api/version"),
   catalog: () => request<Site[]>("/api/catalog"),
+  /** Abre la materia de ejemplo (409 si ya hay un campus conectado). */
+  startDemo: () => post<{ ok: true }>("/api/demo"),
   chooseSite: (siteId: string) => post<{ ok: true }>("/api/site", { site_id: siteId }),
   startLogin: () => post<{ url: string }>("/api/login/start"),
   /** Enlace de vuelta del campus pegado a mano (lleva el token: no se muestra ni se registra). */

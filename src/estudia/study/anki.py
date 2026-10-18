@@ -1,4 +1,7 @@
-"""Exportación a Anki: un mazo por curso con las preguntas verificadas y no retiradas."""
+"""Exportación a Anki: un mazo por curso con las preguntas verificadas y no retiradas.
+
+Un grupo de variantes es una sola tarjeta también en Anki: sale una nota, la de la original (`HEAD`).
+"""
 import hashlib
 import json
 import os
@@ -14,6 +17,7 @@ import genanki
 from estudia.study.citation import DOCUMENT_KINDS, SOURCE_JOIN, source_label
 from estudia.study.exams import exam_topics
 from estudia.study.home import next_exam
+from estudia.study.srs import CARD_KEY_SQL, HEAD
 
 # Lo propio nunca sale de la compu: las preguntas de estilo (origin='parcial_propio') quedan fuera
 # de toda exportación, aunque alguna vez tengan material. Se agrega a las cuatro consultas.
@@ -110,12 +114,13 @@ def _note(r: sqlite3.Row) -> genanki.Note:
 
 
 def weekly_question_ids(conn: sqlite3.Connection, now: int) -> set[int]:
-    """Preguntas verificadas y no retiradas que vencen en `WEEK_DAYS` días, más las de los temas del próximo examen."""
+    """Preguntas verificadas y no retiradas que vencen en `WEEK_DAYS` días, más las de los temas del próximo examen.
+    De un grupo de variantes, solo la original."""
     ids = {
         r[0]
         for r in conn.execute(
-            "SELECT q.id FROM question q JOIN review_state rs ON rs.card_key = 'q:' || q.id"
-            " WHERE q.verified = 1 AND q.retired = 0 AND rs.due < ?"
+            f"SELECT q.id FROM question q JOIN review_state rs ON rs.card_key = {CARD_KEY_SQL}"
+            f" WHERE {HEAD} AND q.verified = 1 AND q.retired = 0 AND rs.due < ?"
             f" AND {EXPORTABLE}",
             (now + WEEK_DAYS * 86400,),
         )
@@ -128,7 +133,7 @@ def weekly_question_ids(conn: sqlite3.Connection, now: int) -> set[int]:
             r[0]
             for r in conn.execute(
                 f"SELECT q.id FROM question q"
-                f" WHERE q.verified = 1 AND q.retired = 0 AND {EXPORTABLE} AND q.topic_id IN ({marks})", topics
+                f" WHERE {HEAD} AND q.verified = 1 AND q.retired = 0 AND {EXPORTABLE} AND q.topic_id IN ({marks})", topics
             )
         )
     return ids
@@ -147,7 +152,7 @@ def build_apkg(conn: sqlite3.Connection, course_id: int | None,
         " (SELECT MIN(fullname) FROM course WHERE id = t.course_id) AS course"
         " FROM question q JOIN topic t ON t.id = q.topic_id JOIN material m ON m.id = q.material_id"
         f" {SOURCE_JOIN}"
-        f" WHERE q.verified = 1 AND q.retired = 0 AND {EXPORTABLE}"
+        f" WHERE {HEAD} AND q.verified = 1 AND q.retired = 0 AND {EXPORTABLE}"
     )
     params: list = []
     if course_id is not None:

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from estudia.study.mastery import REGULAR, exam_horizon, topic_probability
 from estudia.study.pretest import PretestOffer, pretest_offer
+from estudia.study.srs import CARD_KEY_SQL, HEAD
 
 TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 # Con estas preguntas verificadas un curso ya se puede practicar, aunque sigan clases en cola.
@@ -61,15 +62,16 @@ class HomeView:
 
 
 def ready_course(conn: sqlite3.Connection, now: int) -> ReadyCourse | None:
-    """El curso con READY_QUESTIONS o más preguntas verificadas y no retiradas: primero
-    el del próximo examen (el mismo criterio que `next_exam`), después el de más preguntas."""
+    """El curso con READY_QUESTIONS o más preguntas verificadas y no retiradas (un grupo de variantes
+    cuenta una vez): primero el del próximo examen (el mismo criterio que `next_exam`), después el de
+    más preguntas."""
     row = conn.execute(
         "SELECT t.course_id, COUNT(*) AS n,"
         " (SELECT MIN(c.fullname) FROM course c WHERE c.id = t.course_id) AS course,"
         " (SELECT MIN(e.opens_at) FROM exam e WHERE e.course_id = t.course_id AND COALESCE(NULLIF(e.closes_at, 0), e.opens_at) > ? AND COALESCE(e.kind, 'parcial') != 'inscripcion')"
         " AS exam_at"
         " FROM question q JOIN topic t ON t.id = q.topic_id"
-        f" WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR}"
+        f" WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} AND {HEAD}"
         " GROUP BY t.course_id HAVING COUNT(*) >= ?"
         " ORDER BY exam_at IS NULL, exam_at, n DESC, t.course_id LIMIT 1",
         (now, READY_QUESTIONS),
@@ -131,8 +133,8 @@ def home_view(conn: sqlite3.Connection, now: int) -> HomeView:
         r["topic_id"]: (r["seen"], r["total"])
         for r in conn.execute(
             "SELECT q.topic_id, COUNT(*) AS total, COUNT(rs.card_key) AS seen FROM question q "
-            "LEFT JOIN review_state rs ON rs.card_key = 'q:' || q.id "
-            f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} GROUP BY q.topic_id"
+            f"LEFT JOIN review_state rs ON rs.card_key = {CARD_KEY_SQL} "
+            f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} AND {HEAD} GROUP BY q.topic_id"
         )
     }
     # Dominio = probabilidad de saber el tema el día de su examen más próximo (o hoy, si no tiene).

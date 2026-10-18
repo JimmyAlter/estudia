@@ -55,10 +55,10 @@ def test_dev_seed_acepta_el_puerto(dev_seed, monkeypatch, tmp_path):
 def test_la_app_sembrada_muestra_todo_lo_de_la_etapa_3a(seeded):
     conn, now = seeded
     home = home_view(conn, now)
-    # Una clase recién procesada con pretest, y un curso con 12 preguntas mientras falta una clase.
+    # Una clase recién procesada con pretest, y un curso con 13 preguntas (el grupo de variantes cuenta una) mientras falta una clase.
     assert home.pretest is not None and home.pretest.kind == "youtube"
     assert home.processing.pending > 0
-    assert home.ready is not None and home.ready.questions == 12
+    assert home.ready is not None and home.ready.questions == 13
     assert conn.execute("SELECT value FROM kv WHERE key = ?", (STOP_KEY,)).fetchone()[0] == BUDGET
 
     # 25 o más respuestas con confianza (alcanza para calibrar) y un simulacro con predicción y nota real.
@@ -125,3 +125,46 @@ def test_la_app_sembrada_muestra_los_parciales_y_el_formato(seeded):
     # El simulacro de siempre del final cita la página del apunte en la revisión.
     plain = start_mock(conn, final, now)
     assert {11, 12} <= {item.question_id for item in plain.items}
+
+
+def test_la_app_sembrada_muestra_un_grupo_de_variantes(seeded):
+    """Etapa 3c: un grupo de 3 variantes contestado una vez; la práctica trae otro miembro."""
+    from estudia.study.practice import build_quiz
+
+    conn, now = seeded
+    members = conn.execute("SELECT id, stem, options_json, correct_index, check_expr, verified, retired"
+                           " FROM question WHERE variant_group = 13 ORDER BY id").fetchall()
+    assert [m["id"] for m in members] == [13, 14, 15]
+    assert all(m["verified"] == 1 and m["retired"] == 0 for m in members)
+    assert len({m["stem"] for m in members}) == 3
+    for m in members:
+        options = json.loads(m["options_json"])
+        assert len(set(options)) == 4 and options[m["correct_index"]] == m["check_expr"]
+    assert [r[0] for r in conn.execute("SELECT question_id FROM answer WHERE question_id IN (13, 14, 15)")] == [13]
+
+    quiz = build_quiz(conn, 101, topic_id=1, now=now)
+    shown = [item for item in quiz if item.card_key == "v:13"]
+    assert len(shown) == 1 and shown[0].question_id in (14, 15)
+    # En la práctica de toda la materia también aparece (y una sola vez).
+    assert [i.question_id for i in build_quiz(conn, 101, now=now) if i.card_key == "v:13"] in ([14], [15])
+
+
+def test_el_primer_paso_arranca_sin_materias(dev_seed, monkeypatch, tmp_path):
+    """`--step facultad` es una instalación nueva: sin materias, la materia de ejemplo se puede probar."""
+    from fastapi.testclient import TestClient
+
+    seen = {}
+    monkeypatch.setattr(dev_seed.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["dev_seed.py", "--port", "8790", "--step", "facultad"])
+    monkeypatch.setattr(dev_seed.uvicorn, "run", lambda app, host, port, log_level: seen.update(app=app))
+    monkeypatch.setattr(dev_seed.keyring, "set_keyring", lambda backend: None)
+    dev_seed.main()
+    conn = connect(tmp_path / "estudia.db")
+    assert conn.execute("SELECT COUNT(*) FROM course").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM question").fetchone()[0] == 0
+    conn.close()
+    with TestClient(seen["app"], base_url="http://127.0.0.1:8790") as client:
+        headers = {"Origin": "http://127.0.0.1:8790"}
+        assert client.get("/api/state").json()["demo"] is False
+        assert client.post("/api/demo", headers=headers).status_code == 201
+        assert client.get("/api/state").json()["demo"] is True

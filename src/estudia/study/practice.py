@@ -1,5 +1,6 @@
 """Práctica: armado del cuestionario, registro de respuestas y repaso de errores."""
 import json
+import logging
 import math
 import random
 import sqlite3
@@ -18,7 +19,8 @@ from estudia.study.srs import (
     STATE_REVIEW,
     SURE,
     UNSURE,
-    card_key,
+    CARD_KEY_SQL,
+    card_ref,
     day_start,
     local_day,
     rating_for,
@@ -26,6 +28,8 @@ from estudia.study.srs import (
     sync_review_state,
     validate_answer_extras,
 )
+
+log = logging.getLogger(__name__)
 
 # Formato en que se muestra cada ítem ([CA] §2.1).
 MCQ, THINK_FIRST, TYPED = "mcq", "think_first", "typed"
@@ -52,6 +56,7 @@ class QuizItem:
     phase: str = FOCUS               # review | focus
     relearning: dict | None = None   # {"day": 1..3} si está en reaprendizaje
     points: float | None = None      # en el simulacro con el formato de la cátedra: lo que vale
+    card_key: str = ""               # tarjeta FSRS ('q:<id>' o 'v:<grupo>'): la interfaz cuenta una vez cada una
 
 
 @dataclass
@@ -67,6 +72,7 @@ class AnswerFeedback:
     requeue: bool = False            # vuelve al final de la sesión
     next_label: str | None = None    # "Vuelve mañana", "Vuelve en 2 días", "La sabés: vuelve en 9 días"
     relearn_progress: str | None = None   # "1 de 3 días" mientras está en reaprendizaje
+    requeue_item: "QuizItem | None" = None  # con `requeue` en un grupo: otra variante para el final de la sesión
     feedback_style: str = "full"     # alarm | full | short | doubt (ver `feedback_style`)
     question_id: int | None = None   # de qué pregunta es (la revisión del simulacro se arma por id)
     answer_id: int | None = None     # fila de `answer` recién guardada
@@ -101,26 +107,88 @@ def _weakest_topic(conn: sqlite3.Connection, course_id: int, now: int) -> int | 
     return min((r["id"] for r in rows), key=lambda tid: topic_probability_at_exam(conn, tid, now))
 
 
+# Cada pregunta mostrable con su tarjeta (`card_key`, `head_id`: la original del grupo o ella misma),
+# el estado de esa tarjeta y si se acertó alguna vez algún miembro (`ever_correct`, por tarjeta).
+_GROUP_OF = "COALESCE(q.variant_group, q.id)"
+_POOL_SQL = (
+    "SELECT q.id, q.stem, q.options_json, q.check_expr, q.correct_index, q.typed_safe, "
+    f"t.name AS topic, {CARD_KEY_SQL} AS card_key, {_GROUP_OF} AS head_id, rs.state, rs.due, "
+    "rs.last_review, rs.relearn_days, rs.relearn_last_day, hit.head_id IS NOT NULL AS ever_correct "
+    "FROM question q JOIN topic t ON t.id = q.topic_id "
+    f"LEFT JOIN review_state rs ON rs.card_key = {CARD_KEY_SQL} "
+    "LEFT JOIN (SELECT DISTINCT COALESCE(qa.variant_group, qa.id) AS head_id FROM answer a "
+    "JOIN question qa ON qa.id = a.question_id "
+    f"WHERE a.correct = 1 AND COALESCE(a.mode, '') != 'pretest') hit ON hit.head_id = {_GROUP_OF} "
+    f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} "
+    # Retirar actúa sobre todo el grupo; igual, con la original retirada no se muestra ningún miembro.
+    f"AND EXISTS (SELECT 1 FROM question h WHERE h.id = {_GROUP_OF} AND h.retired = 0)"
+)
+
+
+def last_answered_member(conn: sqlite3.Connection, head_id: int) -> int | None:
+    """El miembro de la última respuesta de la tarjeta (en cualquier modo salvo pretest)."""
+    row = conn.execute(
+        "SELECT a.question_id FROM answer a JOIN question q ON q.id = a.question_id "
+        f"WHERE {_GROUP_OF} = ? AND COALESCE(a.mode, '') != 'pretest' ORDER BY a.at DESC, a.id DESC LIMIT 1",
+        (head_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def pick_member(members: list, last_id: int | None, answered: set[int], rng: random.Random):
+    """La variante a mostrar: nunca `last_id` si hay otra; primero las nunca contestadas; entre
+    las iguales, al azar con `rng`."""
+    pool = [m for m in members if m["id"] != last_id] or list(members)
+    fresh = [m for m in pool if m["id"] not in answered]
+    return rng.choice(fresh or pool)
+
+
+def _member_history(conn: sqlite3.Connection, head_ids: list[int]) -> tuple[set[int], dict[int, int]]:
+    """De los grupos `head_ids`: los miembros con alguna respuesta (cualquier modo) y el de la
+    última respuesta de cada grupo (sin pretest, como `last_answered_member`)."""
+    answered: set[int] = set()
+    last: dict[int, int] = {}
+    if not head_ids:
+        return answered, last
+    for r in conn.execute(
+        "SELECT a.question_id, q.variant_group AS head, COALESCE(a.mode, '') = 'pretest' AS pretest "
+        "FROM answer a JOIN question q ON q.id = a.question_id "
+        f"WHERE q.variant_group IN ({','.join('?' * len(head_ids))}) ORDER BY a.at, a.id",
+        head_ids,
+    ):
+        answered.add(r["question_id"])
+        if not r["pretest"]:
+            last[r["head"]] = r["question_id"]
+    return answered, last
+
+
+def one_per_card(conn: sqlite3.Connection, rows: list, rng: random.Random) -> list:
+    """Un representante por tarjeta (`pick_member`), en el orden en que aparece cada tarjeta.
+    Cada fila necesita `id` y `head_id`. Las preguntas sin grupo pasan tal cual."""
+    cards: dict[int, list] = {}
+    for r in rows:
+        cards.setdefault(r["head_id"], []).append(r)
+    grouped = [h for h, members in cards.items() if len(members) > 1]
+    answered, last = _member_history(conn, grouped)
+    return [members[0] if len(members) == 1 else pick_member(members, last.get(head), answered, rng)
+            for head, members in cards.items()]
+
+
 def _ranked(
     conn: sqlite3.Connection, course_id: int, topic_ids: list[int] | None, now: int
 ) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
-    """Preguntas disponibles en orden de práctica: (vencidas, resto). Ver `build_quiz`."""
+    """Tarjetas disponibles en orden de práctica: (vencidas, resto). Ver `build_quiz`.
+
+    De un grupo de variantes sale un solo miembro (`one_per_card`): nunca el último contestado si
+    hay otro, y primero los nunca contestados. Una tarjeta nunca sale dos veces en un cuestionario.
+    """
     # `review_state` ya está al día: lo sincronizan `connect` y cada respuesta registrada.
-    sql = (
-        "SELECT q.id, q.stem, q.options_json, q.check_expr, q.correct_index, q.typed_safe, "
-        "t.name AS topic, rs.state, rs.due, "
-        "rs.last_review, rs.relearn_days, rs.relearn_last_day, hit.question_id IS NOT NULL AS ever_correct "
-        "FROM question q JOIN topic t ON t.id = q.topic_id "
-        "LEFT JOIN review_state rs ON rs.card_key = 'q:' || q.id "
-        "LEFT JOIN (SELECT DISTINCT question_id FROM answer "
-        "WHERE correct = 1 AND COALESCE(mode, '') != 'pretest') hit ON hit.question_id = q.id "
-        f"WHERE t.course_id = ? AND q.verified = 1 AND q.retired = 0 AND {REGULAR}"
-    )
+    sql = _POOL_SQL + " AND t.course_id = ?"
     params: list = [course_id]
     if topic_ids is not None:
         sql += f" AND t.id IN ({','.join('?' * len(topic_ids))})"
         params.extend(topic_ids)
-    questions = conn.execute(sql + " ORDER BY q.id", params).fetchall()
+    questions = one_per_card(conn, conn.execute(sql + " ORDER BY q.id", params).fetchall(), random.Random(now))
 
     today = local_day(now)
     today_end = day_start(today + timedelta(days=1))
@@ -213,7 +281,8 @@ def _items(conn: sqlite3.Connection, rows: list[sqlite3.Row], phase: str, now: i
     typed_ok = typed_safe_ids(conn, [q for q in rows if q["state"] is not None])
     return [
         QuizItem(q["id"], q["stem"], json.loads(q["options_json"]), q["topic"],
-                 format=_format(q, now, typed_ok), phase=phase, relearning=_relearning(q, today))
+                 format=_format(q, now, typed_ok), phase=phase, relearning=_relearning(q, today),
+                 card_key=q["card_key"])
         for q in rows
     ]
 
@@ -279,9 +348,9 @@ def build_session_quiz(conn: sqlite3.Connection, session_id: int, *, size: int =
     if review_min:
         overdue, _ = _ranked(conn, s["course_id"], topics, now)
         review = overdue[:math.ceil(size * review_min / s["minutes"])]
-    taken = {q["id"] for q in review}
+    taken = {q["card_key"] for q in review}   # por tarjeta: el foco puede elegir otra variante
     overdue, others = _ranked(conn, s["course_id"], [s["topic_id"]], now)
-    focus = [q for q in overdue + others if q["id"] not in taken][:size - len(review)]
+    focus = [q for q in overdue + others if q["card_key"] not in taken][:size - len(review)]
     return _items(conn, review, REVIEW, now) + _items(conn, focus, FOCUS, now)
 
 
@@ -294,10 +363,15 @@ def feedback_style(correct: bool, confidence: int | None) -> str:
     return "alarm" if sure else "full"
 
 
+REQUEUE_TEXT = "Vuelve al final de la sesión"
+# Cuando vuelve otra variante del grupo: que no sorprenda ver otros números.
+REQUEUE_VARIANT_TEXT = "Vuelve al final de la sesión, con otros números"
+
+
 def _next_label(review: sqlite3.Row, rating: Rating, now: int) -> str:
     """Cuándo vuelve, en palabras. "La sabés" solo fuera del reaprendizaje y sin dudar."""
     if rating == Rating.Again:
-        return "Vuelve al final de la sesión"
+        return REQUEUE_TEXT
     days = (local_day(review["due"]) - local_day(now)).days
     when = "hoy" if days <= 0 else "mañana" if days == 1 else f"en {days} días"
     if review["state"] == STATE_REVIEW and rating in (Rating.Good, Rating.Easy):
@@ -353,7 +427,34 @@ def record_answer(
     """
     feedback = _insert_answer(conn, question_id, chosen_index, now, **extras)
     conn.commit()
+    if feedback.requeue:
+        # Después del commit: armar el ítem puede consultar al worker (`typed_safe_ids`) y eso
+        # nunca se hace con el candado de escritura tomado. La respuesta ya quedó guardada: si
+        # armar la otra variante falla, vuelve sin ella (en el log, solo el tipo del error).
+        try:
+            feedback.requeue_item = next_variant_item(conn, question_id, now)
+            if feedback.requeue_item is not None:
+                feedback.next_label = REQUEUE_VARIANT_TEXT
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            log.warning("no se pudo armar otra variante: %s", type(exc).__name__)
+            feedback.requeue_item = None
     return feedback
+
+
+def next_variant_item(conn: sqlite3.Connection, question_id: int, now: int) -> QuizItem | None:
+    """Otra variante de la tarjeta de `question_id` para volver al final de la sesión (`pick_member`
+    sin repetir `question_id`). None si no tiene grupo o no queda otro miembro que se pueda mostrar."""
+    ref = card_ref(conn, question_id)
+    if ref is None or not ref.grouped:
+        return None
+    # `_POOL_SQL` ya deja afuera los miembros de una original retirada.
+    rows = conn.execute(_POOL_SQL + f" AND {_GROUP_OF} = ? ORDER BY q.id", (ref.head_id,)).fetchall()
+    if not any(r["id"] != question_id for r in rows):
+        return None
+    answered, _ = _member_history(conn, [ref.head_id])
+    return _items(conn, [pick_member(rows, question_id, answered, random.Random(now))], FOCUS, now)[0]
 
 
 def grade_typed_answer(check_expr: str | None, typed_text: str, unreadable_as_wrong: bool = False) -> bool:
@@ -451,7 +552,7 @@ def _insert_answer(
 
     requeue, next_label, relearn_progress = False, None, None
     review = conn.execute(
-        "SELECT state, due, relearn_days FROM review_state WHERE card_key = ?", (card_key(question_id),)
+        "SELECT state, due, relearn_days FROM review_state WHERE card_key = ?", (card_ref(conn, question_id).key,)
     ).fetchone()
     if mode not in _NO_SESSION_MODES and review is not None:
         rating = rating_for(correct, confidence, mode)
@@ -483,9 +584,15 @@ def _insert_answer(
     )
 
 
+# La pregunta y, si es de un grupo de variantes, todo su grupo: una variante mal pone en duda
+# la plantilla entera. Toma el id dos veces.
+_SAME_GROUP = ("WHERE id = ? OR (variant_group IS NOT NULL"
+               " AND variant_group = (SELECT variant_group FROM question WHERE id = ?))")
+
+
 def retire_question(conn: sqlite3.Connection, question_id: int) -> None:
-    """Botón "Esta está mal": la pregunta deja de mostrarse."""
-    conn.execute("UPDATE question SET retired = 1 WHERE id = ?", (question_id,))
+    """Botón "Esta está mal": la pregunta deja de mostrarse, con todo su grupo de variantes."""
+    conn.execute("UPDATE question SET retired = 1 " + _SAME_GROUP, (question_id, question_id))
     conn.commit()
 
 
@@ -498,7 +605,7 @@ class QuestionSuperseded(Exception):
 
 
 def unretire_question(conn: sqlite3.Connection, question_id: int) -> None:
-    """Deshacer el reporte de error: la pregunta vuelve a mostrarse.
+    """Deshacer el reporte de error: la pregunta vuelve a mostrarse, con todo su grupo de variantes.
 
     `QuestionSuperseded` si es de un material que ya no vale: un tramo de una versión vieja del
     archivo (`replaced`), un documento que después se partió (`split`), o un archivo que el campus
@@ -510,5 +617,5 @@ def unretire_question(conn: sqlite3.Connection, question_id: int) -> None:
     if row is not None and (row["status"] in ("replaced", "split")
                             or (row["origin"] is None and row["dedupe_key"] is None)):
         raise QuestionSuperseded(QUESTION_SUPERSEDED_TEXT)
-    conn.execute("UPDATE question SET retired = 0 WHERE id = ?", (question_id,))
+    conn.execute("UPDATE question SET retired = 0 " + _SAME_GROUP, (question_id, question_id))
     conn.commit()

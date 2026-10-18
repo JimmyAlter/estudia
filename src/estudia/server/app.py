@@ -37,10 +37,27 @@ from estudia.ai.base import (
     AIQuotaError,
     AIUnavailableError,
 )
+from estudia.ai.keys import (
+    KEY_FORMAT_TEXT,
+    KEY_MISSING_TEXT,
+    KEY_REJECTED_TEXT,
+    KEY_UNAVAILABLE_TEXT,
+    looks_like_gemini_key,
+    normalize_key,
+)
 from estudia.ai.gate import AIBlocked, GatedProvider, age_is_adult
 from estudia.catalog import get_site, load_catalog
 from estudia.config import DOCUMENTS_DIRNAME, SYNC_EVERY_S, data_dir
 from estudia.db import connect
+from estudia.demo import (
+    DEMO_CONNECTED_TEXT,
+    DemoUnavailable,
+    cleanup_leftover_demo,
+    demo_active,
+    demo_path,
+    remove_demo,
+    start_demo,
+)
 from estudia.generation.past_exams import extract_pending_styles
 from estudia.generation.style_questions import fill_style_gaps, style_material_text
 from estudia.generation.verify import GradingUnavailable
@@ -71,6 +88,7 @@ from estudia.moodle.calendar_feed import (
     fetch_feed_url,
 )
 from estudia.moodle.client import MoodleClient, MoodleError, TokenInvalid
+from estudia.moodle.names import moodle_private_name, moodle_token_name
 from estudia.moodle.sync import sync_all
 from estudia.updates import default_http, latest_release
 from estudia.version import __version__
@@ -153,7 +171,7 @@ from estudia.study.schedule import (
     suggestions,
     update_slot,
 )
-from estudia.study.srs import UNSURE
+from estudia.study.srs import HEAD, UNSURE
 
 HOST = "127.0.0.1"
 GEMINI_KEY = "gemini_key"
@@ -192,14 +210,6 @@ def ai_age(conn: sqlite3.Connection) -> str | None:
     return value if value in AGES else None
 
 
-def moodle_token_name(site_id: str) -> str:
-    return f"moodle_token:{site_id}"
-
-
-def moodle_private_name(site_id: str) -> str:
-    return f"moodle_private:{site_id}"
-
-
 def web_dist_dir() -> Path:
     """Carpeta del frontend compilado (`web/dist`), en desarrollo o empaquetado."""
     if getattr(sys, "frozen", False):
@@ -224,6 +234,21 @@ def default_provider_factory(key: str) -> AIProvider:
     from estudia.ai.gemini import GeminiProvider
 
     return GeminiProvider(key)
+
+
+def _has_questions(conn: sqlite3.Connection) -> bool:
+    """¿La base tiene al menos una pregunta? Sin la tabla, o si no es una base, no.
+
+    Cualquier otro error (la base bloqueada por otro pedido) se deja pasar: una base ocupada no
+    es una base vacía, y la demo no se borra por eso."""
+    try:
+        return conn.execute("SELECT COUNT(*) FROM question").fetchone()[0] > 0
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return False
+        raise
+    except sqlite3.DatabaseError:
+        return False
 
 
 def _kv_get(conn: sqlite3.Connection, key: str) -> str | None:
@@ -849,6 +874,13 @@ def create_app(
     # Passport del login en curso: solo en memoria.
     login = {"passport": None}
 
+    # Lo que quedó de una demo apagada (un archivo que Windows no dejó borrar) se borra al arrancar.
+    conn = jobs.connect()
+    try:
+        cleanup_leftover_demo(conn, db_path)
+    finally:
+        conn.close()
+
     app = FastAPI(title="Estudia", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = jobs
     # Contra DNS rebinding y pedidos de otros sitios (el último agregado va por fuera).
@@ -865,6 +897,52 @@ def create_app(
 
     def get_conn() -> Iterator[sqlite3.Connection]:
         conn = jobs.connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def get_study_conn() -> Iterator[sqlite3.Connection]:
+        """La base de las rutas de estudio (`DEMO_ROUTES`): la de ejemplo si la demo está prendida.
+        Ninguna otra ruta la usa, así la materia de ejemplo no llega a exportaciones, plan ni inicio.
+
+        Si la demo se borró entre la revisión y la apertura (el login de otro pedido), la base de
+        ejemplo no se vuelve a crear: el pedido sigue con la real, que es lo que hay sin demo.
+        Si demo.db está rota (no es SQLite) o no tiene preguntas (0 bytes), la demo se apaga y
+        también se sigue con la real."""
+        conn = jobs.connect()
+        try:
+            if demo_active(conn, jobs.db_path):
+                study = None
+                try:
+                    study = connect(demo_path(jobs.db_path), check_same_thread=False, create=False)
+                except sqlite3.OperationalError:
+                    if demo_path(jobs.db_path).exists():
+                        raise   # otro error (base bloqueada): no se cambia de base en silencio
+                    # se borró recién: sigue con la real
+                except sqlite3.DatabaseError as exc:
+                    # Solo el tipo: el mensaje podría traer un pedazo del archivo.
+                    log.warning("La base de la materia de ejemplo está rota (%s): se apaga la demo",
+                                type(exc).__name__)
+                    remove_demo(conn, jobs.db_path)
+                try:
+                    empty = study is not None and not _has_questions(study)
+                except BaseException:
+                    study.close()
+                    raise
+                if empty:
+                    # SQLite válida pero vacía (0 bytes, o sin la tabla): tampoco es una demo.
+                    log.warning("La base de la materia de ejemplo está vacía: se apaga la demo")
+                    study.close()
+                    study = None
+                    remove_demo(conn, jobs.db_path)
+                if study is not None:
+                    conn.close()
+                    conn = study
+                    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        except BaseException:
+            conn.close()
+            raise
         try:
             yield conn
         finally:
@@ -914,7 +992,17 @@ def create_app(
             "syncing": jobs.running,
             "last_sync_at": int(last) if last else None,
             "last_sync_error": _kv_get(conn, SYNC_ERROR_KEY),
+            "demo": demo_active(conn, jobs.db_path),
         }
+
+    @app.post("/api/demo", status_code=201)
+    def start_demo_mode(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+        # Sin red, sin IA y sin la edad: todo sale de la materia de ejemplo del paquete.
+        try:
+            start_demo(conn, jobs.db_path, int(time.time()))
+        except DemoUnavailable:
+            raise HTTPException(409, DEMO_CONNECTED_TEXT) from None
+        return {"ok": True}
 
     @app.get("/api/version")
     def version(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
@@ -981,6 +1069,8 @@ def create_app(
             set_secret(moodle_private_name(site_id), pair.private_token)
         else:
             delete_secret(moodle_private_name(site_id))
+        # Con el campus conectado la materia de ejemplo (y sus respuestas) desaparece.
+        remove_demo(conn, jobs.db_path)
         start_jobs(background)
         return {"ok": True}
 
@@ -994,9 +1084,12 @@ def create_app(
             raise HTTPException(403, AGE_PENDING_TEXT)
         if body.provider != "gemini":
             raise HTTPException(400, "proveedor no soportado")
-        key = body.key.strip()
-        if not key:
-            raise HTTPException(400, "falta la clave")
+        key = normalize_key(body.key)
+        if key is None:
+            raise HTTPException(400, KEY_MISSING_TEXT)
+        # El formato es una pista, no una puerta: decide Google. Si la rechaza y además
+        # no tiene la forma conocida, el texto del formato ayuda más.
+        well_formed = looks_like_gemini_key(key)
         try:
             jobs.provider(key).check_key()
         except AIBlocked:
@@ -1004,9 +1097,9 @@ def create_app(
             raise HTTPException(403, MINOR_AI_TEXT) from None
         except (AIAuthError, AIFormatError):
             # Un pedido inválido tampoco prueba que la clave sirva.
-            raise HTTPException(400, "la clave fue rechazada") from None
+            raise HTTPException(400, KEY_REJECTED_TEXT if well_formed else KEY_FORMAT_TEXT) from None
         except AIUnavailableError:
-            raise HTTPException(503, "no se pudo verificar la clave; probá más tarde") from None
+            raise HTTPException(503, KEY_UNAVAILABLE_TEXT) from None
         except AIQuotaError:
             pass  # la clave autenticó: solo se agotó la cuota
         set_secret(GEMINI_KEY, key)
@@ -1036,7 +1129,7 @@ def create_app(
         return home_view(conn, int(time.time()))
 
     @app.get("/api/progress")
-    def progress(conn: sqlite3.Connection = Depends(get_conn)):
+    def progress(conn: sqlite3.Connection = Depends(get_study_conn)):
         return progress_view(conn)
 
     @app.get("/api/materials")
@@ -1059,6 +1152,7 @@ def create_app(
             " ORDER BY s.course_id, s.num, COALESCE(m.parent_id, m.id), m.page_from, m.id"
         )
         # Temas de cada clase y cuántas preguntas se pueden practicar de ellos ("Practicar esta clase").
+        # Un grupo de variantes cuenta una vez.
         topics_of: dict[int, list[int]] = {}
         for r in conn.execute("SELECT material_id, topic_id FROM material_topic ORDER BY topic_id"):
             topics_of.setdefault(r["material_id"], []).append(r["topic_id"])
@@ -1066,7 +1160,7 @@ def create_app(
             r["topic_id"]: r["n"]
             for r in conn.execute(
                 "SELECT q.topic_id, COUNT(*) AS n FROM question q WHERE q.verified = 1 AND q.retired = 0"
-                f" AND {REGULAR} GROUP BY q.topic_id"
+                f" AND {REGULAR} AND {HEAD} GROUP BY q.topic_id"
             )
         }
         for r in rows:
@@ -1100,7 +1194,7 @@ def create_app(
         return {"reset": reset}
 
     @app.post("/api/quiz")
-    def quiz(body: QuizIn, conn: sqlite3.Connection = Depends(get_conn)):
+    def quiz(body: QuizIn, conn: sqlite3.Connection = Depends(get_study_conn)):
         now = int(time.time())
         if body.session_id is not None:
             try:
@@ -1122,7 +1216,7 @@ def create_app(
         return build_quiz(conn, course_id, topic_ids=topic_ids, weakest=body.weakest, size=body.size, now=now)
 
     @app.post("/api/answer")
-    def answer(body: AnswerIn, conn: sqlite3.Connection = Depends(get_conn)):
+    def answer(body: AnswerIn, conn: sqlite3.Connection = Depends(get_study_conn)):
         now = int(time.time())
         if body.mode not in PRACTICE_MODES:
             raise HTTPException(400, f"Modo de respuesta desconocido: {body.mode}")
@@ -1145,7 +1239,7 @@ def create_app(
         return feedback
 
     @app.post("/api/answers/{answer_id}/explain")
-    def answer_explain(answer_id: int, body: ExplainIn, conn: sqlite3.Connection = Depends(get_conn)):
+    def answer_explain(answer_id: int, body: ExplainIn, conn: sqlite3.Connection = Depends(get_study_conn)):
         try:
             record_explain_match(conn, answer_id, body.same)
         except LookupError:
@@ -1190,14 +1284,14 @@ def create_app(
         return {"headings": [asdict(h) for h in recall_check(row["summary_md"], body.text)]}
 
     @app.post("/api/question/{question_id}/retire")
-    def retire(question_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    def retire(question_id: int, conn: sqlite3.Connection = Depends(get_study_conn)) -> dict:
         if conn.execute("SELECT 1 FROM question WHERE id=?", (question_id,)).fetchone() is None:
             raise HTTPException(404, "pregunta inexistente")
         retire_question(conn, question_id)
         return {"ok": True}
 
     @app.post("/api/question/{question_id}/unretire")
-    def unretire(question_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    def unretire(question_id: int, conn: sqlite3.Connection = Depends(get_study_conn)) -> dict:
         if conn.execute("SELECT 1 FROM question WHERE id=?", (question_id,)).fetchone() is None:
             raise HTTPException(404, "pregunta inexistente")
         try:
@@ -1234,7 +1328,7 @@ def create_app(
             raise HTTPException(404, "El examen no existe")
 
     @app.get("/api/exams")
-    def exams(conn: sqlite3.Connection = Depends(get_conn)):
+    def exams(conn: sqlite3.Connection = Depends(get_study_conn)):
         return list_exams(conn, int(time.time()))
 
     @app.post("/api/exams")
@@ -1425,7 +1519,7 @@ def create_app(
         return {"ok": True}
 
     @app.get("/api/exams/{exam_id}/topics")
-    def topics_of_exam(exam_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
+    def topics_of_exam(exam_id: int, conn: sqlite3.Connection = Depends(get_study_conn)) -> list[dict]:
         exam_exists(conn, exam_id)
         ids = exam_topics(conn, exam_id)
         if not ids:
@@ -1499,7 +1593,7 @@ def create_app(
         return {"ok": True}
 
     @app.post("/api/mock/start")
-    def mock_start(body: MockStartIn, conn: sqlite3.Connection = Depends(get_conn)):
+    def mock_start(body: MockStartIn, conn: sqlite3.Connection = Depends(get_study_conn)):
         # NotEnoughQuestions hereda de ValueError: va primero.
         try:
             return start_mock(conn, body.exam_id, int(time.time()), body.predicted_grade,
@@ -1514,7 +1608,7 @@ def create_app(
             raise HTTPException(400, str(exc)) from None
 
     @app.post("/api/mock/{attempt_id}/finish")
-    def mock_finish(attempt_id: int, body: MockFinishIn, conn: sqlite3.Connection = Depends(get_conn)):
+    def mock_finish(attempt_id: int, body: MockFinishIn, conn: sqlite3.Connection = Depends(get_study_conn)):
         now = int(time.time())
         try:
             answers = {
@@ -1539,7 +1633,7 @@ def create_app(
         return result
 
     @app.get("/api/mock/{attempt_id}")
-    def mock_read(attempt_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    def mock_read(attempt_id: int, conn: sqlite3.Connection = Depends(get_study_conn)):
         """El resultado de un simulacro ya entregado (si una entrega se repite, se lee de acá)."""
         try:
             return mock_result(conn, attempt_id)

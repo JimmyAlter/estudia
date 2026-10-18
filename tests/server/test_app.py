@@ -23,10 +23,10 @@ SITE_URL = "https://aulasvirtuales.frba.utn.edu.ar"
 CONTENTS = json.loads((FIXTURES / "core_course_get_contents_101.json").read_text("utf-8"))
 QUIZZES = json.loads((FIXTURES / "mod_quiz_get_quizzes_by_courses_101.json").read_text("utf-8"))
 PAGE = (FIXTURES / "page_video_clase_1.html").read_text("utf-8")
-GOOD_KEY = "clave-buena-123"
+GOOD_KEY = "AIza" + "g" * 35
 PORT = 8123
 BASE = f"http://127.0.0.1:{PORT}"
-BAD_KEY = "clave-mala-456"
+BAD_KEY = "AIza" + "b" * 35
 
 
 class FakeMoodle:
@@ -319,7 +319,7 @@ def test_answer_flow(env):
     assert r.status_code == 200
     items = r.json()
     assert items == [{"question_id": 1, "stem": "¿Pendiente?", "options": ["1", "2", "3", "4"], "topic": "Rectas",
-                      "format": "mcq", "phase": "focus", "relearning": None, "points": None}]
+                      "format": "mcq", "phase": "focus", "relearning": None, "points": None, "card_key": "q:1"}]
 
     r = c.post("/api/answer", json={"question_id": 1, "chosen_index": 0})
     assert r.status_code == 200

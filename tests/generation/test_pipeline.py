@@ -1267,3 +1267,462 @@ def test_segments_saved_on_done(conn):
     assert json.loads(rows[1]) == [{"start_s": 0, "end_s": 60, "title": "Intro"},
                                    {"start_s": 60, "end_s": 200, "title": "Recta"}]
     assert rows[2] is None
+
+
+# --- Tarea 7: variantes guardadas en grupo ---------------------------------------------------
+
+from variant_fixtures import linear_question, percent_question  # noqa: E402
+
+LINEAR_PREFIX = "Si f(x) ="
+
+
+def blind_right_for_linear(stem, options):
+    """Acierta la lineal y todas sus variantes (la correcta está en 0); erra el resto."""
+    return 0 if stem.startswith(LINEAR_PREFIX) else 3
+
+
+def group_rows(conn):
+    return conn.execute(
+        "SELECT id, stem, options_json, correct_index, check_expr, explanation, common_error,"
+        " topic_id, source_seconds, verified, retired, variant_group, variant_values_json, dedupe_key"
+        " FROM question ORDER BY id").fetchall()
+
+
+def test_variants_stored_only_for_blind_kept_questions(conn):
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question(), percent_question()],
+                                        topics=["Funciones lineales", "Porcentajes"])},
+                        blind_right_for_linear)
+    res = process_material(conn, prov, 1)
+    assert (res.kept, res.discarded) == (1, 1)
+    rows = group_rows(conn)
+    head = rows[0]
+    assert head["stem"] == linear_question().stem
+    assert head["variant_group"] == head["id"]
+    assert json.loads(head["variant_values_json"]) == {"a": 2, "b": 3, "c": 4}
+    members = rows[1:]
+    assert 1 <= len(members) <= 4
+    assert all(r["stem"].startswith(LINEAR_PREFIX) for r in members)   # nada de la de porcentajes
+    for r in members:
+        assert (r["verified"], r["retired"], r["variant_group"]) == (1, 0, head["id"])
+        assert r["topic_id"] == head["topic_id"] and r["source_seconds"] == head["source_seconds"]
+        values = json.loads(r["variant_values_json"])
+        assert r["check_expr"] == str(values["a"] * values["c"] + values["b"])
+        assert "{" not in r["explanation"] + r["common_error"] + r["stem"]
+    # Cada variante pasó por la pasada a ciegas, en el mismo pedido que las originales.
+    assert prov.requests["blind"] == 1
+    items, exclude = prov.blind_batches[0]
+    assert exclude == ("analizador",)
+    stems = [stem for stem, _ in items]
+    # Primero las originales; después las variantes de cada candidata, en orden (también las de
+    # la de porcentajes, que se mandan antes de saber que su original no pasa).
+    assert stems[:2] == [linear_question().stem, percent_question().stem]
+    assert stems[2:2 + len(members)] == [r["stem"] for r in members]
+    assert stems[2 + len(members):] and all("%" in s for s in stems[2 + len(members):])
+
+
+def test_every_stored_variant_key_recomputes_independently(conn):
+    import sympy
+
+    from estudia.generation.verify import parse_option
+
+    add_material(conn, 1, "v1")
+    template = linear_question().variant
+    prov = FakeProvider({"v1": analysis([linear_question()])}, blind_right_for_linear)
+    process_material(conn, prov, 1)
+    rows = [r for r in group_rows(conn) if r["variant_group"] is not None]
+    assert len(rows) >= 2
+    for r in rows:
+        values = json.loads(r["variant_values_json"])
+        key = sympy.sympify(template.answer_expr, locals={k: sympy.Integer(v) for k, v in values.items()})
+        options = json.loads(r["options_json"])
+        assert sympy.simplify(parse_option(options[r["correct_index"]]) - key) == 0
+        for i, option in enumerate(options):
+            if i != r["correct_index"]:
+                assert sympy.simplify(parse_option(option) - key) != 0
+
+
+def test_a_variant_the_blind_model_gets_wrong_drops_the_whole_group(conn):
+    add_material(conn, 1, "v1")
+    seen = []
+
+    def blind(stem, options):
+        seen.append(stem)
+        # Erra solo la segunda variante (el tercer enunciado del pedido).
+        return 2 if len(seen) == 3 else 0
+
+    prov = FakeProvider({"v1": analysis([linear_question()])}, blind)
+    res = process_material(conn, prov, 1)
+    assert len(seen) >= 3   # se mandaron variantes
+    assert (res.kept, res.discarded) == (1, 0)
+    rows = group_rows(conn)
+    assert [r["stem"] for r in rows] == [linear_question().stem]
+    assert (rows[0]["variant_group"], rows[0]["variant_values_json"]) == (None, None)
+
+
+def test_a_variant_without_blind_answer_drops_the_whole_group(conn):
+    add_material(conn, 1, "v1")
+
+    def blind(stem, options):
+        if stem != linear_question().stem:
+            raise AIFormatError("no sabe")   # FakeProvider: sin respuesta (None)
+        return 0
+
+    process_material(conn, FakeProvider({"v1": analysis([linear_question()])}, blind), 1)
+    rows = group_rows(conn)
+    assert len(rows) == 1 and rows[0]["variant_group"] is None
+
+
+def test_unreadable_blind_with_variants_retries_once_without_them(conn):
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question()])}, blind_right_for_linear,
+                        blind_errors=[AIFormatError("ilegible")])
+    res = process_material(conn, prov, 1)
+    assert res.kept == 1
+    rows = group_rows(conn)
+    assert len(rows) == 1 and rows[0]["variant_group"] is None   # la original sí, sin variantes
+    assert prov.requests["blind"] == 2
+    assert len(prov.blind_batches[0][0]) > 1
+    assert [stem for stem, _ in prov.blind_batches[1][0]] == [linear_question().stem]
+
+
+def test_unreadable_blind_without_variants_still_one_request(conn):
+    # Sin variantes en el pedido no hay reintento nuevo: la clase queda `failed` como siempre.
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([q("A", check_expr="2")])}, lambda s, o: 1,
+                        blind_errors=[AIFormatError("ilegible")])
+    res = process_material(conn, prov, 1)
+    assert res.status == "failed" and prov.requests["blind"] == 1
+
+
+def test_blind_unavailable_stores_nothing(conn):
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question()])}, blind_right_for_linear,
+                        blind_errors=[AIUnavailableError("caído")])
+    with pytest.raises(AIUnavailableError):
+        process_material(conn, prov, 1)
+    assert group_rows(conn) == []
+    assert statuses(conn)[1] == "pending"
+
+
+def test_variant_worker_down_stores_original_only(conn, monkeypatch):
+    from estudia.generation import variants
+
+    monkeypatch.setattr(variants, "compute_variant_values", lambda payload: None)
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question()])}, blind_right_for_linear)
+    res = process_material(conn, prov, 1)
+    assert res.kept == 1
+    rows = group_rows(conn)
+    assert len(rows) == 1 and rows[0]["variant_group"] is None
+    assert [len(items) for items, _ in prov.blind_batches] == [1]
+
+
+def test_worker_unavailable_stops_variants_and_keeps_every_original(conn, monkeypatch):
+    """El primer WorkerUnavailable corta las variantes del análisis. Las originales ya pasaron
+    sus controles locales antes de cualquier trabajo de variantes: el backoff no las tumba."""
+    import time as time_module
+
+    from estudia.generation import variants, verify
+    from estudia.generation.verify import WorkerUnavailable
+
+    calls = []
+
+    def sick(payload):
+        calls.append(payload)
+        # Como un tiempo agotado de verdad: el worker queda en backoff.
+        monkeypatch.setattr(verify, "_unavailable_until", time_module.monotonic() + 60)
+        raise WorkerUnavailable("tiempo agotado")
+
+    monkeypatch.setattr(variants, "compute_variant_values", sick)
+    add_material(conn, 1, "v1")
+    questions = [linear_question(), percent_question(), q("Después", correct=1, check_expr="2")]
+    prov = FakeProvider({"v1": analysis(questions, topics=["Funciones lineales", "Porcentajes"])},
+                        lambda stem, options: 1 if stem == "Después" else 0)
+    res = process_material(conn, prov, 1)
+    assert len(calls) == 1
+    assert res.kept == 3
+    rows = group_rows(conn)
+    assert [r["stem"] for r in rows] == [linear_question().stem, percent_question().stem, "Después"]
+    assert all(r["variant_group"] is None for r in rows)
+    assert [len(items) for items, _ in prov.blind_batches] == [3]
+
+
+def test_worker_in_backoff_builds_no_variants(conn, monkeypatch):
+    from estudia.generation import variants, verify
+
+    calls = []
+    monkeypatch.setattr(variants, "compute_variant_values", lambda payload: calls.append(1) or [])
+    monkeypatch.setattr(verify, "worker_available", lambda: False)
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question()])}, blind_right_for_linear)
+    res = process_material(conn, prov, 1)
+    assert res.kept == 1 and calls == []
+    assert group_rows(conn)[0]["variant_group"] is None
+
+
+def test_process_result_counts_originals_only(conn):
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question(), q("B", correct=1)])},
+                        lambda stem, options: 0 if stem.startswith(LINEAR_PREFIX) else 1)
+    res = process_material(conn, prov, 1)
+    assert conn.execute("SELECT COUNT(*) FROM question").fetchone()[0] > 2
+    assert (res.kept, res.discarded) == (2, 0)
+
+
+def test_variants_in_a_multi_class_batch_go_in_the_same_request(conn):
+    from estudia.generation.pipeline import verify_batch
+
+    add_material(conn, 1, "v1")
+    add_material(conn, 2, "v2")
+    prov = FakeProvider({"v1": analysis([linear_question()]), "v2": analysis([q("B", correct=1)])},
+                        lambda stem, options: 0 if stem.startswith(LINEAR_PREFIX) else 1)
+    for mid, ref in ((1, "v1"), (2, "v2")):
+        conn.execute("UPDATE material SET analysis_json=?, analysis_model='m' WHERE id=?",
+                     (prov.analyses[ref].model_dump_json(), mid))
+    conn.commit()
+    results = verify_batch(conn, prov, [1, 2])
+    assert [(r.kept, r.discarded) for r in results] == [(1, 0), (1, 0)]
+    assert prov.requests["blind"] == 1
+    by_material = {r["material_id"]: r["n"] for r in conn.execute(
+        "SELECT material_id, COUNT(*) AS n FROM question GROUP BY material_id")}
+    assert by_material[1] > 1 and by_material[2] == 1
+    assert conn.execute("SELECT COUNT(*) FROM question WHERE material_id=2 AND variant_group IS NOT NULL"
+                        ).fetchone()[0] == 0
+
+
+def test_first_worker_unavailable_stops_variants_even_without_backoff(conn, monkeypatch):
+    from estudia.generation import variants
+    from estudia.generation.verify import WorkerUnavailable
+
+    calls = []
+
+    def sick(payload):
+        calls.append(payload)
+        raise WorkerUnavailable("se cayó")
+
+    monkeypatch.setattr(variants, "compute_variant_values", sick)
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([linear_question(), percent_question()],
+                                        topics=["Funciones lineales", "Porcentajes"])},
+                        lambda stem, options: 0)
+    res = process_material(conn, prov, 1)
+    assert len(calls) == 1
+    assert res.kept == 2 and all(r["variant_group"] is None for r in group_rows(conn))
+
+
+def test_a_variant_never_takes_the_place_of_another_original(conn, monkeypatch):
+    """Si una variante de la primera tiene el enunciado de otra original de la clase, la
+    original entra (y cuenta) y esa variante no."""
+    from estudia.generation.pipeline import _passes_local_checks
+    from estudia.generation.variants import build_variants
+
+    first = linear_question()
+    variants = build_variants(first, _passes_local_checks)
+    clash = variants[0]
+    second = first.model_copy(update={
+        "stem": clash.stem, "options": clash.options, "check_expr": clash.check_expr,
+        "explanation": clash.explanation, "common_error": clash.common_error, "variant": None})
+    add_material(conn, 1, "v1")
+    prov = FakeProvider({"v1": analysis([first, second])}, blind_right_for_linear)
+    res = process_material(conn, prov, 1)
+    assert res.kept == 2
+    rows = {r["stem"]: r for r in group_rows(conn)}
+    assert rows[clash.stem]["variant_group"] is None
+    assert len(rows) == 1 + len(variants)   # la cabeza, la segunda y las demás variantes
+
+
+def test_a_bug_while_building_variants_does_not_fail_the_class(conn, monkeypatch):
+    from estudia.generation import pipeline
+
+    def broken(q, passes):
+        raise KeyError("raro")
+
+    monkeypatch.setattr(pipeline, "build_variants", broken)
+    add_material(conn, 1, "v1")
+    res = process_material(conn, FakeProvider({"v1": analysis([linear_question()])}, blind_right_for_linear), 1)
+    assert (res.status, res.kept) == ("done", 1)
+    assert group_rows(conn)[0]["variant_group"] is None
+
+
+# --- Tarea 7, arreglo 1: los reintentos no vuelven a revisar las originales; tope por pedido ---
+
+
+def setup_classes(conn, prov, mids):
+    for mid in mids:
+        add_material(conn, mid, f"v{mid}")
+        conn.execute("UPDATE material SET analysis_json=?, analysis_model='m' WHERE id=?",
+                     (prov.analyses[f"v{mid}"].model_dump_json(), mid))
+    conn.commit()
+
+
+def test_resend_after_variant_worker_backoff_keeps_originals(conn, monkeypatch):
+    """Un trabajo de variantes deja el worker en backoff después de armar un grupo; la respuesta
+    a ciegas es ilegible y se repite sin variantes: las originales no se vuelven a revisar."""
+    import time as time_module
+
+    from estudia.generation import variants as variants_module, verify
+    from estudia.generation.verify import WorkerUnavailable
+
+    real = variants_module.compute_variant_values
+    calls = []
+
+    def flaky(payload):
+        calls.append(1)
+        if len(calls) == 1:
+            return real(payload)
+        monkeypatch.setattr(verify, "_unavailable_until", time_module.monotonic() + 60)
+        raise WorkerUnavailable("tiempo agotado")
+
+    monkeypatch.setattr(variants_module, "compute_variant_values", flaky)
+    add_material(conn, 1, "v1")
+    questions = [linear_question(), percent_question(), q("Z", correct=1, check_expr="2")]
+    prov = FakeProvider({"v1": analysis(questions, topics=["Funciones lineales", "Porcentajes"])},
+                        lambda s, o: 1 if s == "Z" else 0, blind_errors=[AIFormatError("ilegible")])
+    res = process_material(conn, prov, 1)
+    assert res.kept == 3
+    assert all(r["variant_group"] is None for r in group_rows(conn))
+    assert [len(items) for items, _ in prov.blind_batches][1] == 3
+
+
+def test_multiclass_format_error_after_worker_trip_keeps_originals(conn, monkeypatch):
+    """El primer trabajo de variantes deja el worker en backoff; la respuesta del lote de dos
+    clases es ilegible y se reintenta de a una: las originales no se vuelven a revisar."""
+    import time as time_module
+
+    from estudia.generation import variants as variants_module, verify
+    from estudia.generation.pipeline import verify_batch
+    from estudia.generation.verify import WorkerUnavailable
+
+    def sick(payload):
+        monkeypatch.setattr(verify, "_unavailable_until", time_module.monotonic() + 60)
+        raise WorkerUnavailable("tiempo agotado")
+
+    monkeypatch.setattr(variants_module, "compute_variant_values", sick)
+    prov = FakeProvider({"v1": analysis([linear_question()]), "v2": analysis([q("B", correct=1, check_expr="2")])},
+                        lambda s, o: 1 if s == "B" else 0, blind_errors=[AIFormatError("ilegible")])
+    setup_classes(conn, prov, (1, 2))
+    results = verify_batch(conn, prov, [1, 2])
+    assert [r.kept for r in results] == [1, 1]
+
+
+def test_unexpected_error_in_a_multiclass_batch_keeps_originals_after_worker_trip(conn, monkeypatch):
+    """Un error inesperado al cerrar una clase del lote, con el worker en backoff por las
+    variantes: las demás clases se cierran con sus originales ya revisadas, sin variantes."""
+    import time as time_module
+
+    from estudia.generation import pipeline, variants as variants_module, verify
+    from estudia.generation.pipeline import verify_batch
+    from estudia.generation.verify import WorkerUnavailable
+
+    def sick(payload):
+        monkeypatch.setattr(verify, "_unavailable_until", time_module.monotonic() + 60)
+        raise WorkerUnavailable("tiempo agotado")
+
+    monkeypatch.setattr(variants_module, "compute_variant_values", sick)
+    real_finalize = pipeline._finalize
+    broken = []
+
+    def finalize(conn_, material_id, *args, **kwargs):
+        if material_id == 2 and not broken:
+            broken.append(1)
+            raise KeyError("raro")
+        return real_finalize(conn_, material_id, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_finalize", finalize)
+    prov = FakeProvider({"v1": analysis([linear_question()]), "v2": analysis([q("B", correct=1, check_expr="2")])},
+                        lambda s, o: 1 if s == "B" else 0)
+    setup_classes(conn, prov, (1, 2))
+    pipeline._verify_in_queue(conn, prov, [1, 2])
+    kept = {r["material_id"] for r in conn.execute("SELECT material_id FROM question")}
+    assert kept == {1, 2}
+    assert statuses(conn) == {1: "done", 2: "done"}
+
+
+def linear_with(a: int, b: int, c: int):
+    """La pregunta lineal con otros valores originales (la plantilla los reproduce)."""
+    from estudia.generation.variants import template_problems
+
+    base = linear_question()
+    key = a * c + b
+    question = base.model_copy(update={
+        "stem": f"Si f(x) = {a}x + {b}, ¿cuánto vale f({c})?",
+        "options": [str(key), str(a * (c + b)), str(a + b), str(a * c)],
+        "explanation": f"f({c}) = {a}·{c} + {b} = {key}.",
+        "common_error": f"Olvidarse de sumar {b} a {a}·{c}.",
+        "check_expr": str(key),
+        "variant": base.variant.model_copy(update={"original": [a, b, c]}),
+    })
+    assert template_problems(question) == []
+    return question
+
+
+def linear_set(n: int) -> list:
+    out = []
+    for a in range(2, 10):
+        for b in range(2, 10):
+            for c in range(2, 10):
+                if len({a, b, c}) < 3 or a * c + b in (a, b, c):
+                    continue
+                options = [a * c + b, a * (c + b), a + b, a * c]
+                if len(set(options)) == 4:
+                    out.append(linear_with(a, b, c))
+                if len(out) == n:
+                    return out
+    raise AssertionError("no alcanzan")
+
+
+def test_blind_request_holds_at_most_60_items_originals_first(conn):
+    from estudia.ai.quota import BLIND_ITEMS_MAX
+    from estudia.generation.pipeline import verify_batch
+
+    assert BLIND_ITEMS_MAX == 60
+    questions = linear_set(48)
+    prov = FakeProvider({f"v{m}": analysis(questions[(m - 1) * 12:m * 12]) for m in (1, 2, 3, 4)},
+                        lambda s, o: 0)
+    setup_classes(conn, prov, (1, 2, 3, 4))
+    results = verify_batch(conn, prov, [1, 2, 3, 4])
+    assert [r.kept for r in results] == [12] * 4
+    assert prov.requests["blind"] == 1
+    items = [stem for stem, _ in prov.blind_batches[0][0]]
+    assert len(items) == 60
+    assert items[:48] == [x.stem for x in questions]
+    sent = set(items[48:])
+    stored = [r["stem"] for r in conn.execute(
+        "SELECT stem FROM question WHERE variant_group IS NOT NULL AND variant_group != id")]
+    assert stored and set(stored) <= sent
+
+
+def test_more_originals_than_the_cap_get_no_variants(conn, monkeypatch):
+    from estudia.generation import variants as variants_module
+    from estudia.generation.pipeline import verify_batch
+
+    calls = []
+    monkeypatch.setattr(variants_module, "compute_variant_values", lambda p: calls.append(1) or [])
+    questions = linear_set(64)
+    prov = FakeProvider({f"v{m}": analysis(questions[(m - 1) * 16:m * 16]) for m in (1, 2, 3, 4)},
+                        lambda s, o: 0)
+    setup_classes(conn, prov, (1, 2, 3, 4))
+    results = verify_batch(conn, prov, [1, 2, 3, 4])
+    assert [r.kept for r in results] == [16] * 4    # las originales van todas
+    assert calls == [] and prov.requests["blind"] == 1
+    assert len(prov.blind_batches[0][0]) == 64
+
+
+def test_a_group_is_cut_to_the_room_left(conn):
+    """57 originales dejan lugar para 3 variantes: el grupo de 4 se recorta a 3."""
+    from estudia.generation.pipeline import verify_batch
+
+    questions = linear_set(57)
+    sizes = [14, 14, 14, 15]
+    starts = [0, 14, 28, 42]
+    prov = FakeProvider({f"v{m}": analysis(questions[starts[m - 1]:starts[m - 1] + sizes[m - 1]])
+                         for m in (1, 2, 3, 4)}, lambda s, o: 0)
+    setup_classes(conn, prov, (1, 2, 3, 4))
+    results = verify_batch(conn, prov, [1, 2, 3, 4])
+    assert [r.kept for r in results] == sizes
+    items = [stem for stem, _ in prov.blind_batches[0][0]]
+    assert len(items) == 60 and items[:57] == [x.stem for x in questions]
+    members = conn.execute("SELECT COUNT(*) FROM question WHERE variant_group IS NOT NULL"
+                           " AND variant_group != id").fetchone()[0]
+    assert members == 3

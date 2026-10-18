@@ -48,6 +48,25 @@ def option_key(text: str) -> str:
     return re.sub(r"\s+", "", text).casefold()
 
 
+class VariantParam(BaseModel):
+    name: str  # una letra minúscula
+    low: int
+    high: int  # inclusive
+
+
+# Plantilla de variantes numéricas de una pregunta con `check_expr`. La valida
+# `generation.variants.template_problems`; nada se evalúa fuera del worker de SymPy.
+# Sin docstring a propósito: iría como "description" en el esquema que se le manda a Gemini.
+class VariantTemplate(BaseModel):
+    params: list[VariantParam]  # de 1 a 3
+    original: list[int]  # valores de la pregunta original, en el orden de params
+    stem: str  # con {a}, {b}…
+    answer_expr: str  # SymPy con los parámetros
+    distractor_exprs: list[str]  # 3, en el orden de los distractores en options
+    explanation: str  # con {a} y {respuesta}, sin pasos intermedios
+    common_error: str  # con {a} y {respuesta}, sin pasos intermedios
+
+
 class GenQuestion(BaseModel):
     stem: str
     options: list[str]  # exactamente 4
@@ -57,6 +76,8 @@ class GenQuestion(BaseModel):
     topic: str  # idealmente uno de VideoAnalysis.topics; si no, se crea el tema
     source_seconds: int
     check_expr: str | None = None
+    # Un análisis guardado sin plantilla se sigue leyendo.
+    variant: VariantTemplate | None = None
 
 
 class Segment(BaseModel):
@@ -82,6 +103,7 @@ class DocQuestion(BaseModel):
     topic: str
     source_page: int | None  # página del archivo (desde 1) o número de diapositiva
     check_expr: str | None = None
+    variant: VariantTemplate | None = None
 
 
 class DocumentAnalysis(BaseModel):

@@ -162,3 +162,27 @@ def test_requests_are_added_to_the_daily_usage(conn):
     with pytest.raises(RuntimeError):
         reverify_all(conn, boom)
     assert used_today(conn, "blind", time.time()) == 4
+
+
+def add_group_member(conn, qid, mid, stem, group, correct=1):
+    add_question(conn, qid, mid, stem, correct=correct)
+    conn.execute("UPDATE question SET variant_group=?, variant_values_json='{\"a\": 1}' WHERE id=?",
+                 (group, qid))
+
+
+def test_reverify_sends_heads_only_and_retires_whole_group(conn):
+    add_material(conn, 1, "m")
+    add_group_member(conn, 1, 1, "Cabeza 1", group=1)
+    add_group_member(conn, 2, 1, "Variante 1a", group=1)
+    add_group_member(conn, 3, 1, "Variante 1b", group=1)
+    add_question(conn, 4, 1, "Suelta")
+    add_group_member(conn, 5, 1, "Cabeza 5", group=5)
+    add_group_member(conn, 6, 1, "Variante 5a", group=5)
+    conn.commit()
+    # Erra la cabeza 1; acierta la suelta y la cabeza 5.
+    prov = Scripted({"Cabeza 1": [0, 1, 1]})
+    result = reverify_all(conn, prov)
+    items, _ = prov.blind_batches[0]
+    assert [stem for stem, _ in items] == ["Cabeza 1", "Suelta", "Cabeza 5"]
+    assert retired(conn) == {1: 1, 2: 1, 3: 1, 4: 0, 5: 0, 6: 0}
+    assert (result.kept, result.retired) == (2, 3)

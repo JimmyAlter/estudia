@@ -26,6 +26,7 @@ ALLOWED_IMPORTS = {
     "ai/gemini.py": "el SDK de Gemini; httpx solo para atrapar TransportError",
     "material/video.py": "yt-dlp, solo a YouTube; sin imports de red propios",
     "moodle/sync.py": "urllib.parse (no hace pedidos)",
+    "db.py": "urllib.parse.quote para la URI de SQLite (no hace pedidos)",
     "__main__.py": "socket para buscar un puerto libre en 127.0.0.1",
 }
 
