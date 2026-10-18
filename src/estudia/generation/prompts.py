@@ -29,6 +29,8 @@ no a opciones absurdas. En "common_error" explicá cuál es el error típico.
 - "topic": debe ser exactamente uno de los textos de "topics".
 - "source_seconds": segundo del video en el que la clase explica el tema de \
 la pregunta.
+- "segments": los tramos de la clase en orden, cada uno con "start_s" y \
+"end_s" (segundos del video) y un "title" corto; sin superponerse.
 - "check_expr": completalo SOLO si las 4 opciones son valores numéricos o \
 algebraicos cerrados escritos solos (un número o una expresión cerrada como \
 2*sqrt(2), sin variables, sin unidades, sin %, sin palabras, sin pares ni \

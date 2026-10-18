@@ -20,6 +20,7 @@ const HOME: HomeData = {
   ],
   suggestion: { id: 1, name: "Límites", mastery: 0.6449, practiced: true, seen: 3, total: 12, at: PARCIAL },
   processing: { pending: 0, done: 2, failed: 0 },
+  ready: null,
 };
 
 const SESSION = {
@@ -36,13 +37,13 @@ const HEALTH: ExamHealth[] = [
       { topic_id: 1, topic: "Límites", probability: 0.64, minutes: 200 },
       { topic_id: 2, topic: "Derivadas", probability: 0.8, minutes: 160 },
     ],
-    today: SESSION,
+    today: SESSION, kind: "parcial", note: null, mock_suggested_at: null,
   },
 ];
 
 const exam = (over: Partial<ExamInfo>): ExamInfo => ({
   id: 3, course_id: 10, course: "Análisis Matemático", name: "Primer parcial", at: PARCIAL, closes_at: null,
-  source: "manual", topic_ids: [], max_grade: 10, time_limit_s: null, attempts: null, editable: true,
+  source: "manual", kind: "parcial", topic_ids: [], max_grade: 10, time_limit_s: null, attempts: null, editable: true,
   result: null, result_skipped: false, ...over,
 });
 
@@ -214,5 +215,129 @@ describe("Inicio: ronda 2", () => {
     });
     const list = (await screen.findByRole("heading", { name: "Hoy" })).nextElementSibling!;
     expect(list.textContent!.indexOf("Foco: Límites")).toBeLessThan(list.textContent!.indexOf("Aula 204"));
+  });
+});
+
+describe("Inicio 3.1", () => {
+  it("Inicio ofrece practicar con 10 preguntas aunque falten clases", async () => {
+    const onPractice = vi.fn();
+    renderHome(
+      {
+        "GET /api/home": {
+          ...HOME,
+          processing: { pending: 3, done: 1, failed: 0 },
+          ready: { course_id: 10, course: "Análisis Matemático", questions: 10 },
+        },
+      },
+      onPractice,
+    );
+    expect(
+      await screen.findByText("Ya hay 10 preguntas de Análisis Matemático: podés empezar mientras se preparan las demás."),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Practicar" }));
+    expect(onPractice).toHaveBeenCalledWith({});
+    // "Practicar" hace lo mismo que "Práctica de todo": no se ofrecen los dos.
+    expect(screen.queryByRole("button", { name: "Práctica de todo" })).not.toBeInTheDocument();
+  });
+
+  it("el tope de pedidos del día no se muestra como error", async () => {
+    mockApi({
+      "GET /api/home": { ...HOME, processing: { pending: 3, done: 1, failed: 0 } },
+      "GET /api/plan/health": [],
+      "GET /api/exams": [],
+      "GET /api/agenda": { days: [], health: [] },
+    });
+    render(
+      <Home refreshKey={0} aiStopReason="budget" working={false} onPractice={vi.fn()} onNavigate={() => {}} onSessionExpired={() => {}} />,
+    );
+    const line = await screen.findByText("Lo de hoy ya está. Las demás clases siguen mañana.");
+    expect(line).not.toHaveAttribute("role", "alert");
+    expect(line.className).not.toMatch(/bad/);
+    expect(screen.queryByText(/por preparar/)).not.toBeInTheDocument();
+  });
+
+  it("con el tope del día y preguntas listas, una sola línea que dice las dos cosas", async () => {
+    const onPractice = vi.fn();
+    mockApi({
+      "GET /api/home": {
+        ...HOME,
+        processing: { pending: 3, done: 1, failed: 0 },
+        ready: { course_id: 10, course: "Análisis Matemático", questions: 10 },
+      },
+      "GET /api/plan/health": [],
+      "GET /api/exams": [],
+      "GET /api/agenda": { days: [], health: [] },
+    });
+    render(
+      <Home refreshKey={0} aiStopReason="budget" working={false} onPractice={onPractice} onNavigate={() => {}} onSessionExpired={() => {}} />,
+    );
+    expect(
+      await screen.findByText("Ya hay 10 preguntas de Análisis Matemático. Las demás clases se preparan mañana."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Lo de hoy ya está/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/podés empezar mientras/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Practicar" }));
+    expect(onPractice).toHaveBeenCalledWith({});
+  });
+
+  it("el enlace Cómo vengo lleva a su pantalla, y sin pretest no hay oferta", async () => {
+    mockApi({
+      "GET /api/home": HOME,
+      "GET /api/plan/health": [],
+      "GET /api/exams": [],
+      "GET /api/agenda": { days: [], health: [] },
+    });
+    const onNavigate = vi.fn();
+    render(
+      <Home refreshKey={0} aiStopReason={null} working={false} onPractice={vi.fn()} onNavigate={onNavigate} onSessionExpired={() => {}} />,
+    );
+    const link = await screen.findByRole("link", { name: "Cómo vengo" });
+    expect(link).toHaveAttribute("href", "#/como-vengo");
+    await userEvent.click(link);
+    expect(onNavigate).toHaveBeenCalledWith("como-vengo");
+    expect(screen.queryByText("3 preguntas para arrancar")).not.toBeInTheDocument();
+  });
+
+  it("si llegás a todo, lo dice una vez y solo lista lo que tiene algo para hacer", async () => {
+    const ok = (over: Partial<ExamHealth>): ExamHealth => ({
+      ...HEALTH[0], verdict: "llegás", weak_topics: [], today: null, note: null, mock_suggested_at: null, ...over,
+    });
+    const onShortMock = vi.fn();
+    mockApi({
+      "GET /api/home": HOME,
+      "GET /api/plan/health": [
+        ok({ exam_id: 3 }),
+        ok({ exam_id: 4, exam: "Segundo parcial", at: PARCIAL + 86400 * 30 }),
+        ok({
+          exam_id: 5, exam: "Final de Matemática", at: PARCIAL + 86400 * 20, kind: "final",
+          note: "Faltan menos de 4 semanas: el plan usa el tiempo que hay.",
+        }),
+        ok({ exam_id: 6, exam: "Recuperatorio de funciones", at: PARCIAL + 86400 * 5, kind: "recuperatorio", mock_suggested_at: NOW }),
+      ],
+      "GET /api/exams": [],
+      "GET /api/agenda": { days: [], health: [] },
+    });
+    render(
+      <Home refreshKey={0} aiStopReason={null} working={false} onPractice={vi.fn()} onShortMock={onShortMock} onNavigate={() => {}} onSessionExpired={() => {}} />,
+    );
+    expect(await screen.findByText("Con tu tiempo actual llegás a todo.")).toBeInTheDocument();
+    expect(screen.queryByText(/con tu tiempo actual llegás\./i)).not.toBeInTheDocument();
+    // Sin acción ni nota, no hay línea.
+    expect(screen.queryByText(/Segundo parcial/)).not.toBeInTheDocument();
+    const line = (text: string) => (_: string, el: Element | null) => el?.tagName === "P" && el.textContent === text;
+    expect(screen.getByText(line("Final de Matemática: faltan menos de 4 semanas, el plan usa el tiempo que hay."))).toBeInTheDocument();
+    expect(screen.getByText(line("Recuperatorio de funciones · Hoy: simulacro corto"))).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Hoy: simulacro corto" }));
+    expect(onShortMock).toHaveBeenCalledWith(6);
+  });
+
+  it("no pregunta cómo te fue en una inscripción", async () => {
+    renderHome({
+      "GET /api/exams": [
+        exam({ id: 9, name: "Inscripción a finales", kind: "inscripcion", at: NOW - 3 * 86400, closes_at: NOW - 86400, max_grade: null }),
+      ],
+    });
+    await screen.findByText(/Probabilidad de que lo sepas/);
+    expect(screen.queryByText(/¿Cómo te fue/)).not.toBeInTheDocument();
   });
 });

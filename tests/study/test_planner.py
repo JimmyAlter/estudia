@@ -296,7 +296,8 @@ def test_replan_during_session_in_progress(conn):
     assert sum(s.minutes for s in today) <= 100
     assert hm(today[0].starts_at) == "19:00" and not today[0].done
     assert today[1].starts_at >= today[0].starts_at + (50 + 10) * 60
-    assert [(hm(s.starts_at), s.minutes) for s in today] == [("19:00", 50), ("20:00", 25), ("20:35", 25)]
+    # Los dos de 25 que entran después son del mismo tema: van juntos en uno de 50.
+    assert [(hm(s.starts_at), s.minutes) for s in today] == [("19:00", 50), ("20:00", 50)]
 
 
 @pytest.mark.parametrize("right", [(0, 3, 6, 9), (1, 3, 5, 8)])  # aciertos de 10: dominio 0,0·0,3·0,6·0,9 y 0,1·0,3·0,5·0,8
@@ -351,8 +352,9 @@ def test_late_night_utc_uses_local_day(conn):
     assert datetime.fromtimestamp(now, ZoneInfo("UTC")).date() > local_day(now)
     replan(conn, now)
     out = all_sessions(conn)
+    # Dos de 25 del mismo tema, seguidos: una sola sesión de 50.
     assert [(local_day(s.starts_at), hm(s.starts_at), s.minutes) for s in out] == [
-        (local_day(local(17)), "21:05", 25), (local_day(local(17)), "21:40", 25)]
+        (local_day(local(17)), "21:05", 50)]
     health = plan_health(conn, now)
     assert health[0].minutes_available == 50  # sábado 50 + domingo 0; el lunes es el examen
 
@@ -433,8 +435,7 @@ def test_last_week_sessions_all_mixed(conn):
     for s in week:
         assert sorted(s.topic_ids) == [1, 2, 3] and s.topic_ids[0] == s.topic_id
         assert (s.review_minutes, s.focus_minutes) == (s.minutes, 0)
-        others = [f"T{t}" for t in s.topic_ids[1:]]
-        assert s.label == f"Repaso mezclado: T{s.topic_id}, {others[0]} y 1 más"
+        assert s.label == "Repaso mezclado: T1, T2 y 1 más"
     # el sábado faltan 8 días: todavía hay foco
     saturday = [s for s in out if local_day(s.starts_at) == local_day(NOW)]
     assert saturday and all(s.kind != "mixed_only" for s in saturday)
@@ -572,7 +573,7 @@ def test_mixed_labels_name_their_topics(conn):
             "VALUES (10, ?, ?, ?, 50, ?, ?)", (topics[0], exam, local(18, 8 + i), kind, json.dumps(topics)))
     conn.commit()
     assert [s.label for s in all_sessions(conn)] == [
-        "Repaso mezclado: T3, T1 y 2 más", "Repaso mezclado: T2 y T1", "Repaso mezclado: T4",
+        "Repaso mezclado: T1, T2 y 2 más", "Repaso mezclado: T1 y T2", "Repaso mezclado: T4",
         "Foco: T1, con repaso de T2 y T3", "Foco: T1", "Foco: T2"]
 
 
@@ -593,3 +594,75 @@ def test_answers_never_count_for_a_later_session(conn, minutes, now):
         answer(conn, 1 + i % 2, 1, local(17, 19) + minute * 60)
     assert mark_done_from_answers(conn, now) == 1
     assert [s.done for s in all_sessions(conn) if s.id in {t.id for t in today}] == [True, False]
+
+
+# --- Crítico 3a, ronda 1: rótulos estables y sesiones seguidas del mismo conjunto ---
+
+def test_mixed_label_is_stable_whatever_the_focus(conn):
+    for t in (1, 2, 3):
+        add_topic(conn, t)
+    exam = create_manual_exam(conn, 10, "Parcial", local(25, 9), [], None)
+    rows = [("mixed_only", [3, 1, 2]), ("mixed_only", [2, 3, 1]), ("mixed_focus", [2, 3, 1]),
+            ("mixed_focus", [2, 1, 3])]
+    for i, (kind, topics) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO plan_session(course_id, topic_id, exam_id, starts_at, minutes, kind, topics_json) "
+            "VALUES (10, ?, ?, ?, 50, ?, ?)", (topics[0], exam, local(18, 8 + i), kind, json.dumps(topics)))
+    conn.commit()
+    assert [s.label for s in all_sessions(conn)] == [
+        "Repaso mezclado: T1, T2 y 1 más", "Repaso mezclado: T1, T2 y 1 más",
+        "Foco: T2, con repaso de T1 y T3", "Foco: T2, con repaso de T1 y T3"]
+    # El orden de los temas para practicar no cambia: el foco sigue primero.
+    assert [s.topic_ids[0] for s in all_sessions(conn)] == [3, 2, 2, 2]
+
+
+def test_back_to_back_sessions_of_the_same_topics_merge(conn):
+    add_topic(conn, 1)
+    create_manual_exam(conn, 10, "Parcial", local(31, 9), [], None)
+    set_availability(conn, {0: 50, 5: 100})   # lunes: dos bloques de 25; sábado: dos de 50
+    replan(conn, NOW)
+    by_day: dict = {}
+    for s in all_sessions(conn):
+        by_day.setdefault(local_day(s.starts_at), []).append(s)
+    # Dos de 25 seguidos del mismo tema son una sesión de 50, sin pasarse del bloque.
+    monday = by_day[local_day(local(19))]
+    assert [(hm(s.starts_at), s.minutes, s.label) for s in monday] == [("19:00", 50, "Foco: T1")]
+    # Dos de 50 no se unen (el bloque es de 50), pero dicen lo mismo.
+    saturday = by_day[local_day(local(17))]
+    assert [(hm(s.starts_at), s.minutes) for s in saturday] == [("19:00", 50), ("20:00", 50)]
+    assert len({s.label for s in saturday}) == 1
+
+
+def test_last_week_back_to_back_mixed_sessions_merge(conn):
+    for t in (1, 2):
+        add_topic(conn, t)
+    exam = create_manual_exam(conn, 10, "Parcial", local(22, 9), [], None)   # jueves 22
+    set_availability(conn, everyday(50))
+    replan(conn, NOW)
+    week = [s for s in all_sessions(conn) if s.exam_id == exam]
+    by_day: dict = {}
+    for s in week:
+        by_day.setdefault(local_day(s.starts_at), []).append(s)
+    assert by_day and all(s.kind == "mixed_only" for s in week)
+    for items in by_day.values():
+        assert [(hm(s.starts_at), s.minutes) for s in items] == [("19:00", 50)]
+        assert items[0].label == "Repaso mezclado: T1 y T2"
+
+
+def test_names_with_y_inside_are_joined_with_commas(conn):
+    conn.execute("INSERT INTO topic(id, course_id, slug, name) VALUES (21, 10, 'a', 'Paralelismo y perpendicularidad')")
+    conn.execute("INSERT INTO topic(id, course_id, slug, name) VALUES (22, 10, 'b', 'Funciones lineales y pendiente')")
+    conn.execute("INSERT INTO topic(id, course_id, slug, name) VALUES (23, 10, 'c', 'Rectas')")
+    exam = create_manual_exam(conn, 10, "Parcial", local(25, 9), [], None)
+    rows = [("mixed_only", [21, 22]), ("mixed_focus", [23, 21]), ("mixed_only", [23, 21, 22])]
+    for i, (kind, topics) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO plan_session(course_id, topic_id, exam_id, starts_at, minutes, kind, topics_json) "
+            "VALUES (10, ?, ?, ?, 50, ?, ?)", (topics[0], exam, local(18, 8 + i), kind, json.dumps(topics)))
+    conn.commit()
+    # Con una "y" adentro de un nombre, "A y B" se leería como tres temas: van con coma.
+    assert [s.label for s in all_sessions(conn)] == [
+        "Repaso mezclado: Funciones lineales y pendiente, Paralelismo y perpendicularidad",
+        "Foco: Rectas, con repaso de Paralelismo y perpendicularidad",
+        "Repaso mezclado: Funciones lineales y pendiente, Paralelismo y perpendicularidad y 1 más",
+    ]

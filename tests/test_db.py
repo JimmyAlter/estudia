@@ -146,3 +146,17 @@ def test_fresh_install_does_not_turn_on_later(tmp_path):
     conn = connect(path)
     assert _kv(conn, "allow_download") is None
     conn.close()
+
+
+def test_connect_drops_the_old_global_calendar_feed_status(tmp_path):
+    """La marca global vieja del calendario (antes de ser por campus) se borra al abrir la base."""
+    conn = connect(tmp_path / "e.db")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('calendar_feed_status', 'unavailable')")
+    conn.execute("INSERT INTO kv(key, value) VALUES ('calendar_feed_status:utn-frba', 'saved')")
+    conn.commit()
+    conn.close()
+    for _ in range(2):   # la segunda vez no hay nada que borrar y no falla
+        conn = connect(tmp_path / "e.db")
+        keys = {r[0] for r in conn.execute("SELECT key FROM kv WHERE key LIKE 'calendar_feed_status%'")}
+        assert keys == {"calendar_feed_status:utn-frba"}
+        conn.close()

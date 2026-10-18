@@ -66,12 +66,15 @@ export function plural(n: number, one: string, many: string): string {
 }
 
 const OPERATOR = "[=+\\-−·/×<>≤≥]";
-const AROUND_OPERATOR = new RegExp(` (?=${OPERATOR})|(?<=${OPERATOR}) `, "g");
+const OPERATOR_BUT_EQUALS = "[+\\-−·/×<>≤≥]";
+const AROUND_OPERATOR = new RegExp(`(?<!=) (?=${OPERATOR})|(?<=${OPERATOR_BUT_EQUALS}) `, "g");
 
 /**
  * Evita que una cuenta se corte a mitad de línea ("y = kx + 2" queda junta):
  * los espacios alrededor de operadores y dentro de paréntesis pasan a ser
- * espacios duros. El resto del texto se corta normalmente.
+ * espacios duros. El espacio después de un "=" queda normal, así una cadena
+ * larga ("d = √25 = 5") se corta solo ahí y nunca a mitad de un término.
+ * El resto del texto se corta normalmente.
  */
 export function keepMath(text: string): string {
   return text
@@ -149,5 +152,5 @@ export function freeTime(minutes: number): string {
 
 /** Nota en la escala del examen, con coma: 7.5 → "7,5". */
 export function grade(value: number): string {
-  return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 2 }).format(value);
+  return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 1 }).format(value);
 }

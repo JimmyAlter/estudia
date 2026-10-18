@@ -1,0 +1,16 @@
+{
+  "sitename": "Campus de prueba",
+  "username": "alumna.prueba",
+  "fullname": "Alumna Prueba",
+  "userid": 4242,
+  "siteurl": "https://campus.example",
+  "release": "4.1.2 (Build: 20230313)",
+  "functions": [
+    {"name": "core_webservice_get_site_info", "version": "2022112800"},
+    {"name": "core_enrol_get_users_courses", "version": "2022112800"},
+    {"name": "core_course_get_contents", "version": "2022112800"},
+    {"name": "core_calendar_get_action_events_by_timesort", "version": "2022112800"},
+    {"name": "core_calendar_get_calendar_export_token", "version": "2022112800"},
+    {"name": "mod_quiz_get_quizzes_by_courses", "version": "2022112800"}
+  ]
+}

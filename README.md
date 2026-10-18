@@ -7,7 +7,7 @@
 Gratis, de código abierto y corre en tu PC. Hecho por un estudiante del ingreso a la UTN.
 
 [![Licencia MIT](https://img.shields.io/badge/licencia-MIT-2a2c2e)](LICENSE)
-[![Estado: etapa 1](https://img.shields.io/badge/estado-etapa%202%20·%20FRBA-c4532b)](#roadmap)
+[![Estado: etapa 1](https://img.shields.io/badge/estado-etapa%203%20·%20FRBA-c4532b)](#roadmap)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-2a2c2e)](https://www.python.org/)
 
 <img src="docs/img/estudia-demo.gif" alt="Recorrido por Estudia: el inicio muestra el próximo examen y el tema más flojo; en la práctica se responde mal, aparece la explicación con el minuto de la clase, se responde bien, se ve el resultado y se abre un resumen en Materiales." width="860">
@@ -23,6 +23,7 @@ Gratis, de código abierto y corre en tu PC. Hecho por un estudiante del ingreso
 - **Sabés si llegás al examen.** Para cada tema ves la probabilidad de que lo sepas el día del parcial, y "¿Llegás?" te dice por qué y qué estudiar hoy.
 - **Tu semana, ordenada.** La agenda junta tus horarios de cursada, entregas y exámenes del campus, y un plan reparte sesiones de estudio en el tiempo que le das, sin pisarse con tus clases. Se exporta a Google Calendar o al celular con un archivo `.ics`.
 - **Un simulacro antes del parcial.** Mismos temas, reloj y escala de nota que el examen, sin ver las respuestas hasta el final. Antes te pregunta cuánto creés que te sacás, para que veas si te estás sobreestimando.
+- **Para cada momento de la cursada.** Inscripciones con aviso antes del cierre, recuperatorio que repasa solo lo que no tenés firme, y final con un plan de 6 semanas. Te lo dice sin retar.
 - **Practicar como pide la ciencia del aprendizaje.** Te pregunta qué tan seguro estabas (una respuesta adivinada no cuenta como sabida), a veces te pide pensar antes de ver las opciones o escribir el resultado, y antes del parcial mezcla temas para que practiques reconocer qué método va.
 
 ## Cómo se ve
@@ -236,7 +237,8 @@ Hoy el único login probado de punta a punta es `"browser"`. Las entradas nuevas
 
 - [x] **Etapa 1:** camino UTN-FRBA de punta a punta. Login por navegador, clases en video procesadas con Gemini, preguntas verificadas, práctica con repaso de errores, inicio centrado en el próximo examen y resúmenes.
 - [x] **Etapa 2:** agenda con horarios, entregas y exámenes (también cargados a mano), plan de estudio con "¿Llegás?", simulacro con el reloj y la escala del examen real, repaso espaciado por pregunta, confianza y respuestas escritas, exportar a calendario (`.ics`) y a Anki, y recordatorios en la PC.
-- [ ] **Etapa 3:** problemas en papel corregidos con una foto (desde la PC o el celular por QR), y métodos de la cátedra detectados y confirmados con vos.
+- [x] **Etapa 3a:** cola por fecha de examen y cuota de Gemini mejor aprovechada, 3 preguntas para arrancar, recuerdo libre, "Explicá por qué", "Cómo vengo", mazo de la semana y calendario del campus en el celular, inscripciones, recuperatorio y final.
+- [ ] **Etapa 3b y 3c:** PDF y apuntes (para UBA y el CBC), simulacro con tus parciales viejos, variantes numéricas de las preguntas y problemas en papel corregidos con una foto.
 - [ ] **Etapa 4:** Claude y ChatGPT además de Gemini, videos subidos a Moodle y PDFs.
 - [ ] **Etapa 5:** catálogo completo (todas las facultades de la tabla), login con usuario y contraseña y con Office 365, y materias sin cuentas con respuestas verificadas contra una cita del material.
 - [x] **Etapa 6:** instalador para Windows, enlace de vuelta del login registrado solo y actualizaciones por GitHub Releases.

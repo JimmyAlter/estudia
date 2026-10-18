@@ -6,9 +6,15 @@ import re
 import sqlite3
 import tempfile
 import unicodedata
+from collections.abc import Collection
 from html import escape
 
 import genanki
+
+from estudia.study.exams import exam_topics
+from estudia.study.home import next_exam
+
+WEEK_DAYS = 7  # el mazo de la semana: lo que vence en los próximos 7 días
 
 # NUNCA CAMBIAR: Anki identifica el tipo de nota por este número. Si cambia, al
 # reimportar se crea un tipo nuevo y las tarjetas ya estudiadas se duplican.
@@ -93,8 +99,32 @@ def _note(r: sqlite3.Row) -> genanki.Note:
     )
 
 
-def build_apkg(conn: sqlite3.Connection, course_id: int | None) -> bytes:
-    """Archivo .apkg con un mazo por curso (o solo el pedido).
+def weekly_question_ids(conn: sqlite3.Connection, now: int) -> set[int]:
+    """Preguntas verificadas y no retiradas que vencen en `WEEK_DAYS` días, más las de los temas del próximo examen."""
+    ids = {
+        r[0]
+        for r in conn.execute(
+            "SELECT q.id FROM question q JOIN review_state rs ON rs.card_key = 'q:' || q.id"
+            " WHERE q.verified = 1 AND q.retired = 0 AND rs.due < ?",
+            (now + WEEK_DAYS * 86400,),
+        )
+    }
+    exam = next_exam(conn, now)
+    topics = exam_topics(conn, exam["id"]) if exam else []
+    if topics:
+        marks = ",".join("?" * len(topics))
+        ids.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT id FROM question WHERE verified = 1 AND retired = 0 AND topic_id IN ({marks})", topics
+            )
+        )
+    return ids
+
+
+def build_apkg(conn: sqlite3.Connection, course_id: int | None,
+               question_ids: Collection[int] | None = None) -> bytes:
+    """Archivo .apkg con un mazo por curso (o solo el pedido); con `question_ids`, solo esas preguntas.
 
     Levanta LookupError si no hay ninguna pregunta verificada para exportar.
     """
@@ -109,6 +139,10 @@ def build_apkg(conn: sqlite3.Connection, course_id: int | None) -> bytes:
     if course_id is not None:
         sql += " AND t.course_id = ?"
         params.append(course_id)
+    if question_ids is not None:
+        ids = sorted(question_ids)
+        sql += f" AND q.id IN ({','.join('?' * len(ids))})"
+        params += ids
     sql += " ORDER BY t.course_id, q.id"
 
     decks: dict[int, genanki.Deck] = {}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiError, api, type ExamInfo, type MockAnswer, type MockResult, type MockStart, type QuizParams } from "../api";
 import { formatDuration, formatTimestamp, grade, keepMath, tidy } from "../format";
 import { Button, FIELD, Label, Notice, TypedField } from "../ui";
@@ -10,11 +10,13 @@ const PER_QUESTION_TEXT = "90 segundos por pregunta";
 interface Props {
   onPractice: (params: QuizParams) => void;
   onExit: () => void;
+  /** Desde el botón del simulacro corto ("Hoy: simulacro corto"): ese examen y, con `short`, 6 preguntas. */
+  start?: { examId: number; short: boolean } | null;
 }
 
 type Answers = Record<number, MockAnswer>;
 
-export default function Mock({ onPractice, onExit }: Props) {
+export default function Mock({ onPractice, onExit, start }: Props) {
   const [exams, setExams] = useState<ExamInfo[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [examId, setExamId] = useState<number | null>(null);
@@ -29,9 +31,10 @@ export default function Mock({ onPractice, onExit }: Props) {
       .then((list) => {
         if (!alive) return;
         const now = Date.now() / 1000;
-        const upcoming = list.filter((e) => e.at != null && (e.closes_at ?? e.at) > now);
+        // Una inscripción no es un examen: no tiene simulacro.
+        const upcoming = list.filter((e) => e.kind !== "inscripcion" && e.at != null && (e.closes_at ?? e.at) > now);
         setExams(upcoming);
-        setExamId(upcoming[0]?.id ?? null);
+        setExamId((upcoming.find((e) => e.id === start?.examId) ?? upcoming[0])?.id ?? null);
       })
       .catch(() => alive && setFailed(true));
     return () => {
@@ -42,6 +45,8 @@ export default function Mock({ onPractice, onExit }: Props) {
   if (failed) return <Notice>No se pudieron cargar los exámenes. Probá recargar la página.</Notice>;
   if (!exams) return null;
   const exam = exams.find((e) => e.id === examId) ?? null;
+  // El simulacro corto es solo el del examen pedido; si ese ya no está, es uno común.
+  const short = Boolean(start?.short && exam && exam.id === start.examId);
 
   if (result && attempt && exam) {
     return (
@@ -69,6 +74,7 @@ export default function Mock({ onPractice, onExit }: Props) {
     <Setup
       exams={exams}
       exam={exam}
+      short={short}
       onChoose={setExamId}
       onStarted={(a) => {
         setAnswers({});
@@ -84,12 +90,14 @@ export default function Mock({ onPractice, onExit }: Props) {
 function Setup({
   exams,
   exam,
+  short,
   onChoose,
   onStarted,
   onExit,
 }: {
   exams: ExamInfo[];
   exam: ExamInfo | null;
+  short: boolean;
   onChoose: (id: number) => void;
   onStarted: (attempt: MockStart) => void;
   onExit: () => void;
@@ -97,6 +105,8 @@ function Setup({
   const id = useId();
   const [prediction, setPrediction] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // "Todavía no hay suficientes preguntas…": no es un error, se dice tranquilo.
+  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   if (!exam) {
@@ -124,18 +134,24 @@ function Setup({
     }
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
-      onStarted(await api.startMock(exam!.id, predicted));
+      onStarted(await api.startMock(exam!.id, predicted, short));
     } catch (err) {
-      setError(err instanceof ApiError && err.status === 409 ? err.detail : "No se pudo armar el simulacro. Probá de nuevo.");
+      if (err instanceof ApiError && err.status === 409) setNotice(err.detail);
+      else setError("No se pudo armar el simulacro. Probá de nuevo.");
       setBusy(false);
     }
   }
 
+  // Con el selector a la vista, la materia ya está en cada opción. El corto no elige examen.
+  const choosing = exams.length > 1 && !short;
+  // El corto usa el reloj de 90 segundos por pregunta, no el límite del examen.
+  const perQuestion = short || !exam.time_limit_s;
   return (
     <div className="max-w-xl">
-      <Label className="mb-2">Simulacro</Label>
-      {exams.length > 1 ? (
+      <Label className="mb-2">{short ? "Simulacro corto" : "Simulacro"}</Label>
+      {choosing ? (
         <fieldset className="mb-6">
           <legend className="mb-3 font-serif text-[2rem] leading-tight tracking-[-0.02em]">¿De qué examen?</legend>
           <div className="space-y-1">
@@ -159,16 +175,29 @@ function Setup({
         <h1 className="mb-2 font-serif text-[2.2rem] leading-[1.1] tracking-[-0.025em]">{tidy(exam.name)}</h1>
       )}
       <p className="text-muted">
+        {/* Cada dato entero en su renglón: la línea se corta solo en los puntos. */}
         {[
-          // Con el selector a la vista, la materia ya está en cada opción.
-          exams.length > 1 ? null : tidy(exam.course),
-          exam.time_limit_s ? formatDuration(exam.time_limit_s) : PER_QUESTION_TEXT,
+          choosing ? null : tidy(exam.course),
+          short
+            ? exam.kind === "recuperatorio"
+              ? "6 preguntas de los temas que todavía no tenés firmes"
+              : "6 preguntas"
+            : null,
+          // Un límite del examen es un dato más de la línea.
+          perQuestion ? null : formatDuration(exam.time_limit_s!),
         ]
           .filter(Boolean)
-          .join(" · ")}
+          .map((part, i) => (
+            <Fragment key={i}>
+              {i > 0 && " · "}
+              <span className="sm:whitespace-nowrap">{part}</span>
+            </Fragment>
+          ))}
+        {/* El reloj por pregunta (el corto siempre lo usa) va en su propio renglón. */}
+        {perQuestion && <span className="block">{PER_QUESTION_TEXT}</span>}
       </p>
       <p className="mt-6 font-medium">No vas a ver las respuestas hasta el final</p>
-      <p className="mt-1 text-sm text-muted">Podés ir y volver entre las preguntas. Al terminar el tiempo se entrega solo.</p>
+      <p className="mt-1 text-sm text-muted">Podés ir y volver entre las preguntas. Cuando se termina el tiempo, se entrega solo.</p>
 
       <form
         className="mt-10"
@@ -200,6 +229,11 @@ function Setup({
         {error && (
           <p role="alert" className="mt-2 text-sm text-bad">
             {error}
+          </p>
+        )}
+        {notice && (
+          <p role="status" className="mt-6 text-sm text-muted">
+            {notice}
           </p>
         )}
         <div className="mt-8 flex flex-wrap gap-3">

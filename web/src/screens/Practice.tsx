@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import {
   ApiError,
   api,
@@ -10,7 +10,7 @@ import {
   type SessionInfo,
 } from "../api";
 import { formatTimestamp, keepMath, plural, tidy } from "../format";
-import { Button, Label, Notice, TypedField } from "../ui";
+import { Button, FIELD, Label, Notice, TypedField } from "../ui";
 
 const UNDO_MS = 5000;
 /** Enter no saltea la corrección antes de este tiempo: primero hay que leerla. */
@@ -47,7 +47,7 @@ const CONFIDENCE: { value: Confidence; label: string; key: string }[] = [
 
 let nextKey = 0;
 
-function shuffled(length: number): number[] {
+export function shuffled(length: number): number[] {
   const order = Array.from({ length }, (_, i) => i);
   for (let i = order.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -100,6 +100,11 @@ export default function Practice({ params, session, onExit }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [classTitles, setClassTitles] = useState<Map<string, string>>(new Map());
+  /**
+   * "Explicá por qué" después de un acierto dudoso: `ask` mientras escribe (la explicación espera),
+   * `compare` con lo escrito a la vista, `done` cuando ya contestó o salteó.
+   */
+  const [explain, setExplain] = useState<{ step: "ask" | "compare" | "done"; text: string } | null>(null);
   const shownAt = useRef(Date.now());
   const revealedMs = useRef<number | null>(null);
   const feedbackRef = useRef<HTMLElement>(null);
@@ -184,7 +189,8 @@ export default function Practice({ params, session, onExit }: Props) {
   useEffect(() => {
     setCanSkip(false);
     if (!feedback) return;
-    feedbackRef.current?.focus();
+    // Si se pide "Explicá por qué", el foco va a su campo (lo enfoca el propio campo).
+    if (!feedback.explain_prompt) feedbackRef.current?.focus();
     const timer = window.setTimeout(() => setCanSkip(true), FEEDBACK_MIN_MS);
     return () => window.clearTimeout(timer);
   }, [feedback]);
@@ -236,6 +242,7 @@ export default function Practice({ params, session, onExit }: Props) {
           shown_order: typing ? [] : item.order,
         });
         setFeedback(fb);
+        setExplain(fb.explain_prompt && fb.answer_id != null ? { step: "ask", text: "" } : null);
         setAnsweredText(typing ? typed : null);
         setResults((r) => (r.some((x) => x.item.question_id === item.question_id) ? r : [...r, { item, correct: fb.correct }]));
         if (fb.requeue) {
@@ -272,6 +279,7 @@ export default function Practice({ params, session, onExit }: Props) {
 
   const next = useCallback(() => {
     setFeedback(null);
+    setExplain(null);
     setError(null);
     setRelearnNote(false);
     setIndex((i) => i + 1);
@@ -335,12 +343,13 @@ export default function Practice({ params, session, onExit }: Props) {
         }
       } else if (event.key === "Enter" && !target?.closest("button, a, summary")) {
         event.preventDefault();
-        if (canSkip) next();
+        // Mientras se pide "Explicá por qué", se sigue con Listo o Saltear.
+        if (canSkip && explain?.step !== "ask") next();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [item, feedback, revealed, typedReady, chosen, canSkip, pick, send, next]);
+  }, [item, feedback, revealed, typedReady, chosen, canSkip, explain, pick, send, next]);
 
   if (items === null) return error ? <Notice>{error}</Notice> : null;
 
@@ -524,6 +533,11 @@ export default function Practice({ params, session, onExit }: Props) {
               </span>
             </p>
           )}
+          {explain?.step === "ask" ? (
+            <ExplainPrompt
+              onDone={(text) => setExplain({ step: text ? "compare" : "done", text })}
+            />
+          ) : (
           <FeedbackBody
             feedback={feedback}
             typed={answeredText !== null}
@@ -543,13 +557,17 @@ export default function Practice({ params, session, onExit }: Props) {
               )
             }
           />
-          {(feedback.next_label || feedback.relearn_progress) && (
+          )}
+          {explain && explain.step !== "ask" && explain.text && feedback.answer_id != null && (
+            <ExplainCompare text={explain.text} answerId={feedback.answer_id} />
+          )}
+          {explain?.step !== "ask" && (feedback.next_label || feedback.relearn_progress) && (
             <p className="mt-6 text-sm text-muted">
               {[feedback.next_label, feedback.relearn_progress].filter(Boolean).join(" · ")}
             </p>
           )}
-          {relearnNote && <p className="mt-1 text-sm text-muted">{RELEARN_NOTE}</p>}
-          <div className="mt-8 flex flex-wrap items-baseline gap-x-6 gap-y-3">
+          {relearnNote && explain?.step !== "ask" && <p className="mt-1 text-sm text-muted">{RELEARN_NOTE}</p>}
+          <div className={`mt-8 flex flex-wrap items-baseline gap-x-6 gap-y-3 ${explain?.step === "ask" ? "hidden" : ""}`}>
             <Button onClick={next}>{index + 1 < items.length ? "Siguiente" : "Ver resultado"}</Button>
             {undoLine ?? (
               <Button variant="quiet" className="text-sm" onClick={report} disabled={busy}>
@@ -558,6 +576,102 @@ export default function Practice({ params, session, onExit }: Props) {
             )}
           </div>
         </section>
+      )}
+    </div>
+  );
+}
+
+/**
+ * "Explicá por qué": una línea propia antes de ver la explicación. Lo escrito queda en la pantalla
+ * para compararlo; no se manda a ningún lado.
+ */
+function ExplainPrompt({ onDone }: { onDone: (text: string) => void }) {
+  const id = useId();
+  const [text, setText] = useState("");
+  return (
+    <form
+      className="max-w-xl"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (text.trim()) onDone(text.trim());
+      }}
+    >
+      <p className="mb-4 font-semibold text-ok">Bien, pero dudaste.</p>
+      <label htmlFor={id} className="mb-1.5 block font-medium">
+        Explicá por qué: escribilo en una línea
+      </label>
+      <div className="flex flex-wrap items-baseline gap-x-5 gap-y-3">
+        <input
+          id={id}
+          type="text"
+          autoComplete="off"
+          maxLength={200}
+          value={text}
+          autoFocus
+          onChange={(e) => setText(e.target.value)}
+          className={`min-w-0 flex-1 basis-56 text-[1.0625rem] ${FIELD}`}
+        />
+        <div className="flex items-baseline gap-5">
+          <Button type="submit" variant="secondary" disabled={!text.trim()}>
+            Listo
+          </Button>
+          <Button variant="quiet" className="text-sm" onClick={() => onDone("")}>
+            Saltear
+          </Button>
+        </div>
+      </div>
+      <p className="mt-2 text-sm text-muted">Después ves la explicación y la comparás con la tuya.</p>
+    </form>
+  );
+}
+
+/** Lo que escribió, al lado de la explicación de arriba, y "¿Dijiste lo mismo?". */
+function ExplainCompare({ text, answerId }: { text: string; answerId: number }) {
+  const id = useId();
+  const [answered, setAnswered] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function send(same: boolean) {
+    setBusy(true);
+    setError(false);
+    try {
+      await api.explain(answerId, same);
+      setAnswered(true);
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-6 max-w-xl">
+      <Label className="mb-1">Tu explicación</Label>
+      <p className="text-[1.0625rem] leading-relaxed">{text}</p>
+      {answered ? (
+        <p role="status" className="mt-4 text-sm text-muted">
+          Anotado. Cuenta para el repaso.
+        </p>
+      ) : (
+        <div role="group" aria-labelledby={id} className="mt-4 flex flex-wrap items-baseline gap-x-4 gap-y-2">
+          <p id={id} className="font-medium">
+            ¿Dijiste lo mismo?
+          </p>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={() => send(true)} disabled={busy}>
+              Sí
+            </Button>
+            <Button variant="secondary" onClick={() => send(false)} disabled={busy}>
+              No
+            </Button>
+          </div>
+        </div>
+      )}
+      {error && (
+        <p role="alert" className="mt-2 text-sm text-bad">
+          No se pudo guardar. Probá de nuevo.
+        </p>
       )}
     </div>
   );
@@ -652,9 +766,9 @@ function FeedbackBody({
   }
 }
 
-type OptionState = "idle" | "picked" | "right" | "rightPicked" | "wrongPicked" | "faded";
+export type OptionState = "idle" | "picked" | "right" | "rightPicked" | "wrongPicked" | "faded";
 
-function optionState(original: number, chosen: number | null, feedback: Feedback | null): OptionState {
+export function optionState(original: number, chosen: number | null, feedback: Feedback | null): OptionState {
   if (!feedback) return chosen === original ? "picked" : "idle";
   if (original === feedback.correct_index) return original === chosen ? "rightPicked" : "right";
   if (original === chosen) return "wrongPicked";
@@ -676,21 +790,40 @@ const OPTION_TAGS: Partial<Record<OptionState, [string, string]>> = {
   wrongPicked: ["Tu respuesta, incorrecta", "text-bad"],
 };
 
+/**
+ * Sin juicio (preguntas para arrancar): la correcta se marca en tinta y lo elegido solo dice
+ * "Tu respuesta". Nada en verde ni en rojo, porque no es una evaluación.
+ */
+const NEUTRAL_STYLES: Partial<Record<OptionState, string>> = {
+  right: "border-ink",
+  rightPicked: "border-ink",
+  wrongPicked: "border-line",
+};
+
+const NEUTRAL_TAGS: Partial<Record<OptionState, [string, string]>> = {
+  right: ["Correcta", "text-ink"],
+  rightPicked: ["Correcta · tu respuesta", "text-ink"],
+  wrongPicked: ["Tu respuesta", "text-muted"],
+};
+
 export function OptionButton(props: {
   text: string;
   number: number;
   state: OptionState;
   disabled: boolean;
   onClick: () => void;
+  /** Sin verde ni rojo: para las preguntas para arrancar. */
+  neutral?: boolean;
 }) {
-  const tag = OPTION_TAGS[props.state];
+  const tag = (props.neutral ? NEUTRAL_TAGS : OPTION_TAGS)[props.state];
+  const style = (props.neutral && NEUTRAL_STYLES[props.state]) || OPTION_STYLES[props.state];
   return (
     <button
       type="button"
       onClick={props.onClick}
       disabled={props.disabled}
       aria-pressed={props.state === "picked" ? true : props.state === "idle" ? false : undefined}
-      className={`press flex w-full items-baseline gap-4 rounded-lg border px-4 py-3 text-left text-[1.0625rem] ${OPTION_STYLES[props.state]}`}
+      className={`press flex w-full items-baseline gap-4 rounded-lg border px-4 py-3 text-left text-[1.0625rem] ${style}`}
     >
       <span className="math min-w-0 flex-1">{props.text}</span>
       {tag ? (

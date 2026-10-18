@@ -116,3 +116,27 @@ def test_tab_becomes_a_space(conn):
     conn.commit()
     summary = next(x for x in _unfold(build_ics(conn, NOW)) if x.startswith("SUMMARY:Examen"))
     assert "Parcial uno" in summary
+
+
+def test_ics_includes_enrollment_open_and_close(conn):
+    conn.execute("INSERT INTO exam(id, course_id, name, opens_at, closes_at, source, kind) "
+                 "VALUES (4, 10, 'Inscripción a finales', ?, ?, 'manual', 'inscripcion')",
+                 (NOW + DAY, NOW + 5 * DAY))
+    conn.commit()
+    lines = _unfold(build_ics(conn, NOW))
+    assert "UID:estudia-enroll-open-4@estudia.local" in lines
+    assert "UID:estudia-enroll-close-4@estudia.local" in lines
+    assert "SUMMARY:Abre la inscripción: Inscripción a finales · Álgebra\\, Cálculo\\; I" in lines
+    assert "SUMMARY:Cierra la inscripción: Inscripción a finales · Álgebra\\, Cálculo\\; I" in lines
+    assert not any(l.startswith("UID:estudia-exam-") for l in lines)
+    opened = lines.index("UID:estudia-enroll-open-4@estudia.local")
+    assert lines[opened + 2] == "DTSTART:" + _ics_utc(NOW + DAY)
+    assert lines[opened + 3] == "DTEND:" + _ics_utc(NOW + DAY + 30 * 60)
+    close = lines.index("UID:estudia-enroll-close-4@estudia.local")
+    assert lines[close + 2] == "DTSTART:" + _ics_utc(NOW + 5 * DAY - 30 * 60)
+    assert lines[close + 3] == "DTEND:" + _ics_utc(NOW + 5 * DAY)
+
+
+def _ics_utc(epoch):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y%m%dT%H%M%SZ")

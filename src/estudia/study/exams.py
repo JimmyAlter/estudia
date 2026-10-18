@@ -4,6 +4,11 @@ import math
 import sqlite3
 from dataclasses import dataclass
 
+EXAM_KINDS = ("parcial", "recuperatorio", "final", "inscripcion")
+FINAL = "final"             # abarca todos los temas de la materia, también los de secciones ocultas
+RETAKE = "recuperatorio"    # solo los temas que todavía no están firmes, sin contenido nuevo
+ENROLLMENT = "inscripcion"  # una ventana de inscripción manual: abre en `opens_at` y cierra en `closes_at`
+
 # Campos que se pueden cambiar en un examen manual, y la columna que tocan.
 _EDITABLE = {"name": "name", "at": "opens_at", "max_grade": "max_grade", "time_limit_s": "time_limit_s"}
 
@@ -17,6 +22,7 @@ class ExamOut:
     at: int | None
     closes_at: int | None
     source: str
+    kind: str
     topic_ids: list[int]
     max_grade: float | None
     time_limit_s: int | None
@@ -41,19 +47,46 @@ def _visible_course_topics(conn: sqlite3.Connection, course_id: int) -> list[int
     ]
 
 
-def _topics_json(conn: sqlite3.Connection, course_id: int, topic_ids: list[int]) -> str | None:
-    """NULL significa 'todos los temas del curso' y se resuelve al leer; una lista explícita se valida."""
+def _all_course_topics(conn: sqlite3.Connection, course_id: int) -> list[int]:
+    """Todos los temas del curso: los de secciones (visibles u ocultas) en orden de sección, después
+    los que no tienen sección, por nombre."""
+    return [
+        r["id"]
+        for r in conn.execute(
+            "SELECT t.id, MIN(s.num) AS num FROM topic t "
+            "LEFT JOIN material_topic mt ON mt.topic_id = t.id "
+            "LEFT JOIN material m ON m.id = mt.material_id "
+            "LEFT JOIN section s ON s.id = m.section_id "
+            "WHERE t.course_id = ? GROUP BY t.id ORDER BY num IS NULL, num, t.name, t.id",
+            (course_id,),
+        )
+    ]
+
+
+def _topics_json(conn: sqlite3.Connection, course_id: int, topic_ids: list[int], kind: str) -> str | None:
+    """NULL significa 'todos los temas del curso' y se resuelve al leer; una lista explícita se valida.
+
+    Un recuperatorio no suma contenido nuevo: 'todos' se congela en la lista de los temas del
+    curso que hay en este momento, y un tema que aparece después no entra.
+    """
     topics = list(topic_ids)
     if not topics:
-        return None
+        return json.dumps(_visible_course_topics(conn, course_id)) if kind == RETAKE else None
     own = {r["id"] for r in conn.execute("SELECT id FROM topic WHERE course_id = ?", (course_id,))}
     if not set(topics) <= own:
         raise ValueError("Hay temas que no son del curso del examen")
     return json.dumps(topics)
 
 
+def _check_enrollment(opens_at, closes_at) -> None:
+    if isinstance(closes_at, bool) or not isinstance(closes_at, int):
+        raise ValueError("La inscripción necesita una fecha de cierre")
+    if closes_at <= opens_at:
+        raise ValueError("La inscripción tiene que cerrar después de abrir")
+
+
 def _manual_row(conn: sqlite3.Connection, exam_id: int):
-    row = conn.execute("SELECT id, course_id, source FROM exam WHERE id = ?", (exam_id,)).fetchone()
+    row = conn.execute("SELECT id, course_id, source, kind, opens_at, closes_at FROM exam WHERE id = ?", (exam_id,)).fetchone()
     if row is None or row["source"] != "manual":
         raise ValueError("Solo se pueden editar o borrar los exámenes cargados a mano")
     return row
@@ -62,8 +95,17 @@ def _manual_row(conn: sqlite3.Connection, exam_id: int):
 def create_manual_exam(
     conn: sqlite3.Connection, course_id: int, name: str, at: int,
     topic_ids: list[int], max_grade: float | None,
+    *, kind: str = "parcial", closes_at: int | None = None, now: int | None = None,
 ) -> int:
-    """Crea un examen manual (cmid NULL: la sincronización no lo toca). Sin temas, abarca todos los del curso."""
+    """Crea un examen manual (cmid NULL: la sincronización no lo toca). Sin temas, abarca todos los del curso
+    (en un recuperatorio, los que hay al crearlo: ver `_topics_json`). Un recuperatorio armado desde un
+    parcial llega con los temas de ese parcial y queda con exactamente esos.
+
+    Una inscripción (`kind="inscripcion"`) no es un examen: `at` es la apertura y `closes_at`
+    (obligatorio, posterior a `at`) el cierre; no lleva temas ni nota.
+    """
+    if kind not in EXAM_KINDS:
+        raise ValueError("El tipo de examen no existe")
     if conn.execute("SELECT 1 FROM course WHERE id = ?", (course_id,)).fetchone() is None:
         raise ValueError("El curso no existe")
     name = (name or "").strip()
@@ -71,20 +113,29 @@ def create_manual_exam(
         raise ValueError("El examen necesita un nombre")
     if isinstance(at, bool) or not isinstance(at, int):
         raise ValueError("La fecha del examen tiene que ser un entero (epoch)")
-    topics_json = _topics_json(conn, course_id, topic_ids)
+    if kind == ENROLLMENT:
+        _check_enrollment(at, closes_at)
+        if topic_ids or max_grade is not None:
+            raise ValueError("Una inscripción no lleva temas ni nota")
+    else:
+        closes_at = None
+    topics_json = _topics_json(conn, course_id, topic_ids, kind)
     cur = conn.execute(
-        "INSERT INTO exam(course_id, cmid, name, opens_at, closes_at, max_grade, source, topics_json) "
-        "VALUES(?, NULL, ?, ?, NULL, ?, 'manual', ?)",
-        (course_id, name, at, max_grade, topics_json),
+        "INSERT INTO exam(course_id, cmid, name, opens_at, closes_at, max_grade, source, topics_json, "
+        "kind, created_at) VALUES(?, NULL, ?, ?, ?, ?, 'manual', ?, ?, ?)",
+        (course_id, name, at, closes_at, max_grade, topics_json, kind, now),
     )
     conn.commit()
     return cur.lastrowid
 
 
 def update_manual_exam(conn: sqlite3.Connection, exam_id: int, **fields) -> None:
-    """Campos: name, at, max_grade, time_limit_s, topic_ids (vacío = todos los del curso)."""
+    """Campos: name, at, max_grade, time_limit_s, topic_ids (vacío = todos los del curso; en un
+    recuperatorio, los que hay al editarlo);
+    `closes_at` solo en una inscripción. El tipo no se cambia."""
     row = _manual_row(conn, exam_id)
-    unknown = set(fields) - set(_EDITABLE) - {"topic_ids"}
+    enrollment = row["kind"] == ENROLLMENT
+    unknown = set(fields) - set(_EDITABLE) - {"topic_ids", "closes_at"}
     if unknown:
         raise ValueError(f"Campos no editables: {', '.join(sorted(unknown))}")
     if "name" in fields:
@@ -93,11 +144,20 @@ def update_manual_exam(conn: sqlite3.Connection, exam_id: int, **fields) -> None
             raise ValueError("El examen necesita un nombre")
     if "at" in fields and (isinstance(fields["at"], bool) or not isinstance(fields["at"], int)):
         raise ValueError("La fecha del examen tiene que ser un entero (epoch)")
+    if "closes_at" in fields and not enrollment:
+        raise ValueError("Solo la inscripción tiene fecha de cierre")
+    if enrollment:
+        if fields.get("topic_ids") or fields.get("max_grade") is not None or fields.get("time_limit_s") is not None:
+            raise ValueError("Una inscripción no lleva temas ni nota")
+        _check_enrollment(fields.get("at", row["opens_at"]), fields.get("closes_at", row["closes_at"]))
     sets, params = [], []
     for key, value in fields.items():
-        if key == "topic_ids":
+        if key == "closes_at":
+            sets.append("closes_at = ?")
+            params.append(value)
+        elif key == "topic_ids":
             sets.append("topics_json = ?")
-            params.append(_topics_json(conn, row["course_id"], value))
+            params.append(_topics_json(conn, row["course_id"], value, row["kind"]))
         else:
             sets.append(f"{_EDITABLE[key]} = ?")
             params.append(value)
@@ -115,14 +175,17 @@ def delete_manual_exam(conn: sqlite3.Connection, exam_id: int) -> None:
 
 
 def exam_topics(conn: sqlite3.Connection, exam_id: int) -> list[int]:
-    """Temas del examen: los guardados si es manual; si es del campus, los de las secciones visibles."""
+    """Temas del examen: los guardados si es manual; si no, los de las secciones visibles, salvo en un
+    final, que abarca todos los temas del curso (también los de secciones ocultas)."""
     row = conn.execute(
-        "SELECT course_id, source, topics_json FROM exam WHERE id = ?", (exam_id,)
+        "SELECT course_id, source, topics_json, kind FROM exam WHERE id = ?", (exam_id,)
     ).fetchone()
-    if row is None:
+    if row is None or row["kind"] == ENROLLMENT:
         return []
     if row["source"] == "manual" and row["topics_json"] is not None:
         return json.loads(row["topics_json"])
+    if row["kind"] == FINAL:
+        return _all_course_topics(conn, row["course_id"])
     return _visible_course_topics(conn, row["course_id"])
 
 
@@ -146,6 +209,7 @@ def list_exams(conn: sqlite3.Connection, now: int) -> list[ExamOut]:
         ExamOut(
             id=r["id"], course_id=r["course_id"], course=r["course"], name=r["name"],
             at=r["opens_at"], closes_at=r["closes_at"] or None, source=r["source"] or "campus",
+            kind=r["kind"] or "parcial",
             topic_ids=exam_topics(conn, r["id"]), max_grade=r["max_grade"],
             time_limit_s=r["time_limit_s"], attempts=r["attempts"],
             editable=r["source"] == "manual", result=results.get(r["id"]),
@@ -163,9 +227,11 @@ def set_exam_result(conn: sqlite3.Connection, exam_id: int, grade: float, now: i
     nota no es un número entre 0 y la escala o si `max_grade` no coincide con la escala del
     examen. La escala es siempre la del examen, o 10 si no tiene.
     """
-    exam = conn.execute("SELECT max_grade, opens_at FROM exam WHERE id = ?", (exam_id,)).fetchone()
+    exam = conn.execute("SELECT max_grade, opens_at, kind FROM exam WHERE id = ?", (exam_id,)).fetchone()
     if exam is None:
         raise LookupError(f"examen {exam_id} no existe")
+    if exam["kind"] == ENROLLMENT:
+        raise ValueError("Una inscripción no tiene nota")
     if exam["opens_at"] and exam["opens_at"] > now:
         raise ValueError("El examen todavía no empezó: la nota real se carga después")
     scale = exam["max_grade"] or 10.0
@@ -204,9 +270,11 @@ def skip_exam_result(conn: sqlite3.Connection, exam_id: int, now: int) -> None:
 
     `LookupError` si el examen no existe; `ValueError` si todavía no empezó.
     """
-    exam = conn.execute("SELECT opens_at FROM exam WHERE id = ?", (exam_id,)).fetchone()
+    exam = conn.execute("SELECT opens_at, kind FROM exam WHERE id = ?", (exam_id,)).fetchone()
     if exam is None:
         raise LookupError(f"examen {exam_id} no existe")
+    if exam["kind"] == ENROLLMENT:
+        raise ValueError("Una inscripción no tiene nota")
     if exam["opens_at"] and exam["opens_at"] > now:
         raise ValueError("El examen todavía no empezó")
     ids = sorted(_skipped(conn) | {exam_id})

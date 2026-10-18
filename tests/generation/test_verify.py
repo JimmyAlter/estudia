@@ -86,7 +86,8 @@ def test_timeout_devuelve_false_y_mata_el_worker(monkeypatch):
 
     from estudia.generation import verify
 
-    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    verify._stop_worker()   # sin worker tibio que pueda contestar a tiempo
+    monkeypatch.setattr(verify, "_start_worker", lambda: False)
     assert check_math("1+1", "2") is False
     assert multiprocessing.active_children() == []
 
@@ -164,7 +165,8 @@ def test_tristate_distingue_igual_distinto_y_no_se_sabe():
 def test_tristate_timeout_es_none(monkeypatch):
     from estudia.generation import verify
 
-    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    verify._stop_worker()   # sin worker tibio que pueda contestar a tiempo
+    monkeypatch.setattr(verify, "_start_worker", lambda: False)
     assert check_math_tristate("1+1", "2") is None
     assert check_math_tristate("1+1", "3") is None
 
@@ -239,7 +241,8 @@ def test_typed_control_ilegible_no_es_falla_del_worker():
 def test_typed_worker_caido_o_lento_no_es_ilegible(monkeypatch):
     from estudia.generation import verify
 
-    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    verify._stop_worker()   # sin worker tibio que pueda contestar a tiempo
+    monkeypatch.setattr(verify, "_start_worker", lambda: False)
     with pytest.raises(verify.GradingUnavailable):
         verify.grade_typed("2", "2")
     monkeypatch.undo()
@@ -278,7 +281,8 @@ def test_typed_accepts_option_runs_in_the_worker_and_timeout_is_none(monkeypatch
     monkeypatch.setattr(verify, "_equal_with_timeout", spy)
     assert verify.typed_accepts_option("sqrt(2)", "1.41") is True
     assert seen == [verify.TYPED_OPTION]
-    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0)
+    verify._stop_worker()   # sin worker tibio que pueda contestar a tiempo
+    monkeypatch.setattr(verify, "_start_worker", lambda: False)
     assert verify.typed_accepts_option("sqrt(2)", "1.41") is None
 
 
@@ -311,3 +315,23 @@ def test_typed_accepts_option_backs_off_after_a_failed_start(monkeypatch):
     monkeypatch.setattr(verify, "_unavailable_until", 0.0)
     assert verify.typed_accepts_option("2", "3") is None
     assert len(starts) == 3
+
+
+def test_worker_colgado_se_mata_de_verdad_al_vencer_el_tiempo(monkeypatch):
+    """Camino real: un trabajo que cuelga al worker devuelve None al vencer, el proceso muere
+    y la próxima llamada arranca uno nuevo que responde."""
+    import multiprocessing
+
+    from estudia.generation import verify
+
+    verify._stop_worker()                     # parte de cero: no hay worker tibio
+    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 0.3)
+    assert verify._equal_with_timeout("1", "1", verify._TEST_HANG) is None
+    assert verify._proc is None and verify._conn is None
+    # El proceso colgado ya no vive (el kill se hizo y se esperó con join).
+    assert multiprocessing.active_children() == []
+    monkeypatch.setattr(verify, "EVAL_TIMEOUT_S", 20.0)
+    verify._unavailable_until = 0.0
+    assert check_math("1+1", "2") is True
+    assert verify._proc is not None and verify._proc.is_alive()
+    verify._stop_worker()

@@ -259,3 +259,17 @@ def test_forget_secrets_deletes_every_estudia_secret(memory_keyring):
     assert memory_keyring.get_password("otra-app", GEMINI_KEY) == "ajeno"
     # Repetirlo sin nada guardado no falla.
     assert handler.main(["--forget-secrets"]) == 0
+
+
+def test_forget_secrets_deletes_calendar_feed_of_every_site(memory_keyring):
+    """La URL del feed lleva un token del campus: el desinstalador también la borra."""
+    from estudia.catalog import load_catalog
+    from estudia.moodle.calendar_feed import feed_secret_name
+    from estudia.secrets import get_secret, set_secret
+
+    names = [feed_secret_name(s.id) for s in load_catalog()]
+    for name in names:
+        set_secret(name, "https://campus.example/calendar/export_execute.php?authtoken=x")
+
+    assert handler.main(["--forget-secrets"]) == 0
+    assert all(get_secret(name) is None for name in names)

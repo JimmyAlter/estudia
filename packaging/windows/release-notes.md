@@ -1,13 +1,12 @@
-## Novedades de la 0.2.0
+## Novedades de la 0.3.0
 
-- **Agenda:** tu semana con clases, entregas, exámenes y sesiones de estudio. Exportala a Google Calendar o al celular.
-- **Plan de estudio y "¿Llegás?":** reparte sesiones en el tiempo que le das y te dice qué estudiar hoy.
-- **Simulacro:** con el reloj y la escala del examen; al final, tu nota al lado de la que creías que te sacabas.
-- **Práctica nueva:** "¿qué tan seguro estás?", "pensalo primero", respuestas escritas corregidas al instante y repaso en días distintos.
-- **Probabilidad de saber cada tema el día del parcial**, en vez de un porcentaje de dominio.
-- **Exportar a Anki** y **recordatorios** en la PC.
-- **Pregunta de edad:** con menos de 18 años, Estudia funciona sin mandar nada a Gemini.
-- **YouTube por enlace:** bajar los videos pasa a ser opcional (Ajustes).
+- **Arrancás antes:** las clases del próximo examen se preparan primero, y apenas hay 10 preguntas ya podés practicar.
+- **Rinde más el plan gratis de Gemini:** la verificación de preguntas va de a 4 clases por pedido, con un presupuesto diario por función.
+- **3 preguntas para arrancar** cuando aparece una clase nueva. No cuentan: es para que la clase te rinda más.
+- **Contá lo que te acordás** antes de leer el resumen, y ves qué títulos no mencionaste. Sin IA.
+- **Explicá por qué** después de un acierto dudoso, y **Cómo vengo**: cuánto acertás cuando decís «Seguro» y qué tan cerca estuvo tu predicción.
+- **En el celular:** el mazo de la semana para Anki y una guía para ver el calendario del campus en Google Calendar.
+- **Inscripciones** con aviso 3 días antes del cierre, **recuperatorio** solo con los temas que no tenés firmes, y **final** con un plan de 6 semanas.
 
 Si ya tenías Estudia, instalá encima: tus materias y tu progreso se mantienen.
 

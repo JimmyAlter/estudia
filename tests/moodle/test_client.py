@@ -2,7 +2,7 @@ import httpx
 import pytest
 import respx
 
-from estudia.moodle.client import MoodleClient, MoodleError, TokenInvalid
+from estudia.moodle.client import MoodleClient, MoodleError, MoodleUnreachable, TokenInvalid
 
 URL = "https://campus.example"
 ENDPOINT = f"{URL}/webservice/rest/server.php"
@@ -70,3 +70,30 @@ def test_fetch_file_transport_error_does_not_leak_token():
     with httpx.Client() as http, pytest.raises(MoodleError) as exc:
         _client(http).fetch_file(f"{URL}/f.html")
     _sin_token(exc.value)
+
+
+@respx.mock
+@pytest.mark.parametrize("respuesta", [
+    {"status_code": 503},
+    {"side_effect": httpx.ConnectTimeout("lento")},
+    {"content": b"<html>no es json</html>"},
+])
+def test_transport_errors_are_unreachable(respuesta):
+    """Red, timeout, 5xx o respuesta rota: MoodleUnreachable (sigue siendo MoodleError)."""
+    ruta = respx.post(ENDPOINT)
+    if "side_effect" in respuesta:
+        ruta.mock(side_effect=respuesta["side_effect"])
+    else:
+        ruta.respond(respuesta.get("status_code", 200), content=respuesta.get("content", b""))
+    with httpx.Client() as http, pytest.raises(MoodleUnreachable) as exc:
+        _client(http).call("x")
+    assert isinstance(exc.value, MoodleError)
+    _sin_token(exc.value)
+
+
+@respx.mock
+def test_errorcode_is_not_unreachable():
+    respx.post(ENDPOINT).respond(200, json={"errorcode": "nopermissions"})
+    with httpx.Client() as http, pytest.raises(MoodleError) as exc:
+        _client(http).call("x")
+    assert not isinstance(exc.value, MoodleUnreachable)

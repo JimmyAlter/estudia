@@ -8,6 +8,8 @@ import Materials from "./screens/Materials";
 import Mock from "./screens/Mock";
 import Onboarding, { LOGIN_WAITING_TEXT, PasteCallback, useCampusLogin } from "./screens/Onboarding";
 import Practice from "./screens/Practice";
+import Pretest from "./screens/Pretest";
+import Progress from "./screens/Progress";
 import Settings from "./screens/Settings";
 import { AgeNotice } from "./screens/Age";
 import { Button } from "./ui";
@@ -23,7 +25,7 @@ const NAV: { screen: Screen; label: string }[] = [
   { screen: "materiales", label: "Materiales" },
 ];
 /** Pantallas que no están en la navegación pero tienen dirección propia. */
-const OTHER_SCREENS: Screen[] = ["ajustes", "simulacro"];
+const OTHER_SCREENS: Screen[] = ["ajustes", "simulacro", "arrancar", "como-vengo"];
 
 function screenFromHash(): Screen {
   const name = window.location.hash.replace(/^#\/?/, "");
@@ -35,6 +37,8 @@ export default function App() {
   const [offline, setOffline] = useState(false);
   const [screen, setScreen] = useState<Screen>(screenFromHash);
   const [practice, setPractice] = useState<{ params: QuizParams; session?: SessionInfo }>({ params: {} });
+  // El botón del simulacro corto ("Hoy: simulacro corto"): el simulacro arranca con ese examen y 6 preguntas.
+  const [mockStart, setMockStart] = useState<{ examId: number; short: boolean } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [sessionExpired, setSessionExpired] = useState(false);
   const lastSync = useRef<number | null>(null);
@@ -81,6 +85,7 @@ export default function App() {
 
   const navigate = useCallback((to: Screen) => {
     if (to === "practica") setPractice({ params: {} });
+    if (to === "simulacro") setMockStart(null);
     window.location.hash = `/${to}`;
     setScreen(to);
     setFocusRequest((n) => n + 1);
@@ -91,6 +96,14 @@ export default function App() {
     setPractice({ params, session });
     window.location.hash = "/practica";
     setScreen("practica");
+    setFocusRequest((n) => n + 1);
+    window.scrollTo(0, 0);
+  }, []);
+
+  const startShortMock = useCallback((examId: number) => {
+    setMockStart({ examId, short: true });
+    window.location.hash = "/simulacro";
+    setScreen("simulacro");
     setFocusRequest((n) => n + 1);
     window.scrollTo(0, 0);
   }, []);
@@ -189,19 +202,29 @@ export default function App() {
             age={state.age}
             working={state.syncing && !expired}
             onPractice={startPractice}
+            onShortMock={startShortMock}
             onNavigate={navigate}
             onSessionExpired={onSessionExpired}
           />
         )}
-        {screen === "agenda" && <Agenda key={refreshKey} onPractice={startPractice} />}
+        {screen === "agenda" && <Agenda key={refreshKey} onPractice={startPractice} onShortMock={startShortMock} />}
         {screen === "practica" && (
           <Practice params={practice.params} session={practice.session} onExit={() => navigate("inicio")} />
         )}
         {screen === "materiales" && (
           <Materials key={refreshKey} aiStopReason={state.ai_stop_reason} age={state.age} onPractice={startPractice} />
         )}
-        {screen === "simulacro" && <Mock onPractice={startPractice} onExit={() => navigate("inicio")} />}
+        {screen === "simulacro" && (
+          <Mock
+            key={mockStart ? `corto-${mockStart.examId}` : "comun"}
+            start={mockStart}
+            onPractice={startPractice}
+            onExit={() => navigate("inicio")}
+          />
+        )}
         {screen === "ajustes" && <Settings onChange={refresh} />}
+        {screen === "arrancar" && <Pretest onNavigate={navigate} />}
+        {screen === "como-vengo" && <Progress />}
       </main>
 
       <Footer />

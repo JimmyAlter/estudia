@@ -75,8 +75,11 @@ ADDED_COLUMNS = (
     ("material", "fail_kind", "TEXT"),
     ("material", "analysis_json", "TEXT"),
     ("material", "analysis_model", "TEXT"),
+    ("material", "segments_json", "TEXT"),         # tramos [{start_s, end_s, title}] de la clase; NULL = ninguno
     ("exam", "source", "TEXT DEFAULT 'campus'"),   # 'campus' | 'manual'
     ("exam", "topics_json", "TEXT"),               # solo manuales: ids de temas
+    ("exam", "kind", "TEXT DEFAULT 'parcial'"),    # parcial | recuperatorio | final | inscripcion
+    ("exam", "created_at", "INTEGER"),             # cuándo se cargó; NULL en los anteriores
     ("mock_attempt", "seconds", "INTEGER"),        # reloj del simulacro al empezar
     ("mock_attempt", "predicted_grade", "REAL"),   # la nota que el estudiante esperaba, en la escala del examen
     ("mock_attempt", "typed_json", "TEXT"),        # ids de las preguntas que se responden escribiendo
@@ -86,6 +89,8 @@ ADDED_COLUMNS = (
     ("answer", "option_order_json", "TEXT"),       # orden en que se mostraron las opciones
     ("answer", "typed_text", "TEXT"),              # lo que escribió, si escribió
     ("answer", "options_revealed_ms", "INTEGER"),  # "pensalo primero": cuándo abrió las opciones
+    ("answer", "explain_prompted", "INTEGER"),     # 1 si después de este acierto se pidió "Explicá por qué"
+    ("answer", "explain_match", "INTEGER"),        # 1 "Sí, dije lo mismo", 0 "No"; NULL = sin respuesta. Lo escrito no se guarda
     ("plan_session", "kind", "TEXT DEFAULT 'focus'"),  # focus | mixed_focus | mixed_only
     ("plan_session", "topics_json", "TEXT"),       # temas de la sesión, el foco primero; NULL = solo topic_id
     # ¿Se puede ofrecer escrita? 1 sí; 0 no (la regla escrita aceptaría un distractor, "1.41" por √2);
@@ -149,6 +154,18 @@ def _migrate_allow_download(conn: sqlite3.Connection, path: Path) -> None:
     conn.commit()
 
 
+# El estado del calendario del campus antes se guardaba en una sola marca global; ahora va por
+# campus (`calendar_feed_status:<sitio>`). La vieja no se lee más: se borra al abrir la base.
+LEGACY_FEED_STATUS_KEY = "calendar_feed_status"
+
+
+def _drop_legacy_feed_status(conn: sqlite3.Connection) -> None:
+    """Borra la marca global vieja si está. Si no está, solo lee."""
+    if _kv_value(conn, LEGACY_FEED_STATUS_KEY) is not None:
+        conn.execute("DELETE FROM kv WHERE key = ?", (LEGACY_FEED_STATUS_KEY,))
+        conn.commit()
+
+
 def connect(path: Path | None = None, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Abre la base (por defecto en la carpeta de datos) y aplica el esquema.
 
@@ -163,6 +180,7 @@ def connect(path: Path | None = None, *, check_same_thread: bool = True) -> sqli
     conn.executescript(SCHEMA)
     _migrate(conn)
     _migrate_allow_download(conn, path)
+    _drop_legacy_feed_status(conn)
     # La primera vez reproduce la historia de respuestas en review_state; después no hace nada.
     from estudia.study.srs import sync_review_state
 

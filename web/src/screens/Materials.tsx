@@ -2,6 +2,7 @@ import { useEffect, useId, useState, type ReactNode } from "react";
 import { api, type Age, type AppState, type Material, type QuizParams, type Section } from "../api";
 import { keepMath, tidy } from "../format";
 import { Button, Label, Notice } from "../ui";
+import Recall from "./Recall";
 
 const quietLink = "text-muted underline decoration-line underline-offset-4 hover:text-ink";
 
@@ -136,7 +137,7 @@ function Status({ material, stopReason, age }: { material: Material; stopReason:
       if (noAi(age)) return <span className="shrink-0 text-sm text-muted">Sin preparar</span>;
       return (
         <span className="shrink-0 text-sm text-muted">
-          {stopReason === "quota" || stopReason === "youtube_cap" ? "Se prepara mañana" : "En preparación"}
+          {stopReason === "quota" || stopReason === "youtube_cap" || stopReason === "budget" ? "Se prepara mañana" : "En preparación"}
         </span>
       );
     default:
@@ -156,7 +157,11 @@ function MaterialRow({
   onPractice?: (params: QuizParams) => void;
 }) {
   const id = useId();
-  const [open, setOpen] = useState(false);
+  /** Lo que se ve debajo de la clase: nada, el resumen o "Contá lo que te acordás". */
+  const [view, setView] = useState<"closed" | "summary" | "recall" | "recalled">("closed");
+  const open = view === "summary";
+  // Sin títulos en el resumen no hay con qué comparar.
+  const canRecall = Boolean(material.summary_md && summaryHeadings(material.summary_md).length);
   const status = <Status material={material} stopReason={stopReason} age={age} />;
   const canPractice = Boolean(onPractice && material.questions && material.topic_ids?.length);
   // Apagado solo lo que no se puede abrir ahora: lo que falta preparar o falló.
@@ -167,7 +172,7 @@ function MaterialRow({
       <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
         <span className={`min-w-0 ${unavailable ? "text-muted" : ""}`}>{tidy(material.title)}</span>
         {(canPractice || material.summary_md || material.status !== "done") && (
-          <span className="flex shrink-0 items-baseline gap-5 text-sm">
+          <span className="flex flex-wrap items-baseline gap-x-5 gap-y-1 text-sm">
             {status}
             {canPractice && (
               <button
@@ -182,15 +187,26 @@ function MaterialRow({
                 Practicar esta clase
               </button>
             )}
-            {material.summary_md && (
+            {canRecall && view === "closed" && (
               <button
                 type="button"
-                onClick={() => setOpen((o) => !o)}
-                aria-expanded={open}
+                onClick={() => setView("recall")}
                 aria-controls={`${id}-summary`}
                 className="press cursor-pointer text-muted underline decoration-line underline-offset-4 hover:text-ink"
               >
-                {open ? "Ocultar resumen" : "Ver resumen"}
+                Contá lo que te acordás
+              </button>
+            )}
+            {/* Mientras se escribe no se ofrece: Saltear y Terminar ya son la salida. */}
+            {material.summary_md && view !== "recall" && (
+              <button
+                type="button"
+                onClick={() => setView((v) => (v === "closed" ? "summary" : "closed"))}
+                aria-expanded={view !== "closed"}
+                aria-controls={`${id}-summary`}
+                className="press cursor-pointer text-muted underline decoration-line underline-offset-4 hover:text-ink"
+              >
+                {view === "closed" ? "Ver resumen" : "Ocultar resumen"}
               </button>
             )}
           </span>
@@ -203,6 +219,16 @@ function MaterialRow({
             Ajustes
           </a>
         </p>
+      )}
+      {material.summary_md && (view === "recall" || view === "recalled") && (
+        <div id={`${id}-summary`} className="reveal pt-4 pb-3">
+          <Recall
+            materialId={material.id}
+            summary={(missed) => <Summary markdown={material.summary_md!} title={material.title} missed={missed} />}
+            onSkip={() => setView("summary")}
+            onCompared={() => setView("recalled")}
+          />
+        </div>
       )}
       {material.summary_md && open && (
         <div id={`${id}-summary`} className="reveal pt-4 pb-3">
@@ -223,21 +249,38 @@ function MaterialRow({
   );
 }
 
-/** Markdown simple de los resúmenes: títulos, viñetas y párrafos. Sin HTML. */
-function Summary({ markdown, title }: { markdown: string; title: string }) {
+/** El texto de un título como lo compara el servidor: sin los # del final ni los **. */
+function headingTitle(text: string): string {
+  return text.replace(/[ \t]+#+$/, "").replaceAll("**", "").trim();
+}
+
+function summaryHeadings(markdown: string): string[] {
+  return markdown
+    .split("\n")
+    .map((raw) => raw.trim().match(/^#{1,6}\s+(.*)$/))
+    .filter((m): m is RegExpMatchArray => m !== null)
+    .map((m) => headingTitle(m[1]));
+}
+
+/**
+ * Markdown simple de los resúmenes: títulos, viñetas y párrafos. Sin HTML. Con `missed`, los títulos
+ * que no aparecieron en "Contá lo que te acordás" llevan "No lo mencionaste".
+ */
+function Summary({ markdown, title, missed }: { markdown: string; title: string; missed?: Set<string> }) {
   const blocks: { kind: "h" | "li" | "p"; text: string }[] = [];
   for (const raw of markdown.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     const heading = line.match(/^#{1,6}\s+(.*)$/);
     const bullet = line.match(/^[-*]\s+(.*)$/);
-    if (heading) blocks.push({ kind: "h", text: heading[1] });
+    if (heading) blocks.push({ kind: "h", text: heading[1].replace(/[ \t]+#+$/, "") });
     else if (bullet) blocks.push({ kind: "li", text: bullet[1] });
     else blocks.push({ kind: "p", text: line });
   }
 
   // El primer título suele repetir el nombre de la clase, que ya está arriba.
-  if (blocks[0]?.kind === "h" && sameTitle(blocks[0].text, title)) blocks.shift();
+  // Si quedó sin mencionar, se deja: la marca tiene que verse.
+  if (blocks[0]?.kind === "h" && sameTitle(blocks[0].text, title) && !missed?.has(headingTitle(blocks[0].text))) blocks.shift();
 
   const out: ReactNode[] = [];
   let list: string[] = [];
@@ -261,9 +304,17 @@ function Summary({ markdown, title }: { markdown: string; title: string }) {
     flush();
     out.push(
       block.kind === "h" ? (
-        <h3 key={out.length} className="mt-4 mb-1 font-semibold first:mt-0">
-          {inline(block.text)}
-        </h3>
+        missed?.has(headingTitle(block.text)) ? (
+          <h3 key={out.length} className="mt-4 mb-1 font-semibold first:mt-0">
+            {inline(block.text)}
+            <span className="sr-only">, </span>
+            <span className="ml-2 font-sans text-sm font-normal whitespace-nowrap text-muted">No lo mencionaste</span>
+          </h3>
+        ) : (
+          <h3 key={out.length} className="mt-4 mb-1 font-semibold first:mt-0">
+            {inline(block.text)}
+          </h3>
+        )
       ) : (
         <p key={out.length} className="my-2">
           {inline(block.text)}

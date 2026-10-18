@@ -15,6 +15,7 @@ const EXAM: ExamInfo = {
   at: NOW + 10 * 86400,
   closes_at: null,
   source: "manual",
+  kind: "parcial",
   topic_ids: [1, 2],
   max_grade: 10,
   time_limit_s: null,
@@ -117,6 +118,47 @@ describe("Simulacro", () => {
     expect(bodyOf(fetchMock, "/api/mock/9/finish")).toEqual({ answers: { 1: { index: 0 }, 2: { typed: "2x" } } });
   });
 
+  it("una inscripción no se ofrece para simulacro", async () => {
+    routes({
+      "GET /api/exams": [
+        { ...EXAM, id: 6, name: "Inscripción a finales", kind: "inscripcion", topic_ids: [], max_grade: null, closes_at: NOW + 12 * 86400 },
+        EXAM,
+      ],
+    });
+    render(<Mock onPractice={() => {}} onExit={() => {}} />);
+    expect(await screen.findByText("No vas a ver las respuestas hasta el final")).toBeInTheDocument();
+    expect(screen.queryByText(/Inscripción a finales/)).not.toBeInTheDocument();
+  });
+
+  it("el recuperatorio sugiere un simulacro corto de 6 preguntas", async () => {
+    const RETAKE: ExamInfo = { ...EXAM, id: 7, name: "Recuperatorio del primer parcial", kind: "recuperatorio", time_limit_s: 7200 };
+    const fetchMock = routes({ "GET /api/exams": [EXAM, RETAKE] });
+    render(<Mock start={{ examId: 7, short: true }} onPractice={() => {}} onExit={() => {}} />);
+
+    expect(await screen.findByText("Simulacro corto")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Recuperatorio del primer parcial");
+    // No se elige examen: es el del recuperatorio. Y su reloj es el de 6 preguntas, no el del examen.
+    expect(screen.queryByText("¿De qué examen?")).not.toBeInTheDocument();
+    expect(screen.getByText(/6 preguntas de los temas que todavía no tenés firmes/)).toBeInTheDocument();
+    // El tiempo por pregunta va en su propio renglón, no colgado de un punto.
+    const perQuestion = screen.getByText("90 segundos por pregunta");
+    expect(perQuestion).toHaveClass("block");
+    expect(perQuestion.parentElement!.textContent).not.toMatch(/·\s*90 segundos/);
+    await userEvent.click(screen.getByRole("button", { name: "Empezar" }));
+    expect(bodyOf(fetchMock, "/api/mock/start")).toEqual({ exam_id: 7, predicted_grade: null, short: true });
+  });
+
+  it("sin preguntas de los temas flojos, el simulacro corto lo dice con calma", async () => {
+    const RETAKE: ExamInfo = { ...EXAM, id: 7, name: "Recuperatorio del primer parcial", kind: "recuperatorio" };
+    const text = "Todavía no hay suficientes preguntas de los temas flojos para un simulacro corto.";
+    routes({ "GET /api/exams": [RETAKE], "POST /api/mock/start": () => jsonResponse(409, { detail: text }) });
+    render(<Mock start={{ examId: 7, short: true }} onPractice={() => {}} onExit={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Empezar" }));
+    const line = await screen.findByText(text);
+    expect(line).not.toHaveClass("text-bad");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("la predicción se puede saltar", async () => {
     const fetchMock = routes();
     render(<Mock onPractice={() => {}} onExit={() => {}} />);
@@ -170,6 +212,9 @@ describe("Simulacro: ronda 1", () => {
     render(<Mock onPractice={() => {}} onExit={() => {}} />);
     expect(await screen.findByText(/90 segundos por pregunta/)).toBeInTheDocument();
     expect(screen.queryByText(/preguntas ·|hasta \d+ preguntas/i)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Podés ir y volver entre las preguntas. Cuando se termina el tiempo, se entrega solo."),
+    ).toBeInTheDocument();
   });
 
   it("la revisión se arma por pregunta: si una se retiró, se ven las demás", async () => {

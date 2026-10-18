@@ -294,6 +294,9 @@ def _start_method() -> str:
     return "spawn"
 
 
+_TEST_HANG = "test_hang"   # gancho de tests: el worker se cuelga con este trabajo
+
+
 def _worker_main(conn) -> None:
     """Bucle del worker: recibe (id, decimales, esperado, dado) y responde (id, resultado).
 
@@ -310,6 +313,8 @@ def _worker_main(conn) -> None:
         if job is None:
             return
         job_id, places, expected_src, given_src = job
+        if places == _TEST_HANG:
+            time.sleep(3600)   # solo para tests: un trabajo colgado de verdad, dentro del subproceso
         try:
             if places == "option":
                 answer = _equal(expected_src, given_src)

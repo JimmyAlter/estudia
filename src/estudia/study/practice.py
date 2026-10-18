@@ -16,10 +16,12 @@ from estudia.study.srs import (
     STATE_RELEARNING,
     STATE_REVIEW,
     SURE,
+    UNSURE,
     card_key,
     day_start,
     local_day,
     rating_for,
+    rebuild_card,
     sync_review_state,
     validate_answer_extras,
 )
@@ -31,6 +33,10 @@ TYPED_SHARE = 0.5          # con check_expr, vistas y nunca acertadas: escritas 
 REVIEW, FOCUS = "review", "focus"
 # Modos sin sesión de práctica detrás: no vuelven "al final de la sesión" ni muestran próxima fecha.
 _NO_SESSION_MODES = ("mock", "pretest")
+# "Explicá por qué": solo en práctica, después de un acierto con "Me parece", y nunca en 2 respuestas
+# calificadas seguidas: sale la 1.ª, la 4.ª, la 7.ª...
+EXPLAIN_EVERY = 3
+_EXPLAIN_MODES = ("mcq", "mcq_think_first", "typed", "typed_then_mcq")
 
 
 @dataclass
@@ -61,6 +67,8 @@ class AnswerFeedback:
     relearn_progress: str | None = None   # "1 de 3 días" mientras está en reaprendizaje
     feedback_style: str = "full"     # alarm | full | short | doubt (ver `feedback_style`)
     question_id: int | None = None   # de qué pregunta es (la revisión del simulacro se arma por id)
+    answer_id: int | None = None     # fila de `answer` recién guardada
+    explain_prompt: bool = False     # pedir "Explicá por qué" (se responde con `record_explain_match`)
 
 
 class UnreadableAnswer(ValueError):
@@ -292,6 +300,42 @@ def _next_label(review: sqlite3.Row, rating: Rating, now: int) -> str:
     return f"Vuelve {when}"
 
 
+def should_prompt_explain(conn: sqlite3.Connection, correct: bool, confidence: int | None, mode: str) -> bool:
+    """¿Corresponde pedir "Explicá por qué" después de esta respuesta (todavía sin guardar)?
+
+    Solo un acierto con "Me parece" en un modo de práctica, y solo si ninguna de las
+    `EXPLAIN_EVERY - 1` respuestas calificadas anteriores (acierto con "Me parece" en práctica) lo pidió.
+    """
+    if not correct or confidence != UNSURE or mode not in _EXPLAIN_MODES:
+        return False
+    recent = conn.execute(
+        "SELECT explain_prompted FROM answer WHERE correct = 1 AND confidence = ? "
+        f"AND mode IN ({','.join('?' * len(_EXPLAIN_MODES))}) ORDER BY at DESC, id DESC LIMIT ?",
+        (UNSURE, *_EXPLAIN_MODES, EXPLAIN_EVERY - 1),
+    ).fetchall()
+    return not any(r["explain_prompted"] == 1 for r in recent)
+
+
+def record_explain_match(conn: sqlite3.Connection, answer_id: int, same: bool) -> None:
+    """Guarda si el estudiante dijo lo mismo que la explicación, rehace la tarjeta y hace commit.
+
+    `LookupError` si la respuesta no existe; `ValueError` si no se pidió explicación o ya se contestó.
+    Lo que escribió el estudiante no llega acá: no se manda ni se guarda.
+    """
+    row = conn.execute(
+        "SELECT question_id, explain_prompted, explain_match FROM answer WHERE id = ?", (answer_id,)
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"respuesta {answer_id} inexistente")
+    if row["explain_prompted"] != 1:
+        raise ValueError("A esta respuesta no se le pidió explicar")
+    if row["explain_match"] is not None:
+        raise ValueError("Esta explicación ya se contestó")
+    conn.execute("UPDATE answer SET explain_match = ? WHERE id = ?", (1 if same else 0, answer_id))
+    rebuild_card(conn, row["question_id"])
+    conn.commit()
+
+
 def record_answer(
     conn: sqlite3.Connection, question_id: int, chosen_index: int | None, now: int, **extras
 ) -> AnswerFeedback:
@@ -387,12 +431,15 @@ def _insert_answer(
             chosen_index = option_order[chosen_index]   # de la posición mostrada a la original
         correct = chosen_index == q["correct_index"]
 
-    conn.execute(
+    explain_prompt = should_prompt_explain(conn, correct, confidence, mode)
+    cur = conn.execute(
         "INSERT INTO answer(question_id, chosen_index, correct, at, confidence, latency_ms, mode, "
-        "option_order_json, typed_text, options_revealed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "option_order_json, typed_text, options_revealed_ms, explain_prompted) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (question_id, chosen_index, 1 if correct else 0, now, confidence, latency_ms, mode,
-         option_order_json, typed_text, options_revealed_ms),
+         option_order_json, typed_text, options_revealed_ms, 1 if explain_prompt else 0),
     )
+    answer_id = cur.lastrowid
     sync_review_state(conn)
 
     requeue, next_label, relearn_progress = False, None, None
@@ -419,6 +466,8 @@ def _insert_answer(
         relearn_progress=relearn_progress,
         feedback_style=feedback_style(correct, confidence),
         question_id=question_id,
+        answer_id=answer_id,
+        explain_prompt=explain_prompt,
     )
 
 

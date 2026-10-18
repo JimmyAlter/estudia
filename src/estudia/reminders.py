@@ -24,7 +24,9 @@ log = logging.getLogger(__name__)
 EXAM_EVE_HOUR = 18         # el aviso del examen sale desde las 18:00 locales del día anterior
 CLASS_LEAD_S = 15 * 60     # la clase se avisa desde 15 minutos antes
 SESSION_WINDOW_S = 10 * 60  # la sesión se avisa al empezar y hasta 10 minutos después
-KEEP_SENT_S = 3 * 24 * 3600
+ENROLL_LEAD_DAYS = 3       # la inscripción se avisa desde 3 días antes del cierre
+ENROLL_FROM_HOUR = 9       # ...a partir de las 9:00 locales de ese día
+KEEP_SENT_S = 5 * 24 * 3600  # más que la ventana más larga de un aviso (la de inscripción)
 CHECK_EVERY_S = 60
 NOTIFY_SEND_TIMEOUT_S = 5
 TITLE = "Estudia"
@@ -64,7 +66,8 @@ def _exam_reminders(conn: sqlite3.Connection, now: int) -> list[Reminder]:
     out = []
     today = _local_date(now)
     for r in conn.execute(
-        "SELECT id, name, opens_at FROM exam WHERE opens_at IS NOT NULL AND opens_at > ? ORDER BY opens_at, id",
+        "SELECT id, name, opens_at FROM exam WHERE opens_at IS NOT NULL AND opens_at > ? "
+        "AND COALESCE(kind, 'parcial') != 'inscripcion' ORDER BY opens_at, id",
         (now,),
     ):
         day = _local_date(r["opens_at"])
@@ -73,6 +76,23 @@ def _exam_reminders(conn: sqlite3.Connection, now: int) -> list[Reminder]:
             continue
         out.append(Reminder(f"exam:{r['id']}:{day.isoformat()}", TITLE,
                             f"Mañana: {r['name']}, {_clock(r['opens_at'])}"))
+    return out
+
+
+def _enrollment_reminders(conn: sqlite3.Connection, now: int) -> list[Reminder]:
+    """Una inscripción se avisa una vez, desde las 9:00 locales del día de cierre menos 3 y hasta el cierre."""
+    out = []
+    for r in conn.execute(
+        "SELECT id, name, closes_at FROM exam WHERE kind = 'inscripcion' AND closes_at IS NOT NULL "
+        "AND closes_at > ? ORDER BY closes_at, id", (now,),
+    ):
+        first_day = _local_date(r["closes_at"]) - timedelta(days=ENROLL_LEAD_DAYS)
+        from_at = int(datetime(first_day.year, first_day.month, first_day.day, ENROLL_FROM_HOUR, tzinfo=TZ).timestamp())
+        if now < from_at:
+            continue
+        close = datetime.fromtimestamp(r["closes_at"], TZ)
+        out.append(Reminder(f"enroll:{r['id']}:{r['closes_at']}", TITLE,
+                            f"Cierra la inscripción: {r['name']}, el {close.day}/{close.month} a las {_clock(r['closes_at'])}"))
     return out
 
 
@@ -108,7 +128,7 @@ def due_reminders(conn: sqlite3.Connection, now: int, sent: set[str]) -> list[Re
     """Avisos que corresponden en `now` (epoch) y todavía no están en `sent`. Apagados: lista vacía."""
     if not reminders_enabled(conn):
         return []
-    found = _exam_reminders(conn, now) + _class_reminders(conn, now) + _session_reminders(conn, now)
+    found = (_exam_reminders(conn, now) + _enrollment_reminders(conn, now) + _class_reminders(conn, now) + _session_reminders(conn, now))
     return [r for r in found if r.key not in sent]
 
 

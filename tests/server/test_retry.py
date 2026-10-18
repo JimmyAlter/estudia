@@ -175,11 +175,12 @@ def test_periodic_loop_waits_while_busy(setup):
     assert setup["moodle_calls"] == 0
 
 
-def test_youtube_cap_waits_until_its_reset(setup):
+@pytest.mark.parametrize("reason", ["youtube_cap", "budget"])
+def test_daily_limits_wait_until_their_reset(setup, reason):
     jobs, clock = setup["jobs"], setup["clock"]
     conn = jobs.connect()
     try:
-        _kv_set(conn, "ai_stop_reason", "youtube_cap")
+        _kv_set(conn, "ai_stop_reason", reason)
         _kv_set(conn, "ai_quota_resets_at", str(int(clock() + 5000)))
         jobs._plan_retry(conn, 0)
     finally:
