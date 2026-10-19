@@ -1,10 +1,11 @@
-"""Tubería de generación: video -> resumen + preguntas verificadas.
+"""Tubería de generación: video, PDF o diapositivas -> resumen + preguntas verificadas.
 
 Regla central: una pregunta solo se guarda (verified=1) si sus opciones son
 distintas, la respuesta a ciegas coincide con `correct_index` y, cuando hay
 `check_expr`, SymPy confirma la opción marcada y ninguna otra. Todo lo demás se
 descarta y no se guarda. La pasada a ciegas va en un pedido por lote de hasta
 BLIND_BATCH_MAX clases y nunca con un modelo que haya analizado alguna de ellas.
+Un documento pasa exactamente por la misma verificación que un video.
 """
 from __future__ import annotations
 
@@ -18,24 +19,29 @@ import time
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from estudia.ai.base import (
     AIAuthError,
+    AIDocumentUnreadableError,
     AIFormatError,
     AINeedsPublicLinkError,
     AIProvider,
     AIQuotaError,
     AIUnavailableError,
     AIVideoUnavailableError,
+    DocumentAnalysis,
+    DocumentInput,
     VideoAnalysis,
     option_key,
 )
 from estudia.ai.quota import (
     BLIND_BATCH_MAX,
     can_analyze,
+    can_analyze_document,
     prune_usage,
     quota_day,
     record_usage,
@@ -47,10 +53,19 @@ from estudia.config import (
     MAX_EXHAUSTED_S,
     VIDEO_ESTIMATE_S,
     YOUTUBE_URL_DENIED_S,
+    data_dir,
 )
 from estudia.generation.notation import sentence_case, student_math
 from estudia.ai.gate import AIBlocked
 from estudia.generation.verify import check_math_tristate, typed_accepts_option
+from estudia.material.documents import DocumentBusy, pdf_pages_bytes, slides_text
+from estudia.material.files import (
+    FAIL_DOWNLOAD,
+    TOO_LARGE_TEXT,
+    UNREADABLE_TEXT,
+    TooLarge,
+    UnreadableFile,
+)
 
 STOP_REASONS = ((AIQuotaError, "quota"), (AIUnavailableError, "unavailable"), (AIAuthError, "auth"))
 FORMAT_ERROR_TEXT = "La IA devolvió una respuesta con formato inválido."
@@ -92,9 +107,18 @@ LOCAL_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 CAP_TZ = ZoneInfo("America/Los_Angeles")   # la zona del día de la cuota de Gemini (rotation.py)
 # material.fail_kind: por qué falló, para decidir qué reintentar.
 FAIL_FORMAT, FAIL_VIDEO, FAIL_ERROR = "format", "video", "error"
+# Un PDF o unas diapositivas que no se pudieron leer (el archivo o Gemini).
+FAIL_DOCUMENT = "document"
 # Con una clave nueva vale la pena reintentar lo que pudo fallar por la IA; un video
-# privado sigue privado. NULL = falló antes de existir fail_kind.
+# privado sigue privado y un archivo ilegible sigue ilegible. NULL = falló antes de existir fail_kind.
 RETRY_ON_NEW_KEY = (FAIL_FORMAT, FAIL_ERROR)
+# material.kind de los documentos del campus; NULL es un video de antes de existir `kind`.
+DOC_KINDS = ("pdf", "slides")
+# Lo que entra en la tubería: los demás (`page`, `file`) nunca quedan pendientes de análisis.
+PIPELINE_KINDS = ("youtube", *DOC_KINDS)
+DOC_UNREADABLE_TEXT = UNREADABLE_TEXT   # "No se pudo leer", fijado por la spec
+# Marca de página del resumen de un documento: "(pág. 14)" o, en diapositivas, "(diap. 14)".
+_PAGE_MARK = re.compile(r"( ?)\((?:pág|diap)\. (\d+)\)")
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +130,7 @@ class ProcessResult:
     status: str = "done"  # done | failed | needs_public_link
 
 
-def _collapse(text: str) -> str:
+def collapse_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -118,7 +142,7 @@ def slugify(name: str) -> str:
 
 
 def dedupe_key(material_id: int, stem: str) -> str:
-    return hashlib.sha1(f"{material_id}:{_collapse(stem).lower()}".encode()).hexdigest()
+    return hashlib.sha1(f"{material_id}:{collapse_spaces(stem).lower()}".encode()).hexdigest()
 
 
 def options_distinct(options: list[str]) -> bool:
@@ -189,7 +213,7 @@ def blind_matches(provider: AIProvider, questions: list, exclude_models) -> list
     return [a is not None and a == q.correct_index for q, a in zip(questions, answers)]
 
 
-def _local_candidates(analysis: VideoAnalysis) -> list:
+def _local_candidates(analysis: VideoAnalysis | DocumentAnalysis) -> list:
     """Las preguntas que pasan lo que se verifica gratis; solo estas van a ciegas."""
     return [q for q in analysis.questions if _passes_local_checks(q)]
 
@@ -288,35 +312,91 @@ def _cap_reached(conn: sqlite3.Connection, now: float) -> bool:
     return used > 0 and used + video_estimate(conn, now) > DAILY_VIDEO_CAP_S
 
 
+def is_document(kind: str | None) -> bool:
+    return kind in DOC_KINDS
+
+
+def load_analysis(kind: str | None, raw: str) -> VideoAnalysis | DocumentAnalysis:
+    """El análisis guardado de un material, con el tipo que corresponde a su `kind`.
+
+    Lanza ValidationError (un ValueError) si no es un análisis de ese tipo: uno de video
+    nunca se lee como de documento ni al revés.
+    """
+    model = DocumentAnalysis if is_document(kind) else VideoAnalysis
+    return model.model_validate_json(raw)
+
+
+def document_input(conn: sqlite3.Connection, material_id: int, base_dir: Path) -> DocumentInput:
+    """Lo que se le manda a Gemini de un documento o de un tramo.
+
+    Un PDF entero va con los bytes del archivo; un tramo, solo con sus páginas (un PDF nuevo
+    que empieza en su página 1). Las diapositivas van como texto, numeradas desde 1 dentro
+    del tramo. UnreadableFile si el archivo no se puede leer o su ruta sale de `base_dir`.
+    """
+    row = conn.execute("SELECT kind, title, ref, pages, page_from, page_to FROM material"
+                       " WHERE id=?", (material_id,)).fetchone()
+    if row is None:
+        raise LookupError(f"material {material_id} inexistente")
+    kind, page_from, page_to = row["kind"], row["page_from"], row["page_to"]
+    if not is_document(kind):
+        raise ValueError(f"material {material_id} no es un documento")
+    root = Path(base_dir).resolve()
+    path = (root / (row["ref"] or "")).resolve()
+    if not path.is_relative_to(root) or path == root:
+        raise UnreadableFile(UNREADABLE_TEXT)
+    part = page_from is not None and page_to is not None
+    pages = page_to - page_from + 1 if part else (row["pages"] or 0)
+    title = row["title"] or ""
+    if kind == "pdf":
+        if part:
+            data = pdf_pages_bytes(path, page_from, page_to)
+        else:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                raise UnreadableFile(UNREADABLE_TEXT) from None
+        return DocumentInput(kind=kind, title=title, pages=pages, data=data, part=part)
+    if not path.is_file():
+        raise UnreadableFile(UNREADABLE_TEXT)
+    text = slides_text(path, page_from or 1, page_to if part else None)
+    return DocumentInput(kind=kind, title=title, pages=pages, text=text, part=part)
+
+
 def _analysis(conn, provider: AIProvider, material_id: int,
-              row, clock: Callable[[], float] = time.time) -> tuple[VideoAnalysis, str]:
-    """El análisis del video y el modelo que lo hizo; si una corrida anterior ya lo
+              row, clock: Callable[[], float] = time.time) -> tuple[VideoAnalysis | DocumentAnalysis, str]:
+    """El análisis del material y el modelo que lo hizo; si una corrida anterior ya lo
     pagó, se reusa.
 
     Se guarda apenas llega, antes de la pasada a ciegas: si esa pasada se corta por
-    cuota, la próxima corrida no vuelve a analizar el video. El modelo se guarda para
-    que la pasada a ciegas no lo use.
+    cuota, la próxima corrida no vuelve a analizar el material. El modelo se guarda para
+    que la pasada a ciegas no lo use. Un documento va por `analyze_document` y nunca suma
+    al tope de YouTube; un video va por `analyze_video`.
     """
+    document = is_document(row["kind"])
     if row["analysis_json"]:
         try:
-            cached = VideoAnalysis.model_validate_json(row["analysis_json"])
+            cached = load_analysis(row["kind"], row["analysis_json"])
             # Sin modelo anotado: es de antes de anotarlo, cuando había uno solo.
             return cached, row["analysis_model"] or LEGACY_ANALYSIS_MODEL
         except ValidationError:
             pass  # guardado roto: se vuelve a pedir
-    try:
-        analysis = provider.analyze_video(row["ref"], row["title"])
-    except AIFormatError:
-        # Una respuesta inservible igual gastó el video del día si fue por enlace.
-        _count_link_read(conn, provider, clock())
-        conn.commit()
-        raise
+    if document:
+        analysis = provider.analyze_document(document_input(conn, material_id, data_dir()))
+    else:
+        try:
+            analysis = provider.analyze_video(row["ref"], row["title"])
+        except AIFormatError:
+            # Una respuesta inservible igual gastó el video del día si fue por enlace.
+            _count_link_read(conn, provider, clock())
+            conn.commit()
+            raise
     model = provider.last_analysis_model or LEGACY_ANALYSIS_MODEL
     conn.execute(
         "UPDATE material SET analysis_json=?, analysis_model=? WHERE id=?",
         (analysis.model_dump_json(), model, material_id),
     )
-    _count_link_read(conn, provider, clock())
+    if not document:
+        _count_link_read(conn, provider, clock())
     conn.commit()
     return analysis, model
 
@@ -337,7 +417,8 @@ def _topic_id(conn, course_id: int, name: str) -> int | None:
 
 def _material_row(conn, material_id: int):
     row = conn.execute(
-        "SELECT m.ref, m.title, m.analysis_json, m.analysis_model, s.course_id FROM material m"
+        "SELECT m.kind, m.ref, m.title, m.analysis_json, m.analysis_model, m.pages,"
+        " m.page_from, m.page_to, s.course_id FROM material m"
         " JOIN section s ON s.id = m.section_id WHERE m.id=?",
         (material_id,),
     ).fetchone()
@@ -348,12 +429,27 @@ def _material_row(conn, material_id: int):
 
 def _analyze_or_close(conn, provider: AIProvider, material_id: int,
                       clock: Callable[[], float]) -> ProcessResult | None:
-    """Deja guardado el análisis (lo pide si hace falta). Si el video no se puede leer o
-    la respuesta es inservible, cierra el material y devuelve cómo quedó; si no, None.
-    Quota/Unavailable/Auth se propagan sin guardar nada."""
+    """Deja guardado el análisis (lo pide si hace falta). Si el video o el documento no se
+    puede leer o la respuesta es inservible, cierra el material y devuelve cómo quedó; si
+    no, None. Quota/Unavailable/Auth se propagan sin guardar nada."""
     row = _material_row(conn, material_id)
     try:
         _analysis(conn, provider, material_id, row, clock)
+    except (UnreadableFile, AIDocumentUnreadableError):
+        # El archivo (o Gemini) no lo pudo leer: va antes que AIFormatError, que es su base.
+        _set_status(conn, material_id, "failed", error=DOC_UNREADABLE_TEXT, fail_kind=FAIL_DOCUMENT)
+        conn.commit()
+        return ProcessResult(0, 0, "failed")
+    except (TooLarge, ValueError) as exc:
+        # Solo en un documento: más páginas que el tope, o un tramo con un rango inválido
+        # (`pdf_pages_bytes`). En un video sigue siendo un error inesperado.
+        if not is_document(row["kind"]):
+            raise
+        conn.rollback()
+        text = TOO_LARGE_TEXT if isinstance(exc, TooLarge) else DOC_UNREADABLE_TEXT
+        _set_status(conn, material_id, "failed", error=text, fail_kind=FAIL_DOCUMENT)
+        conn.commit()
+        return ProcessResult(0, 0, "failed")
     except AINeedsPublicLinkError:
         _set_status(conn, material_id, NEEDS_LINK, error=NEEDS_LINK_TEXT)
         conn.commit()
@@ -369,9 +465,72 @@ def _analyze_or_close(conn, provider: AIProvider, material_id: int,
     return None
 
 
-def _finalize(conn, material_id: int, analysis: VideoAnalysis, kept: list) -> ProcessResult:
-    """Escribe temas, preguntas verificadas, tramos y `done` en una sola transacción."""
-    course_id = _material_row(conn, material_id)["course_id"]
+def _page_range(row) -> tuple[int, int] | None:
+    """Las páginas del documento entero que cubre lo que se mandó; None si no se sabe."""
+    if row["page_from"] is not None and row["page_to"] is not None:
+        return row["page_from"], row["page_to"]
+    if row["pages"]:
+        return 1, row["pages"]
+    return None
+
+
+def _page_offset(row) -> int:
+    """Cuánto correr las páginas que cita Gemini para que sean las del documento entero.
+
+    Un tramo (de PDF o de diapositivas) se manda numerado desde 1: se corre `page_from - 1`.
+    """
+    return row["page_from"] - 1 if row["page_from"] is not None else 0
+
+
+def _in_document(page: int, offset: int, first: int, last: int | None) -> int | None:
+    """La página citada `page` (contada desde 1 en lo mandado) en el documento entero.
+
+    En un tramo que no empieza en la 1 (`offset` > 0), una cita desde `page_from`
+    (= `offset` + 1) puede ser el número impreso en la hoja y no el del archivo: ante la
+    duda, None. Una cita que falta vale; una equivocada, no.
+    """
+    if offset > 0 and page > offset:
+        return None
+    page += offset
+    if last is None or not first <= page <= last:
+        return None
+    return page
+
+
+def _document_page(row, page: int | None) -> int | None:
+    """La página del documento entero; None si no hay, si cae fuera de lo que se mandó o si
+    no se sabe cuántas páginas tiene."""
+    if page is None:
+        return None
+    first, last = _page_range(row) or (1, None)
+    return _in_document(page, _page_offset(row), first, last)
+
+
+def _shift_pages(summary_md: str, offset: int, first: int = 1, last: int | None = None,
+                 unit: str = "pág.") -> str:
+    """Corre `offset` las marcas "(pág. N)" del resumen (de un tramo al documento entero) y
+    las escribe con `unit` ("pág." en un PDF, "diap." en diapositivas).
+
+    Con la misma regla que las preguntas: una marca que cae fuera de `first..last` (o todas,
+    si `last` es None) o que puede ser un número impreso se borra.
+    """
+    def replace(m: re.Match) -> str:
+        page = _in_document(int(m.group(2)), offset, first, last)
+        return "" if page is None else f"{m.group(1)}({unit} {page})"
+
+    return _PAGE_MARK.sub(replace, summary_md)
+
+
+def _finalize(conn, material_id: int, analysis: VideoAnalysis | DocumentAnalysis,
+              kept: list) -> ProcessResult:
+    """Escribe temas, preguntas verificadas, tramos y `done` en una sola transacción.
+
+    Un documento guarda la página citada (la del documento entero) y no tiene segundos
+    ni tramos; un video, al revés.
+    """
+    row = _material_row(conn, material_id)
+    course_id = row["course_id"]
+    document = is_document(row["kind"])
     stored = 0
     try:
         analysis_tids = []
@@ -401,20 +560,28 @@ def _finalize(conn, material_id: int, analysis: VideoAnalysis, kept: list) -> Pr
             if text is None:
                 continue
             check_expr = q.check_expr.strip() if q.check_expr and q.check_expr.strip() else None
+            source_page = _document_page(row, getattr(q, "source_page", None)) if document else None
             cur = conn.execute(
                 "INSERT OR IGNORE INTO question(material_id, topic_id, stem, options_json,"
-                " correct_index, explanation, common_error, source_seconds, check_expr,"
-                " verified, retired, dedupe_key) VALUES (?,?,?,?,?,?,?,?,?,1,0,?)",
+                " correct_index, explanation, common_error, source_seconds, source_page,"
+                " check_expr, verified, retired, dedupe_key) VALUES (?,?,?,?,?,?,?,?,?,?,1,0,?)",
                 (
                     material_id, tid, text.stem, json.dumps(text.options, ensure_ascii=False),
-                    q.correct_index, text.explanation, text.common_error, q.source_seconds,
+                    q.correct_index, text.explanation, text.common_error,
+                    getattr(q, "source_seconds", None), source_page,
                     check_expr, dedupe_key(material_id, text.stem),
                 ),
             )
             stored += cur.rowcount  # 0 si ya estaba (mismo enunciado)
-        segments_json = (json.dumps([s.model_dump() for s in analysis.segments], ensure_ascii=False)
-                         if analysis.segments else None)
-        _set_status(conn, material_id, "done", summary_md=student_math(analysis.summary_md),
+        segments = getattr(analysis, "segments", None)
+        segments_json = (json.dumps([s.model_dump() for s in segments], ensure_ascii=False)
+                         if segments else None)
+        summary_md = analysis.summary_md
+        if document:
+            first, last = _page_range(row) or (1, None)
+            unit = "diap." if row["kind"] == "slides" else "pág."
+            summary_md = _shift_pages(summary_md, _page_offset(row), first, last, unit)
+        _set_status(conn, material_id, "done", summary_md=student_math(summary_md),
                     segments_json=segments_json)
         conn.commit()
     except BaseException:
@@ -459,7 +626,7 @@ def verify_batch(conn: sqlite3.Connection, provider: AIProvider,
         row = _material_row(conn, material_id)
         if not row["analysis_json"]:
             raise LookupError(f"material {material_id} sin análisis guardado")
-        analysis = VideoAnalysis.model_validate_json(row["analysis_json"])
+        analysis = load_analysis(row["kind"], row["analysis_json"])
         loaded.append((material_id, analysis, _local_candidates(analysis)))
     exclude = tuple(dict.fromkeys(_analysis_model_of(conn, mid) for mid in material_ids))
     questions = [q for _, _, candidates in loaded for q in candidates]
@@ -509,8 +676,15 @@ def retry_failed(conn: sqlite3.Connection, kinds: tuple[str, ...] | None = None)
     fail_kind). Los que piden enlace vuelven siempre: si el enlace sigue rechazado y la
     descarga apagada, vuelven a quedar así sin gastar un pedido.
     """
+    now = int(time.time())
+    # Un archivo del campus que no se pudo bajar vuelve a la cola de descargas, de cero.
+    download = conn.execute(
+        "UPDATE material SET status='downloading', error=NULL, fail_kind=NULL,"
+        " download_attempts=0, updated_at=? WHERE status='failed' AND fail_kind=?",
+        (now, FAIL_DOWNLOAD),
+    ).rowcount if kinds is None or FAIL_DOWNLOAD in kinds else 0
     failed = "status='failed'"
-    params: list = [int(time.time())]
+    params: list = [now]
     if kinds is not None:
         failed += f" AND (fail_kind IS NULL OR fail_kind IN ({','.join('?' * len(kinds))}))"
         params.extend(kinds)
@@ -518,7 +692,7 @@ def retry_failed(conn: sqlite3.Connection, kinds: tuple[str, ...] | None = None)
            f" analysis_model=NULL, segments_json=NULL, updated_at=? WHERE status='{NEEDS_LINK}' OR ({failed})")
     cur = conn.execute(sql, params)
     conn.commit()
-    return cur.rowcount
+    return download + cur.rowcount
 
 
 def retry_needs_link(conn: sqlite3.Connection) -> int:
@@ -570,7 +744,7 @@ def _save_url_denial(conn: sqlite3.Connection, provider: AIProvider, now: float)
     conn.commit()
 
 
-def _stop(conn: sqlite3.Connection, reason: str, resets_at: float | None) -> None:
+def record_stop(conn: sqlite3.Connection, reason: str, resets_at: float | None) -> None:
     """Anota el motivo de corte; si hay varios en una corrida, queda el último."""
     conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)", (STOP_KEY, reason))
     if resets_at is not None:
@@ -581,7 +755,7 @@ def _stop(conn: sqlite3.Connection, reason: str, resets_at: float | None) -> Non
     conn.commit()
 
 
-def _stop_reason(exc: Exception) -> str:
+def stop_reason_for(exc: Exception) -> str:
     return next(r for cls, r in STOP_REASONS if isinstance(exc, cls))
 
 
@@ -623,12 +797,12 @@ def _still_pending(conn: sqlite3.Connection, material_ids: list[int]) -> list[in
     """Los de `material_ids` (en ese orden) que siguen pendientes con un análisis legible."""
     ready = []
     for material_id in material_ids:
-        row = conn.execute("SELECT analysis_json FROM material WHERE id=? AND status='pending'",
+        row = conn.execute("SELECT kind, analysis_json FROM material WHERE id=? AND status='pending'",
                            (material_id,)).fetchone()
-        if row is None or not row[0]:
+        if row is None or not row["analysis_json"]:
             continue
         try:
-            VideoAnalysis.model_validate_json(row[0])
+            load_analysis(row["kind"], row["analysis_json"])
         except ValidationError:
             continue  # guardado roto: la próxima corrida lo vuelve a analizar
         ready.append(material_id)
@@ -642,44 +816,90 @@ class QueueItem:
     exam_at: int | None       # el examen futuro más próximo de su curso
 
 
-def pending_queue(conn: sqlite3.Connection, now: int, limit: int) -> list[QueueItem]:
+# Videos y documentos; NULL es un material de antes de que existiera `kind`, que siempre fue
+# un video. Un documento partido queda `split` y entran sus tramos.
+_IN_PIPELINE = "COALESCE(m.kind, 'youtube') IN (" + ",".join(f"'{k}'" for k in PIPELINE_KINDS) + ")"
+
+
+def _kinds_sql(kinds: tuple[str, ...]) -> str:
+    return "(" + ",".join(f"'{k}'" for k in kinds if k in PIPELINE_KINDS) + ")" if kinds else "(NULL)"
+
+
+def pending_queue(conn: sqlite3.Connection, now: int, limit: int,
+                  unpaid_kinds: tuple[str, ...] = PIPELINE_KINDS) -> list[QueueItem]:
     """Los pendientes de secciones visibles, primero los del curso que rinde antes.
 
     Una clase sin analizar todavía no tiene temas: "los temas del próximo examen" se
     resuelven por curso. Un examen abierto (cierra después de `now`) todavía cuenta, como en
     `home.next_exam`. Sin examen futuro van al final; dentro de lo mismo, por sección y por id.
+    Los que no tienen análisis guardado entran solo si su `kind` está en `unpaid_kinds`
+    (los ya analizados, siempre).
     """
     rows = conn.execute(
         "SELECT m.id, m.analysis_json IS NOT NULL AS paid,"
         " (SELECT MIN(e.opens_at) FROM exam e WHERE e.course_id = s.course_id AND COALESCE(NULLIF(e.closes_at, 0), e.opens_at) > ? AND COALESCE(e.kind, 'parcial') != 'inscripcion')"
         " AS exam_at FROM material m JOIN section s ON s.id = m.section_id"
-        " WHERE m.status='pending' AND s.visible=1"
+        " WHERE m.status='pending' AND s.visible=1 AND " + _IN_PIPELINE +
+        " AND (m.analysis_json IS NOT NULL OR COALESCE(m.kind, 'youtube') IN "
+        + _kinds_sql(unpaid_kinds) + ")"
         " ORDER BY exam_at IS NULL, exam_at, s.num, m.id LIMIT ?",
         (now, limit),
     ).fetchall()
     return [QueueItem(r[0], bool(r[1]), r[2]) for r in rows]
 
 
-def _awaiting_blind(conn: sqlite3.Connection) -> int:
+def awaiting_blind_count(conn: sqlite3.Connection) -> int:
     """Clases ya analizadas que esperan la pasada a ciegas."""
     return conn.execute(
         "SELECT COUNT(*) FROM material m JOIN section s ON s.id = m.section_id"
-        " WHERE m.status='pending' AND s.visible=1 AND m.analysis_json IS NOT NULL"
+        " WHERE m.status='pending' AND s.visible=1 AND m.analysis_json IS NOT NULL AND " + _IN_PIPELINE
     ).fetchone()[0]
+
+
+def _analyzable_kinds(conn: sqlite3.Connection, now: float) -> tuple[str, ...]:
+    """Los `kind` que todavía tienen presupuesto de análisis hoy: un video gasta "analysis";
+    un PDF o unas diapositivas, "pdf"."""
+    kinds: tuple[str, ...] = ()
+    if remaining(conn, "analysis", now) > 0:
+        kinds += ("youtube",)
+    if remaining(conn, "pdf", now) > 0:
+        kinds += DOC_KINDS
+    return kinds
+
+
+def _unpaid_waiting(conn: sqlite3.Connection, kinds: tuple[str, ...]) -> bool:
+    """¿Hay pendientes sin analizar de estos `kind`?"""
+    return conn.execute(
+        "SELECT 1 FROM material m JOIN section s ON s.id = m.section_id"
+        " WHERE m.status='pending' AND s.visible=1 AND m.analysis_json IS NULL AND "
+        "COALESCE(m.kind, 'youtube') IN " + _kinds_sql(kinds) + " LIMIT 1"
+    ).fetchone() is not None
+
+
+def _is_document_material(conn: sqlite3.Connection, material_id: int) -> bool:
+    row = conn.execute("SELECT kind FROM material WHERE id=?", (material_id,)).fetchone()
+    return row is not None and is_document(row[0])
 
 
 def process_pending(conn: sqlite3.Connection, provider: AIProvider, budget: int = 10,
                     clock: Callable[[], float] = time.time) -> int:
     """Procesa hasta `budget` materiales pendientes; devuelve cuántos quedaron `done`.
 
-    Orden: `pending_queue` (primero el curso del próximo examen, después sección e id).
+    Orden: `pending_queue` (primero el curso del próximo examen, después sección e id). Los
+    sin analizar de un tipo cuyo presupuesto del día ya está gastado al empezar ("analysis"
+    para un video, "pdf" para un documento) no entran en la ventana: quedan pendientes con
+    el motivo "budget" y no le quitan el lugar a los del otro tipo. Con el tope de YouTube
+    ya alcanzado al empezar, lo mismo con los videos sin analizar (motivo "youtube_cap").
     Va en dos fases:
     1. Analiza los que no tienen análisis guardado, en orden (cada análisis se guarda
        apenas llega). Con DAILY_VIDEO_CAP_S de video leído por enlace en el día de la
        cuota de Gemini (Pacífico), saltea los que mandarían otro video y deja el motivo
        "youtube_cap". Saltea también los que dejarían sin presupuesto del día a la pasada
-       a ciegas de lo ya analizado (`can_analyze`), con el motivo "budget". Los dos
-       vuelven a la medianoche del Pacífico.
+       a ciegas de lo ya analizado, o sin presupuesto propio (`can_analyze` para un video,
+       `can_analyze_document` para un PDF o unas diapositivas), con el motivo "budget".
+       Los dos vuelven a la medianoche del Pacífico. Un documento no tiene tope de
+       YouTube. Si los lugares para leer archivos están ocupados, el documento queda
+       pendiente para la próxima corrida.
     2. Verifica a ciegas, en lotes (`paid_batches`), todos los ya analizados de la ventana,
        mientras quede presupuesto a ciegas del día (si no, corta con "budget").
     Ante Quota/Unavailable/Auth corta la fase y guarda el motivo en kv["ai_stop_reason"]
@@ -694,11 +914,23 @@ def process_pending(conn: sqlite3.Connection, provider: AIProvider, budget: int 
     conn.commit()
     if budget <= 0:
         return 0  # (LIMIT negativo en SQLite sería "sin límite")
-    window = [item.material_id for item in pending_queue(conn, int(clock()), budget)]
-    _load_url_denial(conn, provider, clock())
+    start = clock()
+    _load_url_denial(conn, provider, start)
     load_exhausted(conn, provider)
+    # Lo sin analizar de un tipo sin presupuesto hoy no entra en la ventana: si no, doce PDFs
+    # sin presupuesto adelante dejarían afuera al video de atrás (y al revés).
+    analyzable = _analyzable_kinds(conn, start)
+    held_back = tuple(k for k in PIPELINE_KINDS if k not in analyzable)
     capped_at: float | None = None
-    over_budget_at: float | None = None
+    # Lo mismo con el tope de YouTube ya alcanzado (salvo con el enlace rechazado, que no lee
+    # nada por enlace): los videos sin analizar esperan a mañana y no tapan a los documentos.
+    if "youtube" in analyzable and not _link_denied(provider, start) and _cap_reached(conn, start):
+        analyzable = tuple(k for k in analyzable if k != "youtube")
+        if _unpaid_waiting(conn, ("youtube",)):
+            capped_at = start
+    window = [item.material_id for item in pending_queue(conn, int(start), budget, analyzable)]
+    # Los que quedaron afuera esperan el presupuesto de mañana: el motivo es "budget".
+    over_budget_at: float | None = start if held_back and _unpaid_waiting(conn, held_back) else None
     analysis_stop: str | None = None
     try:
         # Fase 1: análisis.
@@ -707,18 +939,28 @@ def process_pending(conn: sqlite3.Connection, provider: AIProvider, budget: int 
             # Lo pedido hasta acá ya cuenta para el presupuesto del día.
             record_usage(conn, provider, now)
             if not _still_pending(conn, [material_id]):  # sin análisis legible: hay que pedirlo
-                if not can_analyze(conn, now, _awaiting_blind(conn)):
-                    over_budget_at = now  # la reserva de la pasada a ciegas manda
-                    continue
-                # Con el enlace rechazado no sale nada por enlace: el tope no aplica.
-                if not _link_denied(provider, now) and _cap_reached(conn, now):
-                    capped_at = now  # mañana; los ya analizados siguen
-                    continue
+                if _is_document_material(conn, material_id):
+                    # Un documento gasta del presupuesto "pdf" y no lee video: sin tope de YouTube.
+                    if not can_analyze_document(conn, now, awaiting_blind_count(conn)):
+                        over_budget_at = now
+                        continue
+                else:
+                    if not can_analyze(conn, now, awaiting_blind_count(conn)):
+                        over_budget_at = now  # la reserva de la pasada a ciegas manda
+                        continue
+                    # Con el enlace rechazado no sale nada por enlace: el tope no aplica.
+                    if not _link_denied(provider, now) and _cap_reached(conn, now):
+                        capped_at = now  # mañana; los ya analizados siguen
+                        continue
             try:
                 _analyze_or_close(conn, provider, material_id, clock)
+            except DocumentBusy:
+                # Los lugares para leer archivos estaban ocupados: no es el archivo, queda pendiente.
+                conn.rollback()
+                continue
             except (AIQuotaError, AIUnavailableError, AIAuthError) as exc:
-                analysis_stop = _stop_reason(exc)
-                _stop(conn, analysis_stop, getattr(exc, "resets_at", None))
+                analysis_stop = stop_reason_for(exc)
+                record_stop(conn, analysis_stop, getattr(exc, "resets_at", None))
                 capped_at = over_budget_at = None  # el otro motivo manda
                 break
             except AIBlocked:
@@ -728,9 +970,9 @@ def process_pending(conn: sqlite3.Connection, provider: AIProvider, budget: int 
             except Exception as exc:  # noqa: BLE001 - un material roto no traba la cola
                 _fail_unexpected(conn, material_id, exc)
         if capped_at is not None:
-            _stop(conn, YOUTUBE_CAP, next_cap_reset(capped_at))
+            record_stop(conn, YOUTUBE_CAP, next_cap_reset(capped_at))
         if over_budget_at is not None:
-            _stop(conn, BUDGET, next_cap_reset(over_budget_at))
+            record_stop(conn, BUDGET, next_cap_reset(over_budget_at))
         # Fase 2: pasada a ciegas en lotes. Sin clave no tiene sentido; con la cadena de
         # análisis caída sí: la cadena a ciegas usa otros modelos y, si también está
         # caída, se corta sin escribir nada.
@@ -741,12 +983,12 @@ def process_pending(conn: sqlite3.Connection, provider: AIProvider, budget: int 
                 if remaining(conn, "blind", now) <= 0:
                     # Un motivo de la fase 1 (con su propio regreso) no se pisa.
                     if conn.execute("SELECT 1 FROM kv WHERE key = ?", (STOP_KEY,)).fetchone() is None:
-                        _stop(conn, BUDGET, next_cap_reset(now))
+                        record_stop(conn, BUDGET, next_cap_reset(now))
                     break
                 try:
                     _verify_in_queue(conn, provider, batch)
                 except (AIQuotaError, AIUnavailableError, AIAuthError) as exc:
-                    _stop(conn, _stop_reason(exc), getattr(exc, "resets_at", None))
+                    record_stop(conn, stop_reason_for(exc), getattr(exc, "resets_at", None))
                     break
     finally:
         now = clock()

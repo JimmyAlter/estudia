@@ -83,7 +83,8 @@ def test_tray_available_false_when_import_fails(monkeypatch):
 
 def test_shutdown_terminates_children():
     server = SimpleNamespace(should_exit=False)
-    child = multiprocessing.Process(target=time.sleep, args=(60,))
+    # spawn: con fork, un proceso con hilos (los de pytest) avisa que puede trabarse.
+    child = multiprocessing.get_context("spawn").Process(target=time.sleep, args=(60,))
     child.start()
     try:
         tray.shutdown(server)

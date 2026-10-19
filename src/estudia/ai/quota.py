@@ -92,9 +92,20 @@ def can_analyze(conn: sqlite3.Connection, now: float, awaiting_blind: int) -> bo
     que el uso real del día puede pasarse un poco. Pasarse nunca marca nada como hecho sin
     verificar: un material queda `done` solo después de pasar la verificación a ciegas.
     """
-    return remaining(conn, "analysis", now) > 0 and remaining(
-        conn, "blind", now
-    ) >= blind_requests_needed(awaiting_blind + 1)
+    return remaining(conn, "analysis", now) > 0 and _blind_reserved(conn, now, awaiting_blind)
+
+
+def can_analyze_document(conn: sqlite3.Connection, now: float, awaiting_blind: int) -> bool:
+    """Como `can_analyze`, pero un PDF o unas diapositivas gastan del presupuesto "pdf".
+
+    La reserva de la pasada a ciegas es la misma: un documento se verifica igual que un video.
+    """
+    return remaining(conn, "pdf", now) > 0 and _blind_reserved(conn, now, awaiting_blind)
+
+
+def _blind_reserved(conn: sqlite3.Connection, now: float, awaiting_blind: int) -> bool:
+    """¿Alcanza la pasada a ciegas para lo ya analizado más uno nuevo?"""
+    return remaining(conn, "blind", now) >= blind_requests_needed(awaiting_blind + 1)
 
 
 def prune_usage(conn: sqlite3.Connection, now: float) -> None:

@@ -222,6 +222,24 @@ jobs:
           }
           if ($check.ExitCode -ne 0) { throw "El worker de SymPy no anda en el .exe (código $($check.ExitCode))" }
           Write-Host "Worker de SymPy: bien"
+          Write-Host "Lectura de documentos congelada: $exe --check-documents"
+          $check = Start-Process -FilePath $exe -ArgumentList '--check-documents' -PassThru
+          $null = $check.Handle  # sin esto, ExitCode queda vacío
+          if (-not $check.WaitForExit(120000)) {
+            $check.Kill()
+            throw "Estudia.exe --check-documents no terminó en 120 s"
+          }
+          if ($check.ExitCode -ne 0) { throw "La lectura de documentos no anda en el .exe (código $($check.ExitCode))" }
+          Write-Host "Lectura de documentos: bien"
+          Write-Host "Herramientas de video congeladas: $exe --check-video-tools"
+          $check = Start-Process -FilePath $exe -ArgumentList '--check-video-tools' -PassThru
+          $null = $check.Handle  # sin esto, ExitCode queda vacío
+          if (-not $check.WaitForExit(120000)) {
+            $check.Kill()
+            throw "Estudia.exe --check-video-tools no terminó en 120 s"
+          }
+          if ($check.ExitCode -ne 0) { throw "yt-dlp o node no andan en el .exe (código $($check.ExitCode))" }
+          Write-Host "Herramientas de video: bien"
           Write-Host "Abriendo $exe sin navegador ni bandeja"
           $proc = Start-Process -FilePath $exe -PassThru
           $deadline = (Get-Date).AddSeconds(60)
@@ -274,6 +292,24 @@ jobs:
           }
           if ($check.ExitCode -ne 0) { throw "El worker de SymPy no anda en el .exe (código $($check.ExitCode))" }
           Write-Host "Worker de SymPy: bien"
+          Write-Host "Lectura de documentos congelada: $exe --check-documents"
+          $check = Start-Process -FilePath $exe -ArgumentList '--check-documents' -PassThru
+          $null = $check.Handle  # sin esto, ExitCode queda vacío
+          if (-not $check.WaitForExit(120000)) {
+            $check.Kill()
+            throw "Estudia.exe --check-documents no terminó en 120 s"
+          }
+          if ($check.ExitCode -ne 0) { throw "La lectura de documentos no anda en el .exe (código $($check.ExitCode))" }
+          Write-Host "Lectura de documentos: bien"
+          Write-Host "Herramientas de video congeladas: $exe --check-video-tools"
+          $check = Start-Process -FilePath $exe -ArgumentList '--check-video-tools' -PassThru
+          $null = $check.Handle  # sin esto, ExitCode queda vacío
+          if (-not $check.WaitForExit(120000)) {
+            $check.Kill()
+            throw "Estudia.exe --check-video-tools no terminó en 120 s"
+          }
+          if ($check.ExitCode -ne 0) { throw "yt-dlp o node no andan en el .exe (código $($check.ExitCode))" }
+          Write-Host "Herramientas de video: bien"
           Write-Host "Abriendo $exe con bandeja y sin navegador"
           $proc = Start-Process -FilePath $exe -PassThru
           $deadline = (Get-Date).AddSeconds(60)

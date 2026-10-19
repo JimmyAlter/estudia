@@ -6,6 +6,7 @@ from estudia.moodle.client import MoodleClient, MoodleError, MoodleUnreachable, 
 
 URL = "https://campus.example"
 ENDPOINT = f"{URL}/webservice/rest/server.php"
+FILE = f"{URL}/webservice/pluginfile.php/1/mod_page/content/f.html"
 
 
 def _client(http):
@@ -40,9 +41,9 @@ def test_other_errorcode_raises_moodle_error():
 
 @respx.mock
 def test_fetch_file_adds_token():
-    ruta = respx.get(f"{URL}/f.html").respond(content=b"hola")
+    ruta = respx.get(FILE).respond(content=b"hola")
     with httpx.Client() as http:
-        assert _client(http).fetch_file(f"{URL}/f.html?forcedownload=1") == b"hola"
+        assert _client(http).fetch_file(f"{FILE}?forcedownload=1") == b"hola"
     url = ruta.calls.last.request.url
     assert url.params["token"] == "TOK" and url.params["forcedownload"] == "1"
 
@@ -57,18 +58,18 @@ def _sin_token(exc):
 
 @respx.mock
 def test_fetch_file_error_does_not_leak_token():
-    respx.get(f"{URL}/f.html").respond(403)
+    respx.get(FILE).respond(403)
     with httpx.Client() as http, pytest.raises(MoodleError) as exc:
-        _client(http).fetch_file(f"{URL}/f.html?forcedownload=1")
+        _client(http).fetch_file(f"{FILE}?forcedownload=1")
     assert "403" in str(exc.value)
     _sin_token(exc.value)
 
 
 @respx.mock
 def test_fetch_file_transport_error_does_not_leak_token():
-    respx.get(f"{URL}/f.html").mock(side_effect=httpx.ConnectError("boom"))
+    respx.get(FILE).mock(side_effect=httpx.ConnectError("boom"))
     with httpx.Client() as http, pytest.raises(MoodleError) as exc:
-        _client(http).fetch_file(f"{URL}/f.html")
+        _client(http).fetch_file(FILE)
     _sin_token(exc.value)
 
 

@@ -4,7 +4,17 @@ from types import SimpleNamespace
 
 from google.genai import errors, types
 
-from estudia.ai.base import AIFormatError, AIQuotaError, VideoAnalysis
+from estudia.ai.base import (
+    AIFormatError,
+    AIQuotaError,
+    DocumentAnalysis,
+    DocumentInput,
+    ExtractedStyle,
+    PastExamInput,
+    StyleQuestion,
+    StyleRequest,
+    VideoAnalysis,
+)
 
 
 class FakeProvider:
@@ -25,6 +35,9 @@ class FakeProvider:
         models_by_ref: dict[str, str] | None = None,
         blind_errors: list[Exception | None] | None = None,
         blind_models: tuple[str, ...] | None = None,
+        documents: dict[str, DocumentAnalysis] | None = None,
+        styles: dict[bytes, ExtractedStyle] | None = None,
+        style_batches: list[list[StyleQuestion]] | None = None,
     ):
         self.analyses = analyses
         self.video_seconds = video_seconds
@@ -37,7 +50,16 @@ class FakeProvider:
         self.analysis_model = analysis_model
         # Modelo de análisis por id de video (pisa a `analysis_model`).
         self.models_by_ref = models_by_ref or {}
-        self.requests: dict[str, int] = {"analysis": 0, "blind": 0}
+        self.requests: dict[str, int] = {"analysis": 0, "blind": 0, "pdf": 0}
+        # Análisis de documentos por título (`doc.title`) y documentos que se mandaron.
+        self.documents = documents or {}
+        self.analyzed_docs: list[DocumentInput] = []
+        # Estilos de parciales viejos por sus bytes, y lo que se mandó (parcial, temas del curso).
+        self.styles = styles or {}
+        self.style_calls: list[tuple[PastExamInput, list[str]]] = []
+        # Tandas con el estilo del examen, en orden (una por pedido), y lo que se pidió.
+        self.style_batches = list(style_batches or [])
+        self.style_requests: list[StyleRequest] = []
         self.exhausted_until: dict[str, float] = {}
         self.last_analysis_model: str | None = None
         self.blind_batches: list[tuple[list[tuple[str, list[str]]], tuple[str, ...]]] = []
@@ -57,6 +79,29 @@ class FakeProvider:
         self.last_video_seconds = self.video_seconds
         self.last_link_sent = self.by_link
         return self.analyses[youtube_id]
+
+    def analyze_document(self, doc: DocumentInput) -> DocumentAnalysis:
+        self.analyzed_docs.append(doc)
+        if doc.title not in self.documents:
+            raise AIFormatError(f"sin análisis simulado para {doc.title}")
+        self.requests["pdf"] += 1
+        self.last_analysis_model = self.models_by_ref.get(doc.title, self.analysis_model)
+        return self.documents[doc.title]
+
+    def extract_exam_style(self, exam: PastExamInput, course_topics: list[str]) -> ExtractedStyle:
+        self.style_calls.append((exam, list(course_topics)))
+        if exam.data not in self.styles:
+            raise AIFormatError("sin estilo simulado para ese parcial")
+        self.requests["pdf"] += 1
+        return self.styles[exam.data]
+
+    def generate_style_questions(self, request: StyleRequest) -> list[StyleQuestion]:
+        self.style_requests.append(request)
+        if not self.style_batches:
+            raise AIFormatError("sin tanda simulada")
+        self.requests["analysis"] += 1
+        self.last_analysis_model = self.analysis_model
+        return self.style_batches.pop(0)
 
     def answer_blind(self, stem: str, options: list[str]) -> int | None:
         try:

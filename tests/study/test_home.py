@@ -152,6 +152,14 @@ def test_processing_counts_visible_sections_only(conn):
     assert (p.pending, p.done, p.failed) == (2, 1, 1)
 
 
+def test_downloading_counts_as_pending(conn):
+    add_topic(conn, 1, 10, "A", 1, status="pending")
+    add_topic(conn, 2, 10, "B", 1, status="downloading")
+    add_topic(conn, 3, 10, "C", 1, status="too_large")
+    p = home_view(conn, NOW).processing
+    assert (p.pending, p.done, p.failed) == (2, 0, 0)
+
+
 def test_answers_to_retired_questions_do_not_mark_practiced(conn):
     add_exam(conn, 1, 10, REAL_EXAM)
     add_topic(conn, 1, 10, "Alfa", 1)

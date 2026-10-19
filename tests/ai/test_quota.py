@@ -34,7 +34,12 @@ def test_budget_defaults_and_kv_override(conn):
     assert quota.daily_budget(conn, "analysis") == 40
     _set(conn, "ai_budget:analysis", "-3")
     assert quota.daily_budget(conn, "analysis") == 0
-    assert quota.daily_budget(conn, "pdf") == 0
+
+
+def test_default_pdf_budget_is_10(conn):
+    assert quota.daily_budget(conn, "pdf") == 10
+    _set(conn, "ai_budget:pdf", "3")
+    assert quota.daily_budget(conn, "pdf") == 3
 
 
 def test_unknown_function_raises(conn):
@@ -97,3 +102,25 @@ def test_prune_keeps_only_today(conn):
     quota.prune_usage(conn, today)
     assert _keys(conn) == ["ai_used:blind:2026-10-18"]
     assert quota.daily_budget(conn, "analysis") == 5
+
+
+def test_can_analyze_document_needs_pdf_budget(conn):
+    now = _ts("2026-10-18T12:00:00Z")
+    _set(conn, "ai_budget:pdf", "1")
+    assert quota.can_analyze_document(conn, now, awaiting_blind=0) is True
+    quota.add_used(conn, "pdf", 1, now)
+    assert quota.can_analyze_document(conn, now, awaiting_blind=0) is False
+
+
+def test_can_analyze_document_ignores_video_analysis_budget(conn):
+    now = _ts("2026-10-18T12:00:00Z")
+    _set(conn, "ai_budget:analysis", "0")
+    assert quota.can_analyze_document(conn, now, awaiting_blind=0) is True
+
+
+def test_can_analyze_document_reserves_blind_for_already_analyzed(conn):
+    now = _ts("2026-10-18T12:00:00Z")
+    _set(conn, "ai_budget:blind", "2")
+    quota.add_used(conn, "blind", 1, now)
+    assert quota.can_analyze_document(conn, now, awaiting_blind=4) is False
+    assert quota.can_analyze_document(conn, now, awaiting_blind=3) is True

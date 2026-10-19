@@ -442,3 +442,43 @@ describe("Explicá por qué", () => {
     expect(screen.queryByText(/Explicá por qué/)).not.toBeInTheDocument();
   });
 });
+
+describe("Práctica: cita de un apunte", () => {
+  it('la corrección cita "Apunte 3, pág. 14"', async () => {
+    mockApi({
+      "POST /api/quiz": [item()],
+      "GET /api/materials": [],
+      "POST /api/answer": feedback({
+        correct: false,
+        chosen_index: 0,
+        source_page: 14,
+        source_label: "Apunte 3, pág. 14",
+        source_url: "https://campus.example/mod/resource/view.php?id=31",
+      }),
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    await userEvent.click(screen.getByRole("button", { name: /^1/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Me parece/ }));
+
+    const link = await screen.findByRole("link", { name: "Apunte 3, pág. 14" });
+    expect(link).toHaveAttribute("href", "https://campus.example/mod/resource/view.php?id=31");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("sin enlace al campus, la cita queda como texto", async () => {
+    mockApi({
+      "POST /api/quiz": [item()],
+      "GET /api/materials": [],
+      "POST /api/answer": feedback({ correct: false, chosen_index: 0, source_page: 5, source_label: "Clase 2, diap. 5", source_url: null }),
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    await userEvent.click(screen.getByRole("button", { name: /^1/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Me parece/ }));
+
+    expect(await screen.findByText("Clase 2, diap. 5")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Clase 2/ })).not.toBeInTheDocument();
+  });
+});

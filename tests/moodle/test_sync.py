@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from estudia.db import connect
+from estudia.moodle.client import FileTooLarge, ForeignFileUrl, MoodleError, TooManyRedirects
 from estudia.moodle.sync import sync_all
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "moodle"
@@ -236,3 +237,40 @@ def test_failure_after_fetch_writes_nothing(tmp_path, monkeypatch):
     assert not conn.in_transaction
     for table in ("site", "course", "section", "material", "exam"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+
+
+@pytest.mark.parametrize("error", [ForeignFileUrl, TooManyRedirects, FileTooLarge])
+def test_bad_page_does_not_stop_sync(conn, caplog, error):
+    """Una page con URL ajena, bucle de redirecciones o enorme queda sin leer; el resto sigue."""
+    paginas = [m["id"] for sec in CONTENTS for m in sec.get("modules", [])
+               if m["modname"] == "page" and sec.get("uservisible", sec.get("visible"))]
+    mala = paginas[1]
+    url_mala = next(m["contents"][0]["fileurl"] for sec in CONTENTS
+                    for m in sec.get("modules", []) if m["id"] == mala)
+
+    class UnaMala(FakeClient):
+        def fetch_file(self, fileurl):
+            if fileurl == url_mala:
+                self.fetched.append(fileurl)
+                raise error("algo raro")
+            return super().fetch_file(fileurl)
+
+    cliente = UnaMala()
+    sync_all(conn, cliente, SITE)
+    assert len(cliente.fetched) == len(paginas)            # se siguió con las demás
+    fila = conn.execute("SELECT kind, status, ref FROM material WHERE cmid=?", (mala,)).fetchone()
+    assert tuple(fila) == ("page", "unsupported", None)
+    buenas = conn.execute(
+        "SELECT COUNT(*) FROM material WHERE kind='youtube' AND status='pending'").fetchone()[0]
+    assert buenas == len(paginas) - 1
+    assert conn.execute("SELECT COUNT(*) FROM exam").fetchone()[0] == 1   # el sync terminó
+    assert "token" not in caplog.text.lower() and url_mala not in caplog.text
+
+
+def test_other_moodle_error_on_new_page_still_raises(conn):
+    class Rota(FakeClient):
+        def fetch_file(self, fileurl):
+            raise MoodleError("nopermissions")
+
+    with pytest.raises(MoodleError):
+        sync_all(conn, Rota(), SITE)

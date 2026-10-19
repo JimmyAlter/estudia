@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from estudia.study.mastery import exam_horizon, topic_probability
+from estudia.study.mastery import REGULAR, exam_horizon, topic_probability
 from estudia.study.pretest import PretestOffer, pretest_offer
 
 TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -69,7 +69,7 @@ def ready_course(conn: sqlite3.Connection, now: int) -> ReadyCourse | None:
         " (SELECT MIN(e.opens_at) FROM exam e WHERE e.course_id = t.course_id AND COALESCE(NULLIF(e.closes_at, 0), e.opens_at) > ? AND COALESCE(e.kind, 'parcial') != 'inscripcion')"
         " AS exam_at"
         " FROM question q JOIN topic t ON t.id = q.topic_id"
-        " WHERE q.verified = 1 AND q.retired = 0"
+        f" WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR}"
         " GROUP BY t.course_id HAVING COUNT(*) >= ?"
         " ORDER BY exam_at IS NULL, exam_at, n DESC, t.course_id LIMIT 1",
         (now, READY_QUESTIONS),
@@ -115,7 +115,7 @@ def home_view(conn: sqlite3.Connection, now: int) -> HomeView:
     sql = (
         "SELECT t.id, t.name, MIN(s.num) AS num, "
         "EXISTS(SELECT 1 FROM answer a JOIN question q ON q.id = a.question_id "
-        "WHERE q.topic_id = t.id AND q.retired = 0 AND COALESCE(a.mode, '') != 'pretest') AS practiced "
+        f"WHERE q.topic_id = t.id AND q.retired = 0 AND {REGULAR} AND COALESCE(a.mode, '') != 'pretest') AS practiced "
         "FROM topic t JOIN material_topic mt ON mt.topic_id = t.id "
         "JOIN material m ON m.id = mt.material_id "
         "JOIN section s ON s.id = m.section_id "
@@ -132,7 +132,7 @@ def home_view(conn: sqlite3.Connection, now: int) -> HomeView:
         for r in conn.execute(
             "SELECT q.topic_id, COUNT(*) AS total, COUNT(rs.card_key) AS seen FROM question q "
             "LEFT JOIN review_state rs ON rs.card_key = 'q:' || q.id "
-            "WHERE q.verified = 1 AND q.retired = 0 GROUP BY q.topic_id"
+            f"WHERE q.verified = 1 AND q.retired = 0 AND {REGULAR} GROUP BY q.topic_id"
         )
     }
     # Dominio = probabilidad de saber el tema el día de su examen más próximo (o hoy, si no tiene).
@@ -153,7 +153,8 @@ def home_view(conn: sqlite3.Connection, now: int) -> HomeView:
         )
     }
     processing = ProcessingState(
-        pending=counts.get("pending", 0),
+        # Un archivo del campus que todavía no se bajó también está en cola.
+        pending=counts.get("pending", 0) + counts.get("downloading", 0),
         done=counts.get("done", 0),
         # Un video que pide un enlace público tampoco se pudo preparar.
         failed=counts.get("failed", 0) + counts.get("needs_public_link", 0),

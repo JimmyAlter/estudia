@@ -200,3 +200,32 @@ def test_weekly_deck_empty_raises(conn):
     assert weekly_question_ids(conn, NOW) == set()
     with pytest.raises(LookupError):
         build_apkg(conn, None, set())
+
+
+def test_anki_note_cites_page(conn, tmp_path):
+    conn.execute("UPDATE material SET kind='pdf', title='Apunte <3>', ref='documentos/1.pdf',"
+                 " status='split' WHERE id=1")
+    conn.execute("INSERT INTO material(id, section_id, kind, title, ref, status, parent_id, page_from,"
+                 " page_to) VALUES (2, 1, 'pdf', 'Parte 2', 'documentos/1.pdf', 'done', 1, 41, 80)")
+    add_q(conn, 1, seconds=None)
+    conn.execute("UPDATE question SET material_id=2, source_page=43 WHERE id=1")
+    conn.commit()
+    col = open_collection(build_apkg(conn, None), tmp_path)
+    source = col.execute("SELECT flds FROM notes").fetchone()[0].split("\x1f")[5]
+    assert source == "Apunte &lt;3&gt;, pág. 43"
+
+
+def test_anki_slides_without_page_cite_title(conn, tmp_path):
+    conn.execute("UPDATE material SET kind='slides', title='Clase 2', ref='documentos/1.pptx' WHERE id=1")
+    add_q(conn, 1, seconds=None)
+    col = open_collection(build_apkg(conn, None), tmp_path)
+    assert col.execute("SELECT flds FROM notes").fetchone()[0].split("\x1f")[5] == "Clase 2"
+
+
+def test_anki_untitled_document_falls_back_to_apunte(conn, tmp_path):
+    conn.execute("UPDATE material SET kind='pdf', title='  ', ref='documentos/1.pdf' WHERE id=1")
+    add_q(conn, 1, seconds=None)
+    conn.execute("UPDATE question SET source_page=5 WHERE id=1")
+    conn.commit()
+    col = open_collection(build_apkg(conn, None), tmp_path)
+    assert col.execute("SELECT flds FROM notes").fetchone()[0].split("\x1f")[5] == "Apunte"

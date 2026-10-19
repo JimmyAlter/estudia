@@ -1,0 +1,164 @@
+[
+ {
+  "id": 9001,
+  "name": "Unidad 1: Funciones",
+  "visible": 1,
+  "uservisible": true,
+  "summary": "",
+  "section": 1,
+  "modules": [
+   {
+    "id": 7001,
+    "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/resource/view.php?id=7001",
+    "name": "Guía de ejercicios 1",
+    "instance": 501,
+    "contextid": 3900001,
+    "visible": 1,
+    "uservisible": true,
+    "modname": "resource",
+    "modplural": "Archivos",
+    "contents": [
+     {
+      "type": "file",
+      "filename": "viejo.pdf",
+      "filepath": "/",
+      "filesize": 1000,
+      "fileurl": "https://aulasvirtuales.frba.utn.edu.ar/webservice/pluginfile.php/3900001/mod_resource/content/0/viejo.pdf?forcedownload=1",
+      "timecreated": 1790000000,
+      "timemodified": 1790000000,
+      "sortorder": 0,
+      "mimetype": "application/pdf",
+      "isexternalfile": false,
+      "userid": 7,
+      "author": "Profe",
+      "license": "allrightsreserved"
+     },
+     {
+      "type": "file",
+      "filename": "guia1.pdf",
+      "filepath": "/",
+      "filesize": 240000,
+      "fileurl": "https://aulasvirtuales.frba.utn.edu.ar/webservice/pluginfile.php/3900001/mod_resource/content/0/guia1.pdf?forcedownload=1",
+      "timecreated": 1790000000,
+      "timemodified": 1790000000,
+      "sortorder": 1,
+      "mimetype": "application/pdf",
+      "isexternalfile": false,
+      "userid": 7,
+      "author": "Profe",
+      "license": "allrightsreserved"
+     }
+    ]
+   },
+   {
+    "id": 7002,
+    "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/folder/view.php?id=7002",
+    "name": "Apuntes",
+    "instance": 502,
+    "contextid": 3900002,
+    "visible": 1,
+    "uservisible": true,
+    "modname": "folder",
+    "modplural": "Carpetas",
+    "contents": [
+     {
+      "type": "file",
+      "filename": "Apunte 3.pptx",
+      "filepath": "/",
+      "filesize": 512000,
+      "fileurl": "https://aulasvirtuales.frba.utn.edu.ar/webservice/pluginfile.php/3900002/mod_folder/content/0/Apunte%203.pptx?forcedownload=1",
+      "timecreated": 1790000000,
+      "timemodified": 1790000000,
+      "sortorder": 0,
+      "mimetype": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "isexternalfile": false,
+      "userid": 7,
+      "author": "Profe",
+      "license": "allrightsreserved"
+     },
+     {
+      "type": "file",
+      "filename": "Programa.docx",
+      "filepath": "/extra/",
+      "filesize": 30000,
+      "fileurl": "https://aulasvirtuales.frba.utn.edu.ar/webservice/pluginfile.php/3900002/mod_folder/content/0/extra/Programa.docx?forcedownload=1",
+      "timecreated": 1790000000,
+      "timemodified": 1790000000,
+      "sortorder": 0,
+      "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "isexternalfile": false,
+      "userid": 7,
+      "author": "Profe",
+      "license": "allrightsreserved"
+     }
+    ]
+   },
+   {
+    "id": 7003,
+    "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/resource/view.php?id=7003",
+    "name": "Archivo oculto",
+    "instance": 503,
+    "contextid": 3900003,
+    "visible": 0,
+    "uservisible": false,
+    "modname": "resource",
+    "modplural": "Archivos",
+    "contents": [
+     {
+      "type": "file",
+      "filename": "oculto.pdf",
+      "filepath": "/",
+      "filesize": 1000,
+      "fileurl": "https://aulasvirtuales.frba.utn.edu.ar/webservice/pluginfile.php/3900003/mod_resource/content/0/oculto.pdf?forcedownload=1",
+      "timecreated": 1790000000,
+      "timemodified": 1790000000,
+      "sortorder": 0,
+      "mimetype": "application/pdf",
+      "isexternalfile": false,
+      "userid": 7,
+      "author": "Profe",
+      "license": "allrightsreserved"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "id": 9002,
+  "name": "Unidad oculta",
+  "visible": 0,
+  "uservisible": false,
+  "summary": "",
+  "section": 2,
+  "modules": [
+   {
+    "id": 7004,
+    "url": "https://aulasvirtuales.frba.utn.edu.ar/mod/resource/view.php?id=7004",
+    "name": "No se ve",
+    "instance": 504,
+    "contextid": 3900004,
+    "visible": 1,
+    "uservisible": true,
+    "modname": "resource",
+    "modplural": "Archivos",
+    "contents": [
+     {
+      "type": "file",
+      "filename": "nosevee.pdf",
+      "filepath": "/",
+      "filesize": 1000,
+      "fileurl": "https://aulasvirtuales.frba.utn.edu.ar/webservice/pluginfile.php/3900004/mod_resource/content/0/nosevee.pdf?forcedownload=1",
+      "timecreated": 1790000000,
+      "timemodified": 1790000000,
+      "sortorder": 0,
+      "mimetype": "application/pdf",
+      "isexternalfile": false,
+      "userid": 7,
+      "author": "Profe",
+      "license": "allrightsreserved"
+     }
+    ]
+   }
+  ]
+ }
+]

@@ -11,8 +11,13 @@ from html import escape
 
 import genanki
 
+from estudia.study.citation import DOCUMENT_KINDS, SOURCE_JOIN, source_label
 from estudia.study.exams import exam_topics
 from estudia.study.home import next_exam
+
+# Lo propio nunca sale de la compu: las preguntas de estilo (origin='parcial_propio') quedan fuera
+# de toda exportación, aunque alguna vez tengan material. Se agrega a las cuatro consultas.
+EXPORTABLE = "q.origin IS NULL"
 
 WEEK_DAYS = 7  # el mazo de la semana: lo que vence en los próximos 7 días
 
@@ -67,7 +72,12 @@ def course_slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-") or "mazo"
 
 
-def _source(title: str, kind: str, ref: str | None, seconds: int | None) -> str:
+def _source(title: str, kind: str, ref: str | None, seconds: int | None,
+            page: int | None = None) -> str:
+    if kind in DOCUMENT_KINDS:
+        # "Apunte 3, pág. 14": la cita del archivo, sin "Clase:".
+        # Sin título (un documento sin nombre) la cita no puede quedar vacía.
+        return escape(source_label(kind, title, seconds, page) or "Apunte")
     text = f"Clase: {escape(title or '')}"
     if seconds is None:
         return text
@@ -92,7 +102,7 @@ def _note(r: sqlite3.Row) -> genanki.Note:
             answer,
             escape(r["explanation"] or ""),
             escape(r["common_error"] or ""),
-            _source(r["title"], r["kind"], r["ref"], r["source_seconds"]),
+            _source(r["title"], r["kind"], r["ref"], r["source_seconds"], r["source_page"]),
             escape(r["topic"] or ""),
             escape(r["course"] or ""),
         ],
@@ -105,7 +115,8 @@ def weekly_question_ids(conn: sqlite3.Connection, now: int) -> set[int]:
         r[0]
         for r in conn.execute(
             "SELECT q.id FROM question q JOIN review_state rs ON rs.card_key = 'q:' || q.id"
-            " WHERE q.verified = 1 AND q.retired = 0 AND rs.due < ?",
+            " WHERE q.verified = 1 AND q.retired = 0 AND rs.due < ?"
+            f" AND {EXPORTABLE}",
             (now + WEEK_DAYS * 86400,),
         )
     }
@@ -116,7 +127,8 @@ def weekly_question_ids(conn: sqlite3.Connection, now: int) -> set[int]:
         ids.update(
             r[0]
             for r in conn.execute(
-                f"SELECT id FROM question WHERE verified = 1 AND retired = 0 AND topic_id IN ({marks})", topics
+                f"SELECT q.id FROM question q"
+                f" WHERE q.verified = 1 AND q.retired = 0 AND {EXPORTABLE} AND q.topic_id IN ({marks})", topics
             )
         )
     return ids
@@ -130,10 +142,12 @@ def build_apkg(conn: sqlite3.Connection, course_id: int | None,
     """
     sql = (
         "SELECT q.id, q.stem, q.options_json, q.correct_index, q.explanation, q.common_error,"
-        " q.source_seconds, t.course_id, t.name AS topic, m.title, m.kind, m.ref,"
+        " q.source_seconds, q.source_page, t.course_id, t.name AS topic,"
+        " COALESCE(p.title, m.title) AS title, m.kind, m.ref,"
         " (SELECT MIN(fullname) FROM course WHERE id = t.course_id) AS course"
         " FROM question q JOIN topic t ON t.id = q.topic_id JOIN material m ON m.id = q.material_id"
-        " WHERE q.verified = 1 AND q.retired = 0"
+        f" {SOURCE_JOIN}"
+        f" WHERE q.verified = 1 AND q.retired = 0 AND {EXPORTABLE}"
     )
     params: list = []
     if course_id is not None:

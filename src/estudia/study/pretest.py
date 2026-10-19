@@ -21,6 +21,7 @@ class PretestOffer:
     material_id: int
     title: str
     course: str
+    kind: str = "youtube"   # youtube | pdf | slides: un documento no tiene video
 
 
 def _closed(conn: sqlite3.Connection) -> list[int]:
@@ -36,7 +37,7 @@ def pretest_offer(conn: sqlite3.Connection, now: int) -> PretestOffer | None:
     disponibles, sin ninguna respuesta en ningún modo y que no se cerró."""
     closed = _closed(conn)
     sql = (
-        "SELECT m.id, m.title, (SELECT MIN(c.fullname) FROM course c WHERE c.id = s.course_id) AS course "
+        "SELECT m.id, m.title, COALESCE(m.kind, 'youtube') AS kind, (SELECT MIN(c.fullname) FROM course c WHERE c.id = s.course_id) AS course "
         "FROM material m JOIN section s ON s.id = m.section_id "
         "WHERE s.visible = 1 AND m.status = 'done' AND m.updated_at >= ? "
         f"AND (SELECT COUNT(*) FROM question q WHERE q.material_id = m.id AND {_AVAILABLE}) >= ? "
@@ -50,19 +51,20 @@ def pretest_offer(conn: sqlite3.Connection, now: int) -> PretestOffer | None:
     row = conn.execute(sql + "ORDER BY m.updated_at DESC, m.id DESC LIMIT 1", params).fetchone()
     if row is None:
         return None
-    return PretestOffer(row["id"], row["title"] or "", row["course"] or "")
+    return PretestOffer(row["id"], row["title"] or "", row["course"] or "", row["kind"])
 
 
 def build_pretest(conn: sqlite3.Connection, material_id: int) -> list[QuizItem]:
-    """3 preguntas de la clase repartidas a lo largo del video: ordenadas por `source_seconds`
-    (las sin segundo, primero), la primera, la del medio y la última. `LookupError` si no hay 3 o
+    """3 preguntas de la clase repartidas a lo largo del video o del documento: ordenadas por
+    `source_seconds` o, en un documento, por `source_page` (las sin ninguno, primero), la primera, la del medio y la última. `LookupError` si no hay 3 o
     si la clase no está lista (`done`) en una sección visible, como la oferta."""
     rows = conn.execute(
         "SELECT q.id, q.stem, q.options_json, t.name AS topic FROM question q "
         "JOIN topic t ON t.id = q.topic_id "
         "JOIN material m ON m.id = q.material_id JOIN section s ON s.id = m.section_id "
         f"WHERE q.material_id = ? AND m.status = 'done' AND s.visible = 1 AND {_AVAILABLE} "
-        "ORDER BY q.source_seconds IS NOT NULL, q.source_seconds, q.id",
+        "ORDER BY COALESCE(q.source_seconds, q.source_page) IS NOT NULL,"
+        " COALESCE(q.source_seconds, q.source_page), q.id",
         (material_id,),
     ).fetchall()
     n = len(rows)

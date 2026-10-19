@@ -4,8 +4,10 @@ import logging
 import os
 import sys
 import time
+from secrets import token_hex
 from collections.abc import Callable, Collection
 from pathlib import Path
+from typing import TypeVar
 
 import httpx
 from google import genai
@@ -15,13 +17,22 @@ from pydantic import ValidationError
 from estudia import config
 from estudia.ai.base import (
     AIAuthError,
+    AIDocumentUnreadableError,
     AIFormatError,
     AINeedsPublicLinkError,
     AIQuotaError,
     AIUnavailableError,
     AIVideoUnavailableError,
+    DocQuestion,
+    DocumentAnalysis,
+    DocumentInput,
+    ExtractedStyle,
     GenQuestion,
+    PastExamInput,
     Segment,
+    StyleQuestion,
+    StyleQuestions,
+    StyleRequest,
     VideoAnalysis,
     option_key,
 )
@@ -51,8 +62,14 @@ from estudia.config import (
     YOUTUBE_URL_DENIED_S,
     data_dir,
 )
-from estudia.generation.prompts import ANALYSIS_PROMPT
+from estudia.generation.prompts import (
+    ANALYSIS_PROMPT,
+    DOCUMENT_PROMPT,
+    STYLE_PROMPT,
+    STYLE_QUESTIONS_PROMPT,
+)
 from estudia.material import video as video_module
+from estudia.material.files import UPLOAD_COPY_PREFIX
 from estudia.material.video import VideoDownloadError, mime_type
 
 # Un 429 con espera corta es el límite por minuto del plan gratuito: se espera y se reintenta.
@@ -79,6 +96,15 @@ DENIED_VIDEOS_FOR_KEY = 2
 
 # De dónde sale el video en un pedido de análisis.
 YOUTUBE_URL, UPLOADED_FILE = "youtube_url", "uploaded_file"
+# Valor de `video` en `_generate` cuando se manda un documento (PDF o diapositivas).
+DOCUMENT = "document"
+
+# Un PDF de hasta este tamaño va dentro del pedido; si pesa más, se sube con la API de archivos.
+INLINE_DOCUMENT_MAX_BYTES = 18 * 1024 * 1024
+PDF_MIME = "application/pdf"
+# El mime de un parcial viejo según su tipo (que salió de los bytes al cargarlo).
+PAST_EXAM_MIMES = {"pdf": PDF_MIME, "jpeg": "image/jpeg", "png": "image/png"}
+DOCUMENT_UNREADABLE = "Gemini no pudo leer el archivo"
 
 # Modelos que puede usar cada clave (client.models.list()), por huella de la clave.
 # Se consulta una vez y vale mientras dure el proceso: si Google agrega o saca un
@@ -96,14 +122,17 @@ class _YoutubeUrlRejected(Exception):
         self.remember = remember
 
 
-def _question_ok(q: GenQuestion) -> bool:
+_Analysis = TypeVar("_Analysis", VideoAnalysis, DocumentAnalysis)
+
+
+def _question_ok(q: GenQuestion | DocQuestion | StyleQuestion) -> bool:
     if len(q.options) != 4 or not 0 <= q.correct_index <= 3 or not q.stem.strip():
         return False
     keys = [option_key(o) for o in q.options]
     return all(keys) and len(set(keys)) == 4
 
 
-def _validate(analysis: VideoAnalysis) -> VideoAnalysis:
+def _validate(analysis: _Analysis) -> _Analysis:
     """Rechaza el análisis si el resumen o los temas son inválidos; descarta preguntas sueltas.
 
     Una pregunta con un tema fuera de `topics` se acepta: la tubería crea el tema.
@@ -115,6 +144,18 @@ def _validate(analysis: VideoAnalysis) -> VideoAnalysis:
     questions = [q for q in analysis.questions if _question_ok(q)]
     if not questions:
         raise AIFormatError("no hay preguntas válidas")
+    return analysis.model_copy(update={"questions": questions})
+
+
+def _validate_document(analysis: DocumentAnalysis, pages: int) -> DocumentAnalysis:
+    """Mismas reglas que `_validate`. Una página citada fuera del archivo queda en None:
+    la pregunta sirve igual, solo pierde la cita."""
+    analysis = _validate(analysis)
+    questions = [
+        q if q.source_page is None or 1 <= q.source_page <= pages
+        else q.model_copy(update={"source_page": None})
+        for q in analysis.questions
+    ]
     return analysis.model_copy(update={"questions": questions})
 
 
@@ -148,6 +189,53 @@ def _analysis_config() -> types.GenerateContentConfig:
         # Menos tokens por fotograma: alcanza para pizarrón y diapositivas.
         media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
     )
+
+
+def _document_config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=DocumentAnalysis,
+    )
+
+
+def _style_config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=ExtractedStyle,
+    )
+
+
+def _style_questions_config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=StyleQuestions,
+    )
+
+
+def style_questions_prompt(request: StyleRequest) -> str:
+    kinds = "\n".join(f"  - {n} de tipo \"{kind}\"" for kind, n in request.kinds.items() if n > 0)
+    topics = "\n".join(f"  - {name}" for name in request.topics if name.strip())
+    sheet = ("En el examen se puede usar una hoja de fórmulas: no hace falta preguntar fórmulas de memoria."
+             if request.formula_sheet else
+             "En el examen no hay hoja de fórmulas.")
+    return STYLE_QUESTIONS_PROMPT.format(course=request.course, kinds=kinds, topics=topics,
+                                         formula_sheet=sheet, material=request.material_text)
+
+
+def _pages_note(doc: DocumentInput) -> str:
+    """En un tramo, cuántas páginas (o diapositivas) tiene lo mandado: sus hojas traen
+    impresos los números del documento entero."""
+    if not doc.part or doc.pages <= 0:
+        return ""
+    unit = "páginas" if doc.data is not None else "diapositivas"
+    return f" Este archivo tiene {doc.pages} {unit}."
+
+
+def _course_topics_text(course_topics: list[str]) -> str:
+    names = [t.strip() for t in course_topics if t.strip()]
+    if not names:
+        return "  (La materia todavía no tiene temas cargados.)"
+    return "\n".join(f"  - {name}" for name in names)
 
 
 def _video_seconds(response) -> float | None:
@@ -211,7 +299,7 @@ class GeminiProvider:
         self.last_analysis_model: str | None = None
         self.last_blind_model: str | None = None
         # Pedidos a Gemini por función desde la última lectura (quien lee lo reinicia).
-        self.requests: dict[str, int] = {"analysis": 0, "blind": 0}
+        self.requests: dict[str, int] = {"analysis": 0, "blind": 0, "pdf": 0}
         if client is None:
             client = genai.Client(
                 api_key=api_key,
@@ -258,9 +346,10 @@ class GeminiProvider:
 
     def _generate(self, model: str, contents, gen_config, *, video: str | None = None,
                   function: str):
-        """Un pedido a `model`. `video`: de dónde sale el video (YOUTUBE_URL o UPLOADED_FILE);
-        None si es solo texto. `function`: a qué función se le cuenta el pedido ("analysis"
-        o "blind"); un 429 no se cuenta porque no gasta cuota de Google.
+        """Un pedido a `model`. `video`: de dónde sale el video (YOUTUBE_URL o UPLOADED_FILE),
+        DOCUMENT si es un PDF o diapositivas, None si es solo texto. `function`: a qué función
+        se le cuenta el pedido ("analysis", "blind" o "pdf"); un 429 no se cuenta porque no
+        gasta cuota de Google.
         Lanza NextModel si conviene probar el siguiente modelo."""
         quota_tries = transient_tries = 0
         while True:
@@ -306,14 +395,16 @@ class GeminiProvider:
     def _raise_mapped(e: errors.APIError, video: str | None):
         """Traduce el error a uno propio; los mensajes llevan solo el código, nunca la clave.
 
-        Con video, un 403 no prueba que la clave sea mala (la de texto puede andar):
-        la clave se juzga solo con pedidos de texto.
+        Con video o documento, un 403 no prueba que la clave sea mala (la de texto puede
+        andar): la clave se juzga solo con pedidos de texto.
         """
         code = e.code
         if code == 401 or (code == 400 and is_invalid_key(e)) or (code == 403 and video is None):
             raise AIAuthError(f"Gemini rechazó la clave (código {code})") from None
         if code == 408 or (isinstance(code, int) and code >= 500):
             raise AIUnavailableError(f"Gemini no disponible (código {code})") from None
+        if video == DOCUMENT and code in (400, 403):
+            raise AIDocumentUnreadableError(DOCUMENT_UNREADABLE) from None
         if video == YOUTUBE_URL and code == 400 and mentions_url(e):
             raise _YoutubeUrlRejected(remember=False) from None
         if video and code in (400, 403):
@@ -397,20 +488,28 @@ class GeminiProvider:
         _remove_local(path)
         return analysis
 
-    def _upload(self, path: Path):
+    def _upload(self, path: Path, mime: str | None = None, source: str = UPLOADED_FILE):
+        """Sube `path` a la API de archivos. `source`: UPLOADED_FILE (video) o DOCUMENT."""
         try:
-            return self._client.files.upload(file=path, config={"mime_type": mime_type(path)})
+            return self._client.files.upload(file=path, config={"mime_type": mime or mime_type(path)})
         except errors.APIError as e:
             if is_quota(e):
                 raise AIQuotaError("cuota de Gemini agotada") from None
+            if source == DOCUMENT:
+                self._raise_mapped(e, DOCUMENT)  # 400/403: ilegible; 5xx: se reintenta después
             raise AIVideoUnavailableError(f"no se pudo subir el video (código {e.code})") from None
         except (httpx.TransportError, OSError):
+            if source == DOCUMENT:
+                # No es culpa del archivo: el material queda pendiente y se reintenta.
+                raise AIUnavailableError("no se pudo subir el archivo a Gemini") from None
             raise AIVideoUnavailableError("no se pudo subir el video") from None
 
-    def _wait_active(self, uploaded):
+    def _wait_active(self, uploaded, source: str = UPLOADED_FILE):
         file, waited = uploaded, 0.0
         while _state(file) != "ACTIVE":
             if _state(file) == "FAILED" or waited >= FILE_ACTIVE_TIMEOUT_S:
+                if source == DOCUMENT:
+                    raise AIDocumentUnreadableError(DOCUMENT_UNREADABLE)
                 raise AIVideoUnavailableError("Gemini no pudo procesar el video subido")
             self._sleep(FILE_POLL_S)
             waited += FILE_POLL_S
@@ -419,7 +518,7 @@ class GeminiProvider:
             except errors.APIError as e:
                 if is_quota(e):
                     raise AIQuotaError("cuota de Gemini agotada") from None
-                self._raise_mapped(e, UPLOADED_FILE)
+                self._raise_mapped(e, source)
             except httpx.TransportError:
                 raise AIUnavailableError("no se pudo conectar con Gemini") from None
         return file
@@ -428,7 +527,111 @@ class GeminiProvider:
         try:
             self._client.files.delete(name=uploaded.name)
         except Exception as exc:  # noqa: BLE001 - Gemini lo borra solo a las 48 h
-            log.warning("No se pudo borrar el video subido a Gemini (%s)", type(exc).__name__)
+            log.warning("No se pudo borrar el archivo subido a Gemini (%s)", type(exc).__name__)
+
+    # --- Documentos (PDF y diapositivas) ----------------------------------------
+
+    def _document_part(self, data: bytes, mime: str) -> tuple[types.Part, object | None]:
+        """La parte del pedido con el documento y el archivo subido (None si va adentro).
+
+        Hasta INLINE_DOCUMENT_MAX_BYTES va dentro del pedido. Si pesa más, se sube como el
+        video: quien llama borra el archivo subido en un `finally` con `_delete_remote`.
+        """
+        if len(data) <= INLINE_DOCUMENT_MAX_BYTES:
+            return types.Part.from_bytes(data=data, mime_type=mime), None
+        path = _write_upload_copy(data, _UPLOAD_SUFFIXES.get(mime, ".bin"))
+        try:
+            uploaded = self._upload(path, mime, DOCUMENT)
+        finally:
+            _remove_local(path)  # ya está subido (o falló): la copia local no hace falta
+        try:
+            active = self._wait_active(uploaded, DOCUMENT)
+        except BaseException:
+            self._delete_remote(uploaded)
+            raise
+        part = types.Part(file_data=types.FileData(file_uri=active.uri, mime_type=active.mime_type))
+        return part, uploaded
+
+    def analyze_document(self, doc: DocumentInput) -> DocumentAnalysis:
+        """Resumen, temas y preguntas con la página citada. Rota la cadena de análisis y
+        cada pedido cuenta como "pdf". El PDF va como documento; las diapositivas, como texto."""
+        self.last_analysis_model = None
+        uploaded = None
+        try:
+            if doc.data is not None:
+                doc_part, uploaded = self._document_part(doc.data, PDF_MIME)
+                source = "el apunte en PDF"
+            elif doc.text is not None:
+                doc_part, source = types.Part(text=doc.text), "las diapositivas"
+            else:
+                raise AIFormatError("el documento no tiene contenido para mandar")
+            prompt = types.Part(text=DOCUMENT_PROMPT.format(
+                title=doc.title, source=source, pages_note=_pages_note(doc)))
+            contents = types.Content(parts=[doc_part, prompt])
+
+            def attempt(model: str) -> DocumentAnalysis:
+                response = self._generate(model, contents, _document_config(), video=DOCUMENT,
+                                           function="pdf")
+                try:
+                    analysis = DocumentAnalysis.model_validate_json(response.text or "")
+                except ValidationError:
+                    raise AIFormatError("la respuesta no es un análisis válido") from None
+                analysis = _validate_document(analysis, doc.pages)
+                self.last_analysis_model = model
+                return analysis
+
+            return self._rotate(self._analyze_models, attempt)
+        finally:
+            if uploaded is not None:
+                self._delete_remote(uploaded)
+
+    def extract_exam_style(self, exam: PastExamInput, course_topics: list[str]) -> ExtractedStyle:
+        """El formato de un parcial viejo, en un pedido (rota la cadena de análisis; cuenta
+        como "pdf"). El prompt prohíbe transcribir enunciados y solo vuelven números y temas."""
+        mime = PAST_EXAM_MIMES.get(exam.kind)
+        if mime is None:
+            raise AIFormatError("tipo de parcial desconocido")
+        uploaded = None
+        try:
+            doc_part, uploaded = self._document_part(exam.data, mime)
+            prompt = types.Part(text=STYLE_PROMPT.format(
+                course_topics=_course_topics_text(course_topics)))
+            contents = types.Content(parts=[doc_part, prompt])
+
+            def attempt(model: str) -> ExtractedStyle:
+                response = self._generate(model, contents, _style_config(), video=DOCUMENT,
+                                           function="pdf")
+                try:
+                    return ExtractedStyle.model_validate_json(response.text or "")
+                except ValidationError:
+                    raise AIFormatError("la respuesta no es un estilo válido") from None
+
+            return self._rotate(self._analyze_models, attempt)
+        finally:
+            if uploaded is not None:
+                self._delete_remote(uploaded)
+
+    def generate_style_questions(self, request: StyleRequest) -> list[StyleQuestion]:
+        """Una tanda con el estilo del examen, solo con texto (los resúmenes de la clase). Rota la
+        cadena de análisis, cuenta como "analysis" y anota el modelo en `last_analysis_model` para
+        que la pasada a ciegas no lo use. Las preguntas mal armadas se descartan; si no queda
+        ninguna, AIFormatError."""
+        self.last_analysis_model = None
+        prompt = style_questions_prompt(request)
+
+        def attempt(model: str) -> list[StyleQuestion]:
+            response = self._generate(model, prompt, _style_questions_config(), function="analysis")
+            try:
+                batch = StyleQuestions.model_validate_json(response.text or "")
+            except ValidationError:
+                raise AIFormatError("la respuesta no es una tanda válida") from None
+            questions = [q for q in batch.questions if _question_ok(q)]
+            if not questions:
+                raise AIFormatError("no hay preguntas válidas")
+            self.last_analysis_model = model
+            return questions
+
+        return self._rotate(self._analyze_models, attempt)
 
     def check_key(self) -> None:
         """Valida la clave listando modelos: no gasta pedidos de generación."""
@@ -470,11 +673,28 @@ class GeminiProvider:
         return self._rotate(chain, attempt)
 
 
+_UPLOAD_SUFFIXES = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png"}
+
+
+def _write_upload_copy(data: bytes, suffix: str) -> Path:
+    """Escribe la copia para subir. AIUnavailableError (y nada a medio escribir) si falla el disco."""
+    folder = config.data_dir()
+    path = folder / f"{UPLOAD_COPY_PREFIX}{token_hex(8)}{suffix}"
+    try:
+        with open(path, "xb") as fh:
+            fh.write(data)
+    except OSError:
+        _remove_local(path)  # quedó una copia a medio escribir
+        # Falla del disco, no del archivo: el material queda pendiente y se reintenta.
+        raise AIUnavailableError("no se pudo preparar el archivo para subirlo") from None
+    return path
+
+
 def _remove_local(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        log.warning("No se pudo borrar el video bajado (%s)", type(exc).__name__)
+        log.warning("No se pudo borrar la copia local (%s)", type(exc).__name__)
 
 
 def main(argv: list[str]) -> int:

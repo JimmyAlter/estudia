@@ -7,8 +7,23 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from estudia.moodle.client import MoodleClient, MoodleError, TokenInvalid
+from estudia.material.files import (
+    MAX_CAMPUS_FILE_BYTES,
+    NOT_READABLE_YET,
+    TOO_LARGE_TEXT,
+    safe_display_name,
+)
+from estudia.moodle.client import (
+    PLUGINFILE_PATH,
+    FileTooLarge,
+    ForeignFileUrl,
+    MoodleClient,
+    MoodleError,
+    TokenInvalid,
+    TooManyRedirects,
+)
 from estudia.moodle.pages import youtube_ids
 
 log = logging.getLogger(__name__)
@@ -124,6 +139,8 @@ def _write(conn: sqlite3.Connection, site_url: str, site_id: str, f: _Fetched, a
                     continue
                 if mod.get("modname") == "page" and mod["id"] in f.pages:
                     resultado.new_materials += _write_page(conn, sec["id"], mod, f.pages[mod["id"]], ahora)
+                elif mod.get("modname") in FILE_MODULES:
+                    resultado.new_materials += _write_files(conn, site_url, sec["id"], mod, ahora)
                 elif mod.get("modname") == "quiz" and mod["id"] in f.quizzes:
                     _sync_exam(conn, curso_id, mod, f.quizzes[mod["id"]])
 
@@ -326,6 +343,11 @@ def _fetch_page(conn, client, mod: dict) -> list[str] | None:
         html = client.fetch_file(archivos[0]["fileurl"])
     except TokenInvalid:
         raise
+    except (ForeignFileUrl, TooManyRedirects, FileTooLarge) as exc:
+        # La page en sí es rara (URL fuera del campus, bucle, demasiado grande): queda
+        # como sin video y la sincronización sigue. Sin la URL ni el mensaje.
+        log.warning("Page %s sin leer: %s", mod["id"], type(exc).__name__)
+        return []
     except MoodleError:
         if existente is None:
             raise
@@ -359,6 +381,172 @@ def _write_page(conn, section_id: int, mod: dict, ids: list[str], ahora: int) ->
         (section_id, mod["id"], kind, mod.get("name"), ref, status, ahora),
     )
     return 1
+
+
+# Archivos del campus: módulos `resource` (un archivo) y `folder` (varios).
+FILE_MODULES = ("resource", "folder")
+PDF_MIMETYPE = "application/pdf"
+PPTX_MIMETYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def _module_files(mod: dict) -> list[dict]:
+    """Los archivos que aporta el módulo: de un `resource`, el principal; de un `folder`, todos."""
+    files = [c for c in mod.get("contents", []) if isinstance(c, dict) and c.get("type") == "file"]
+    if mod.get("modname") != "resource" or not files:
+        return files
+    # El principal es el de `sortorder` más alto; ante empate, el primero que vino.
+    order = sorted(enumerate(files), key=lambda item: (-_int(item[1].get("sortorder")), item[0]))
+    return [order[0][1]]
+
+
+def _int(value) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _file_kind(content: dict) -> str:
+    """pdf | slides | file, según lo que dice el campus. Al bajarlo se confirma por los bytes."""
+    name = str(content.get("filename") or "").lower()
+    mimetype = content.get("mimetype")
+    if name.endswith(".pdf") or mimetype == PDF_MIMETYPE:
+        return "pdf"
+    if name.endswith(".pptx") or mimetype == PPTX_MIMETYPE:
+        return "slides"
+    return "file"
+
+
+def _is_token_key(key: str) -> bool:
+    """`token`, `wstoken`, `amp;token` (un `&amp;` sin decodificar), `mytoken`..."""
+    return key.strip().lower().endswith("token")
+
+
+def _without_token(url: str) -> str | None:
+    """La URL sin parámetros que terminen en `token` (de la query o `;clave=valor` del path)
+    ni fragmento. None si después de limpiarla todavía dice "token": no se guarda."""
+    parts = urlsplit(url)
+    segments = []
+    for segment in parts.path.split("/"):
+        head, *params = segment.split(";")
+        kept = [p for p in params if not _is_token_key(p.split("=", 1)[0])]
+        segments.append(";".join([head, *kept]))
+    path = "/".join(segments)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    query = [(k, v) for k, v in pairs if not _is_token_key(k)]
+    if path == parts.path and len(query) == len(pairs) and not parts.fragment:
+        clean = url
+    else:
+        clean = urlunsplit(parts._replace(path=path, query=urlencode(query), fragment=""))
+    return None if _mentions_token(clean) else clean
+
+
+def _mentions_token(url: str) -> bool:
+    """¿Dice "token" en la query o en los `;parámetros` del path? El nombre del archivo
+    (`tokens.pdf`) no cuenta."""
+    parts = urlsplit(url)
+    path_params = [p for segment in parts.path.split("/") for p in segment.split(";")[1:]]
+    return "token" in "\n".join([parts.query, *path_params]).lower()
+
+
+def _campus_file_url(site_url: str, url) -> str | None:
+    """La `fileurl` sin token si es un `pluginfile` de este campus; None si no (o si no se
+    pudo sacar el token con seguridad)."""
+    prefix = site_url.rstrip("/") + PLUGINFILE_PATH.rstrip("/")
+    found = _site_url_or_none(prefix, url)
+    return _without_token(found) if found is not None else None
+
+
+def _file_title(mod: dict, content: dict) -> str:
+    module_name = mod.get("name") or "Archivo"
+    if mod.get("modname") != "folder":
+        return module_name
+    name = safe_display_name(content.get("filename"), "Archivo")
+    stem, dot, _ = name.rpartition(".")
+    return f"{module_name}: {stem if dot and stem else name}"
+
+
+def _file_state(site_url: str, content: dict) -> tuple[str, str, str | None, str | None]:
+    """(kind, status, error, remote_url) de un archivo del campus, antes de bajarlo."""
+    kind = _file_kind(content)
+    remote_url = _campus_file_url(site_url, content.get("fileurl"))
+    error = None
+    if remote_url is None:
+        kind, status, error = "file", "unsupported", NOT_READABLE_YET
+    elif kind == "file":
+        status, error = "unsupported", NOT_READABLE_YET
+    elif _int(content.get("filesize")) > MAX_CAMPUS_FILE_BYTES:
+        status, error = "too_large", TOO_LARGE_TEXT
+    else:
+        status = "downloading"
+    return kind, status, error, remote_url
+
+
+def _replaced(existing, size: int, modified: int) -> bool:
+    """¿El campus cambió el archivo (mismo nombre, otra fecha o tamaño)? Lo que no está anotado
+    (una base de antes de guardar `timemodified`) no cuenta como cambio: solo se anota."""
+    if existing["status"] == "downloading":
+        return False   # todavía no se bajó: se baja la versión nueva
+    return bool((modified and existing["remote_modified"] is not None
+                 and modified != existing["remote_modified"])
+                or (size and existing["remote_size"] is not None and size != existing["remote_size"]))
+
+
+def _requeue_replaced(conn, site_url: str, material_id: int, content: dict, now: int) -> None:
+    """El campus reemplazó el archivo: se vuelve a bajar en la misma fila.
+
+    Las preguntas viejas (del documento y de sus tramos) quedan retiradas, nunca borradas, y
+    sin `dedupe_key`, así el documento nuevo puede volver a generar el mismo enunciado. Los
+    tramos viejos quedan `replaced`: fuera de la cola y de la lista.
+    """
+    old = [material_id] + [r[0] for r in conn.execute(
+        "SELECT id FROM material WHERE parent_id=? AND status != 'replaced'", (material_id,))]
+    marks = ",".join("?" * len(old))
+    conn.execute(f"UPDATE question SET retired=1, dedupe_key=NULL WHERE material_id IN ({marks})", old)
+    conn.execute(f"DELETE FROM material_topic WHERE material_id IN ({marks})", old)
+    conn.execute(
+        "UPDATE material SET status='replaced', analysis_json=NULL, analysis_model=NULL,"
+        f" updated_at=? WHERE id IN ({marks}) AND id != ?", (now, *old, material_id))
+    kind, status, error, remote_url = _file_state(site_url, content)
+    conn.execute(
+        "UPDATE material SET kind=?, status=?, error=?, fail_kind=NULL, summary_md=NULL,"
+        " analysis_json=NULL, analysis_model=NULL, segments_json=NULL, pages=NULL, has_text=NULL,"
+        " file_sha256=NULL, download_attempts=NULL, remote_url=?, updated_at=? WHERE id=?",
+        (kind, status, error, remote_url, now, material_id),
+    )
+
+
+def _write_files(conn, site_url: str, section_id: int, mod: dict, now: int) -> int:
+    """Crea los materiales de los archivos de un `resource` o `folder`. Devuelve cuántos son nuevos.
+
+    No baja nada: deja `downloading` lo que hay que bajar (`material.fetch`). Un archivo ya
+    conocido (mismo `file_key`) solo cambia de título, salvo que el campus lo haya reemplazado
+    (otro `timemodified` o `filesize`): entonces se vuelve a bajar (`_requeue_replaced`).
+    """
+    nuevos = 0
+    for content in _module_files(mod):
+        file_key = f"{mod['id']}:{content.get('filepath') or '/'}{content.get('filename') or ''}"
+        title = _file_title(mod, content)
+        size = _int(content.get("filesize"))
+        modified = _int(content.get("timemodified"))
+        existente = conn.execute(
+            "SELECT id, status, remote_size, remote_modified FROM material WHERE file_key=?",
+            (file_key,)).fetchone()
+        if existente is not None:
+            if _replaced(existente, size, modified):
+                _requeue_replaced(conn, site_url, existente["id"], content, now)
+            conn.execute(
+                "UPDATE material SET title=?, remote_size=COALESCE(?, remote_size),"
+                " remote_modified=COALESCE(?, remote_modified) WHERE id=?",
+                (title, size or None, modified or None, existente["id"]))
+            continue
+        kind, status, error, remote_url = _file_state(site_url, content)
+        conn.execute(
+            "INSERT INTO material(section_id, kind, title, status, error, updated_at, file_key,"
+            " module_id, module_kind, remote_url, remote_size, remote_modified)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (section_id, kind, title, status, error, now, file_key, mod["id"], mod.get("modname"),
+             remote_url, size or None, modified or None),
+        )
+        nuevos += 1
+    return nuevos
 
 
 def _sync_exam(conn, curso_id: int, mod: dict, quiz: dict) -> None:

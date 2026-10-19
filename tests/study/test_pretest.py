@@ -267,3 +267,20 @@ def test_pretest_needs_a_done_class_in_a_visible_section(conn, change):
     conn.commit()
     with pytest.raises(LookupError):
         build_pretest(conn, 1)
+
+
+def test_pretest_of_a_document_spreads_by_page(conn):
+    add_class(conn, 1, seconds=[1, 2, 3, 4, 5])
+    conn.execute("UPDATE material SET kind='pdf', ref='documentos/1.pdf' WHERE id=1")
+    # Las preguntas de un documento no tienen segundo: van por página.
+    for qid, page in ((100, 30), (101, None), (102, 5), (103, 12), (104, 40)):
+        conn.execute("UPDATE question SET source_seconds=NULL, source_page=? WHERE id=?", (page, qid))
+    conn.commit()
+    # Por página (sin página, primero): 101, 102, 103, 100, 104.
+    assert [i.question_id for i in build_pretest(conn, 1)] == [101, 103, 104]
+    assert pretest_offer(conn, NOW).kind == "pdf"
+
+
+def test_pretest_offer_kind_of_video(conn):
+    add_class(conn, 1)
+    assert pretest_offer(conn, NOW).kind == "youtube"

@@ -1,8 +1,14 @@
 import os
+import sys
 import webbrowser
+from pathlib import Path
 
 import keyring
 import pytest
+
+# Varios tests reusan el armado de tests/server/test_app.py (`from test_app import ...`).
+# Con la carpeta en el path, un archivo de tests/study/ también se puede correr solo.
+sys.path.insert(0, str(Path(__file__).parent / "server"))
 
 # Ningún test abre un navegador de verdad. Se reemplaza al importar el conftest, no en un
 # fixture: un hilo que sobrevive a su test (el servidor de `main`, la bandeja) puede llamar a

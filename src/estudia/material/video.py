@@ -88,6 +88,27 @@ class _QuietLogger:
         log.debug("yt-dlp (error): %s", msg)
 
 
+def ydl_options(outtmpl: str) -> dict:
+    """Las opciones de yt-dlp para bajar una clase (las usa también `--check-video-tools`)."""
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+    options = {
+        "format": FORMAT_WITH_FFMPEG if has_ffmpeg else FORMAT_WITHOUT_FFMPEG,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "logger": _QuietLogger(),
+        "js_runtimes": js_runtimes(),
+        "socket_timeout": SOCKET_TIMEOUT_S,
+        "max_filesize": MAX_FILESIZE,
+        "retries": DOWNLOAD_RETRIES,
+    }
+    if has_ffmpeg:
+        options["merge_output_format"] = "mp4"
+    return options
+
+
 def download_video(youtube_id: str, dest_dir: Path) -> Path:
     """Baja el video a `dest_dir/<id>.<ext>` (mp4 casi siempre) y devuelve la ruta.
 
@@ -103,22 +124,7 @@ def download_video(youtube_id: str, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix=f".{youtube_id}-", dir=dest_dir))
     try:
-        has_ffmpeg = shutil.which("ffmpeg") is not None
-        options = {
-            "format": FORMAT_WITH_FFMPEG if has_ffmpeg else FORMAT_WITHOUT_FFMPEG,
-            "outtmpl": str(work / f"{youtube_id}.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "logger": _QuietLogger(),
-            "js_runtimes": js_runtimes(),
-            "socket_timeout": SOCKET_TIMEOUT_S,
-            "max_filesize": MAX_FILESIZE,
-            "retries": DOWNLOAD_RETRIES,
-        }
-        if has_ffmpeg:
-            options["merge_output_format"] = "mp4"
+        options = ydl_options(str(work / f"{youtube_id}.%(ext)s"))
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={youtube_id}"])

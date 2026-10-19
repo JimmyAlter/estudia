@@ -254,6 +254,8 @@ export default function Home({
 /** "3 preguntas para arrancar": una oferta tranquila, que se puede dejar pasar. */
 function PretestCard({ offer, onStart, onDismiss }: { offer: PretestOffer; onStart: () => void; onDismiss: () => void }) {
   const [busy, setBusy] = useState(false);
+  // Un PDF o unas diapositivas son un apunte; un video, una clase.
+  const source = offer.kind === "pdf" || offer.kind === "slides" ? "el apunte" : "la clase";
 
   async function dismiss() {
     setBusy(true);
@@ -268,7 +270,9 @@ function PretestCard({ offer, onStart, onDismiss }: { offer: PretestOffer; onSta
   return (
     <section className="mb-10 border-b border-line pb-8">
       <h2 className="mb-1 font-semibold">3 preguntas para arrancar</h2>
-      <p className="mb-4 text-muted">De {tidy(offer.title)}. No cuentan: es para que la clase te rinda más.</p>
+      <p className="mb-4 text-muted">
+        De {tidy(offer.title)}. No cuentan: es para que {source} te rinda más.
+      </p>
       <div className="flex flex-wrap items-baseline gap-x-5 gap-y-3">
         <Button variant="secondary" onClick={onStart} disabled={busy}>
           Empezar

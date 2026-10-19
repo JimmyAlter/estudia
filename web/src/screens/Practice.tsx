@@ -10,7 +10,7 @@ import {
   type SessionInfo,
 } from "../api";
 import { formatTimestamp, keepMath, plural, tidy } from "../format";
-import { Button, FIELD, Label, Notice, TypedField } from "../ui";
+import { Button, DocumentSource, FIELD, Label, Notice, TypedField } from "../ui";
 
 const UNDO_MS = 5000;
 /** Enter no saltea la corrección antes de este tiempo: primero hay que leerla. */
@@ -543,6 +543,9 @@ export default function Practice({ params, session, onExit }: Props) {
             typed={answeredText !== null}
             correctText={current.options[feedback.correct_index]}
             source={
+              feedback.source_label ? (
+                <DocumentSource className="mt-4" label={feedback.source_label} url={feedback.source_url} />
+              ) : (
               feedback.youtube_id && (
                 <p className="mt-4 text-sm">
                   <a
@@ -554,6 +557,7 @@ export default function Practice({ params, session, onExit }: Props) {
                     {sourceText(classTitles.get(feedback.youtube_id), feedback.source_seconds)}
                   </a>
                 </p>
+              )
               )
             }
           />

@@ -15,7 +15,8 @@ export function mockApi(routes: Record<string, Route | unknown>) {
       return new Response(JSON.stringify({ detail: "no encontrada" }), { status: 404 });
     }
     const route = routes[key];
-    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    // Un FormData (subida de un archivo) llega tal cual; lo demás es JSON.
+    const body = init?.body instanceof FormData ? init.body : init?.body ? JSON.parse(String(init.body)) : undefined;
     const data = typeof route === "function" ? (route as Route)(body) : route;
     if (data instanceof Response) return data;
     return new Response(JSON.stringify(data), {

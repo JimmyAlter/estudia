@@ -43,7 +43,7 @@ def env(tmp_path):
 def test_pretest_flow(env):
     c, conn = env["client"], env["conn"]
     offer = c.get("/api/home").json()["pretest"]
-    assert offer == {"material_id": 1, "title": "Rectas", "course": "Álgebra"}
+    assert offer == {"material_id": 1, "title": "Rectas", "course": "Álgebra", "kind": "youtube"}
 
     items = c.post("/api/pretest/1/start").json()
     assert [i["question_id"] for i in items] == [1, 3, 4]

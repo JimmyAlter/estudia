@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 
 from estudia.generation.notation import sentence_case, student_math
 from estudia.generation.pipeline import dedupe_key, student_question
+from estudia.generation.style_questions import style_dedupe_key
+from estudia.study.exam_style import style_revision
 
 log = logging.getLogger(__name__)
 
@@ -26,8 +28,8 @@ class NormalizeResult:
 def normalize_existing(conn: sqlite3.Connection) -> NormalizeResult:
     result = NormalizeResult()
     rows = conn.execute(
-        "SELECT id, material_id, stem, options_json, explanation, common_error, dedupe_key"
-        " FROM question ORDER BY id"
+        "SELECT id, material_id, style_exam_id, retired, stem, options_json, explanation,"
+        " common_error, dedupe_key FROM question ORDER BY id"
     ).fetchall()
     for row in rows:
         text = student_question(row["stem"] or "", json.loads(row["options_json"]),
@@ -38,7 +40,17 @@ def normalize_existing(conn: sqlite3.Connection) -> NormalizeResult:
             result.skipped.append(row["id"])
             continue
         options_json = json.dumps(text.options, ensure_ascii=False)
-        key = dedupe_key(row["material_id"], text.stem)
+        if row["retired"]:
+            # Una retirada conserva su clave: la de estilo, porque su revisión ya pasó y no se
+            # puede saber cuál era; la de un archivo que el campus reemplazó queda en NULL. Así
+            # no choca con la que se generó después.
+            key = row["dedupe_key"]
+        elif row["style_exam_id"] is None:
+            key = dedupe_key(row["material_id"], text.stem)
+        else:
+            # Una de estilo no tiene material: su clave es la del examen y la revisión vigente.
+            key = style_dedupe_key(row["style_exam_id"], text.stem,
+                                   revision=style_revision(conn, row["style_exam_id"]))
         new = (text.stem, options_json, text.explanation, text.common_error, key)
         old = (row["stem"], row["options_json"], row["explanation"], row["common_error"],
                row["dedupe_key"])

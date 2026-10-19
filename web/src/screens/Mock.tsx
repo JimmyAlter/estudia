@@ -1,11 +1,32 @@
-import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
-import { ApiError, api, type ExamInfo, type MockAnswer, type MockResult, type MockStart, type QuizParams } from "../api";
+import { ChevronRight } from "lucide-react";
+import { Fragment, useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import {
+  ApiError,
+  api,
+  type ExamInfo,
+  type ExamStyleView,
+  type MockAnswer,
+  type MockResult,
+  type MockStart,
+  type QuizParams,
+} from "../api";
 import { formatDuration, formatTimestamp, grade, keepMath, tidy } from "../format";
-import { Button, FIELD, Label, Notice, TypedField } from "../ui";
+import { Button, DocumentSource, FIELD, Label, Notice, TypedField } from "../ui";
+import ExamStyle from "./ExamStyle";
+import PastExams from "./PastExams";
 import { OptionButton } from "./Practice";
 
 /** Si el examen no dice cuánto dura, el servidor da 90 segundos por pregunta. */
 const PER_QUESTION_TEXT = "90 segundos por pregunta";
+const NO_MATERIAL_TEXT = "Faltan clases preparadas de estos temas para armar las preguntas que faltan.";
+
+/** Los puntos se dicen solo si no valen todas lo mismo: si no, no agregan nada. */
+const pointsDiffer = (items: { points?: number | null }[]) =>
+  new Set(items.map((i) => i.points).filter((p) => p != null)).size > 1;
+
+/** 1 → "1 punto"; 2.5 → "2,5 puntos". */
+const pointsText = (p: number) =>
+  p === 1 ? "1 punto" : `${new Intl.NumberFormat("es-AR", { maximumFractionDigits: 2 }).format(p)} puntos`;
 
 interface Props {
   onPractice: (params: QuizParams) => void;
@@ -108,6 +129,28 @@ function Setup({
   // "Todavía no hay suficientes preguntas…": no es un error, se dice tranquilo.
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** El formato de la cátedra de este examen; null mientras carga o si no se pudo leer. */
+  const [styleView, setStyleView] = useState<ExamStyleView | null>(null);
+  const [styleReload, setStyleReload] = useState(0);
+  /** "Todavía faltan…" al intentar empezar con el formato: se ofrece el de siempre. */
+  const [styleNotice, setStyleNotice] = useState<string | null>(null);
+  const examId = exam?.id ?? null;
+
+  useEffect(() => {
+    setStyleNotice(null);
+    if (examId == null || short) {
+      setStyleView(null);
+      return;
+    }
+    let alive = true;
+    api
+      .examStyle(examId)
+      .then((v) => alive && setStyleView(v))
+      .catch(() => alive && setStyleView(null));
+    return () => {
+      alive = false;
+    };
+  }, [examId, short, styleReload]);
 
   if (!exam) {
     return (
@@ -121,14 +164,28 @@ function Setup({
     );
   }
 
-  const scale = exam.max_grade ?? 10;
+  // El formato guardado manda en la cantidad, el tiempo y la escala (no en el corto).
+  const style = short ? null : (styleView?.saved ?? null);
+  const styleQuestions = style ? style.groups.reduce((n, g) => n + g.count, 0) : 0;
+  // Antes de empezar ya se sabe si faltan preguntas con el formato.
+  const missingNotice =
+    style && styleView && styleView.missing > 0
+      ? styleView.can_generate
+        ? styleView.missing_text
+        : NO_MATERIAL_TEXT
+      : null;
+  const styleWait = style ? (styleNotice ?? missingNotice) : null;
+  // Si faltan preguntas con el formato, lo que se puede hacer es el de siempre: la línea de arriba,
+  // la escala y el botón son los de ese.
+  const runStyle = styleWait ? null : style;
+  const runScale = runStyle?.max_grade ?? exam.max_grade ?? 10;
 
-  async function start() {
+  async function start(withStyle: boolean) {
     let predicted: number | null = null;
     if (prediction.trim()) {
       predicted = Number(prediction.replace(",", ".").trim());
-      if (!Number.isFinite(predicted) || predicted < 0 || predicted > scale) {
-        setError(`La nota va de 0 a ${grade(scale)}. Si no sabés, dejalo vacío.`);
+      if (!Number.isFinite(predicted) || predicted < 0 || predicted > runScale) {
+        setError(`La nota va de 0 a ${grade(runScale)}. Si no sabés, dejalo vacío.`);
         return;
       }
     }
@@ -136,10 +193,12 @@ function Setup({
     setError(null);
     setNotice(null);
     try {
-      onStarted(await api.startMock(exam!.id, predicted, short));
+      onStarted(await api.startMock(exam!.id, predicted, short, withStyle));
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409) setNotice(err.detail);
-      else setError("No se pudo armar el simulacro. Probá de nuevo.");
+      if (err instanceof ApiError && err.status === 409) {
+        if (withStyle) setStyleNotice(err.detail);
+        else setNotice(err.detail);
+      } else setError("No se pudo armar el simulacro. Probá de nuevo.");
       setBusy(false);
     }
   }
@@ -147,7 +206,7 @@ function Setup({
   // Con el selector a la vista, la materia ya está en cada opción. El corto no elige examen.
   const choosing = exams.length > 1 && !short;
   // El corto usa el reloj de 90 segundos por pregunta, no el límite del examen.
-  const perQuestion = short || !exam.time_limit_s;
+  const perQuestion = short || !(runStyle?.minutes || exam.time_limit_s);
   return (
     <div className="max-w-xl">
       <Label className="mb-2">{short ? "Simulacro corto" : "Simulacro"}</Label>
@@ -183,8 +242,10 @@ function Setup({
               ? "6 preguntas de los temas que todavía no tenés firmes"
               : "6 preguntas"
             : null,
-          // Un límite del examen es un dato más de la línea.
-          perQuestion ? null : formatDuration(exam.time_limit_s!),
+          runStyle ? `${styleQuestions} ${styleQuestions === 1 ? "pregunta" : "preguntas"}` : null,
+          // Un límite (del formato o del examen) es un dato más de la línea.
+          perQuestion ? null : formatDuration(runStyle?.minutes ? runStyle.minutes * 60 : exam.time_limit_s!),
+          runStyle ? `sobre ${grade(runScale)}` : null,
         ]
           .filter(Boolean)
           .map((part, i) => (
@@ -203,14 +264,14 @@ function Setup({
         className="mt-10"
         onSubmit={(e) => {
           e.preventDefault();
-          start();
+          start(Boolean(runStyle));
         }}
       >
         <label htmlFor={`${id}-pred`} className="mb-1.5 block font-medium">
           ¿Cuánto creés que te sacás?
         </label>
         <p id={`${id}-pred-help`} className="mb-2 text-sm text-muted">
-          De 0 a {grade(scale)}. Si no sabés, dejalo vacío.
+          De 0 a {grade(runScale)}. Si no sabés, dejalo vacío.
         </p>
         <input
           id={`${id}-pred`}
@@ -236,16 +297,68 @@ function Setup({
             {notice}
           </p>
         )}
-        <div className="mt-8 flex flex-wrap gap-3">
+        {styleWait && (
+          <p role="status" className="mt-6 text-sm text-muted">
+            {styleWait}
+          </p>
+        )}
+        <div className="mt-8 flex flex-wrap items-baseline gap-x-5 gap-y-3">
+          {/* Una sola salida principal: con el formato, o el de siempre si al formato le faltan preguntas. */}
           <Button type="submit" disabled={busy}>
-            Empezar
+            {styleWait ? "Hacer el simulacro de siempre" : "Empezar"}
           </Button>
           <Button variant="quiet" onClick={onExit}>
             Volver
           </Button>
         </div>
       </form>
+
+      {/* Parciales viejos y formato: solo en el simulacro común, debajo de lo de empezar. */}
+      {!short && styleView && (
+        <StyleSection key={exam.id} folded={Boolean(styleView.saved)} withPastExams={styleView.ai}>
+          {/* Sin IA nadie lee los parciales: el formato se carga a mano. */}
+          {styleView.ai && <PastExams examId={exam.id} ai onChange={() => setStyleReload((n) => n + 1)} />}
+          <ExamStyle
+            // Lo guardado o propuesto cambió: el editor arranca de nuevo con eso.
+            key={JSON.stringify([styleView.saved, styleView.proposed])}
+            examId={exam.id}
+            view={styleView}
+            onChange={() => {
+              setStyleNotice(null);
+              setStyleReload((n) => n + 1);
+            }}
+          />
+        </StyleSection>
+      )}
     </div>
+  );
+}
+
+/**
+ * Los parciales viejos y el editor del formato. Con un formato ya guardado va plegado: la pantalla
+ * es para empezar el simulacro, no para cargar parciales. Se pliega solo al entrar a un examen.
+ */
+function StyleSection({ folded, withPastExams, children }: { folded: boolean; withPastExams: boolean; children: ReactNode }) {
+  const [open, setOpen] = useState(!folded);
+  const body = <div className="space-y-14">{children}</div>;
+  if (!folded) return <div className="mt-16 border-t border-line pt-10">{body}</div>;
+  return (
+    <details
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+      className="group mt-12 border-t border-line pt-5"
+    >
+      <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 text-sm text-muted hover:text-ink [&::-webkit-details-marker]:hidden">
+        <ChevronRight
+          size={16}
+          aria-hidden
+          className="transition-transform duration-150 ease-out group-open:rotate-90 motion-reduce:transition-none"
+        />
+        {withPastExams ? "Cambiar el formato o cargar parciales" : "Cambiar el formato"}
+      </summary>
+      {/* Montado aunque esté plegado: lo que se escribió en el editor no se pierde al plegarlo. */}
+      <div className="reveal pt-8">{body}</div>
+    </details>
   );
 }
 
@@ -277,6 +390,7 @@ function Running({
 
   const items = attempt.items;
   const item = items[index];
+  const points = pointsDiffer(items) ? item.points : null;
 
   const finish = useCallback(async () => {
     if (sentRef.current) return;
@@ -367,7 +481,10 @@ function Running({
         </span>
       </div>
 
-      <h1 className="math mb-7 text-[1.45rem] leading-snug tracking-[-0.01em]">{keepMath(item.stem)}</h1>
+      <h1 className={`math text-[1.45rem] leading-snug tracking-[-0.01em] ${points != null ? "mb-2" : "mb-7"}`}>
+        {keepMath(item.stem)}
+      </h1>
+      {points != null && <p className="mb-7 text-sm text-muted tabular-nums">{pointsText(points)}</p>}
 
       {item.format === "typed" ? (
         <div className="max-w-xl">
@@ -479,6 +596,7 @@ function Result({
   // La revisión se arma por pregunta: si alguna se retiró durante el intento, no está y se ven las demás.
   const byId = new Map(result.review.map((fb) => [fb.question_id, fb]));
   const reviewed = attempt.items.filter((item) => byId.has(item.question_id));
+  const showPoints = pointsDiffer(attempt.items);
 
   async function practiceFailed() {
     setBusy(true);
@@ -547,6 +665,7 @@ function Result({
                       <span className="font-semibold">Error común:</span> {keepMath(fb.common_error)}
                     </p>
                   )}
+                  {fb.source_label && <DocumentSource className="mt-3" label={fb.source_label} url={fb.source_url} />}
                 </>
               );
               return (
@@ -554,6 +673,7 @@ function Result({
                   <div className="mb-2 flex items-baseline justify-between gap-4">
                     <span className="text-sm text-muted tabular-nums">
                       {i + 1} · {item.topic}
+                      {showPoints && item.points != null && ` · ${pointsText(item.points)}`}
                     </span>
                     <span className={`text-sm font-medium ${fb.correct ? "text-ok" : "text-bad"}`}>
                       {fb.correct ? "Bien" : "Mal"}

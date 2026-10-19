@@ -66,6 +66,8 @@ export interface PretestOffer {
   material_id: number;
   title: string;
   course: string;
+  /** youtube | pdf | slides: de un documento se invita a leer el apunte. */
+  kind?: string;
 }
 
 /** "Contá lo que te acordás": cada título del resumen y si apareció en lo escrito. */
@@ -99,7 +101,16 @@ export interface ProgressData {
   gap: number | null;
 }
 
-export type MaterialStatus = "pending" | "done" | "failed" | "unsupported" | "needs_public_link";
+export type MaterialStatus =
+  | "pending"
+  | "done"
+  | "failed"
+  | "unsupported"
+  | "needs_public_link"
+  /** Archivo del campus que todavía se está bajando. */
+  | "downloading"
+  | "too_large"
+  | "unreadable";
 
 export interface Material {
   id: number;
@@ -114,6 +125,12 @@ export interface Material {
   /** Temas de la clase y cuántas preguntas se pueden practicar de ellos. */
   topic_ids: number[];
   questions: number;
+  /** Tramo de un PDF largo: sus páginas en el archivo entero y el nombre de ese archivo ("Apunte 3"). */
+  part?: { from: number; to: number; doc?: string | null } | null;
+  /** Páginas del documento (o del tramo); null si no es un documento o no se bajó. */
+  pages?: number | null;
+  /** Si falló, por qué: "download" es un archivo del campus que no se pudo bajar. */
+  fail_kind?: string | null;
 }
 
 export interface Section {
@@ -139,6 +156,8 @@ export interface QuizItem {
   phase: QuizPhase;
   /** En reaprendizaje: qué día sería acertarla ahora (de 3). */
   relearning: { day: 1 | 2 | 3 } | null;
+  /** En el simulacro con el formato de la cátedra: lo que vale. */
+  points?: number | null;
 }
 
 /**
@@ -172,6 +191,12 @@ export interface Feedback {
   answer_id?: number | null;
   /** Pedir "Explicá por qué" antes de mostrar la explicación. */
   explain_prompt?: boolean;
+  /** Documento: la página (o diapositiva) del archivo entero. */
+  source_page?: number | null;
+  /** Documento: la cita, "Apunte 3, pág. 14". */
+  source_label?: string | null;
+  /** Documento: la página del módulo en el campus (nunca el archivo). */
+  source_url?: string | null;
 }
 
 export interface QuizParams {
@@ -388,6 +413,59 @@ export interface MockResult {
   predicted_grade: number | null;
 }
 
+/** Un parcial viejo cargado por el estudiante. Nunca trae la ruta: solo el nombre para mostrar. */
+export interface PastExam {
+  id: number;
+  name: string;
+  kind: string;
+  status: "pending" | "done" | "failed";
+  error: string | null;
+  created_at: number;
+}
+
+export type ExerciseKind = "opcion_multiple" | "verdadero_falso" | "desarrollo";
+
+export interface StyleGroup {
+  kind: ExerciseKind;
+  count: number;
+  points_each: number;
+}
+
+/** El formato de la cátedra: ejercicios por tipo, tiempo, escala, temas y hoja de fórmulas. */
+export interface ExamStyleData {
+  groups: StyleGroup[];
+  minutes: number | null;
+  max_grade: number | null;
+  topic_ids: number[];
+  topics_unmatched: string[];
+  formula_sheet: boolean;
+}
+
+/** Un parcial que entró en el promedio. */
+export interface StyleSource {
+  past_exam_id: number;
+  name: string;
+  questions: number;
+  minutes: number | null;
+  max_grade: number | null;
+  formula_sheet: boolean;
+}
+
+export interface ExamStyleView {
+  saved: ExamStyleData | null;
+  proposed: ExamStyleData | null;
+  sources: StyleSource[];
+  topics: { id: number; name: string }[];
+  /** Preguntas que le faltan al simulacro con el formato guardado. */
+  missing: number;
+  /** Con `missing` > 0, el aviso del servidor: el mismo texto del 409 al empezar con el formato. */
+  missing_text: string | null;
+  /** Si hay clases preparadas de sus temas para armar las que faltan. */
+  can_generate: boolean;
+  /** Si se puede usar la IA (adulto y con clave): sin ella el formato se carga a mano. */
+  ai: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -406,9 +484,15 @@ async function request<T>(path: string, init?: { method?: string; body?: unknown
   const response = await fetch(path, options);
   const data = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new ApiError(response.status, (data && data.detail) || response.statusText);
+    throw new ApiError(response.status, detailOf(data, response));
   }
   return data as T;
+}
+
+/** El `detail` del servidor si es un texto; si no (una validación 422 trae una lista), el estado. */
+function detailOf(data: unknown, response: Response): string {
+  const detail = data && typeof data === "object" ? (data as { detail?: unknown }).detail : null;
+  return typeof detail === "string" && detail ? detail : response.statusText;
 }
 
 const post = <T>(path: string, body?: unknown) => request<T>(path, { method: "POST", body });
@@ -482,13 +566,31 @@ export const api = {
   savePlanSettings: (body: PlanSettings) => put<{ ok: true }>("/api/plan/settings", body),
   settings: () => request<{ reminders: boolean; age: Age | null; allow_download?: boolean }>("/api/settings"),
   saveSettings: (body: { reminders?: boolean; age?: Age; allow_download?: boolean }) => put<{ ok: true }>("/api/settings", body),
-  /** Con `short`, el simulacro corto: 6 preguntas (en un recuperatorio, de los temas flojos). */
-  startMock: (examId: number, predictedGrade: number | null, short?: boolean) =>
+  /**
+   * Con `short`, el simulacro corto: 6 preguntas (en un recuperatorio, de los temas flojos).
+   * Con `style`, el del formato de la cátedra (409 si todavía faltan preguntas).
+   */
+  startMock: (examId: number, predictedGrade: number | null, short?: boolean, style?: boolean) =>
     post<MockStart>("/api/mock/start", {
       exam_id: examId,
       predicted_grade: predictedGrade,
       ...(short ? { short: true } : {}),
+      ...(style ? { style: true } : {}),
     }),
+  pastExams: (examId: number) => request<PastExam[]>(`/api/exams/${examId}/past-exams`),
+  /** Multipart con el campo `file`; el navegador pone el Content-Type con su límite. */
+  uploadPastExam: async (examId: number, file: File): Promise<Pick<PastExam, "id" | "name" | "status">> => {
+    const form = new FormData();
+    form.append("file", file);
+    const response = await fetch(`/api/exams/${examId}/past-exams`, { method: "POST", body: form });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new ApiError(response.status, detailOf(data, response));
+    return data;
+  },
+  deletePastExam: (examId: number, id: number) => del<{ ok: true }>(`/api/exams/${examId}/past-exams/${id}`),
+  examStyle: (examId: number) => request<ExamStyleView>(`/api/exams/${examId}/style`),
+  saveExamStyle: (examId: number, style: ExamStyleData) => put<{ ok: true }>(`/api/exams/${examId}/style`, style),
+  clearExamStyle: (examId: number) => del<{ ok: true }>(`/api/exams/${examId}/style`),
   finishMock: (attemptId: number, answers: Record<number, MockAnswer>) =>
     post<MockResult>(`/api/mock/${attemptId}/finish`, { answers }),
   /** El resultado de un simulacro ya entregado. */

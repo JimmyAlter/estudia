@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from estudia.study.exams import _skipped
+from estudia.study.mastery import REGULAR
 
 MIN_CALIBRATION = 20
 LABELS = ((2, "Seguro"), (1, "Me parece"), (0, "Adiviné"))
@@ -47,7 +48,9 @@ def calibration(conn: sqlite3.Connection) -> Calibration:
     rows = conn.execute(
         "SELECT confidence, COUNT(*) AS n, SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS ok"
         " FROM answer WHERE confidence IS NOT NULL AND confidence IN (0, 1, 2)"
-        " AND (mode IS NULL OR mode NOT IN ('pretest', 'probe')) GROUP BY confidence"
+        " AND (mode IS NULL OR mode NOT IN ('pretest', 'probe'))"
+        # Las respuestas a preguntas de estilo no cuentan (solo viven en su simulacro).
+        f" AND question_id NOT IN (SELECT q.id FROM question q WHERE NOT ({REGULAR})) GROUP BY confidence"
     ).fetchall()
     stats = {r["confidence"]: (r["n"], r["ok"] or 0) for r in rows}
     total = sum(n for n, _ in stats.values())
@@ -75,9 +78,19 @@ def predictions(conn: sqlite3.Connection) -> list[PredictionRow]:
     for r in rows:
         if r["exam_id"] in skipped:
             continue
-        scale = r["real_max"] or r["exam_max"] or r["mock_max"] or 10.0
-        out.append(PredictionRow(r["exam_id"], r["name"] or "", r["predicted_grade"],
-                                 float(r["mock_grade"]), float(r["real"]), float(scale)))
+        scale = float(r["real_max"] or r["exam_max"] or r["mock_max"] or 10.0)
+        # La prevista y la del simulacro están en la escala del simulacro, que con el formato de
+        # la cátedra puede ser otra (sobre 100 y la real sobre 10): se llevan a la de la real.
+        mock_max = float(r["mock_max"] or scale)
+        factor = scale / mock_max if mock_max > 0 else 1.0
+        predicted = r["predicted_grade"]
+        if predicted is not None and factor != 1.0:
+            predicted = round(predicted * factor, 2)
+        mock_grade = float(r["mock_grade"])
+        if factor != 1.0:
+            mock_grade = round(mock_grade * factor, 2)
+        out.append(PredictionRow(r["exam_id"], r["name"] or "", predicted,
+                                 mock_grade, float(r["real"]), scale))
     return out
 
 

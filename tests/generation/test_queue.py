@@ -221,7 +221,7 @@ def test_usage_recorded_per_pacific_day(conn):
     assert kv(conn, "ai_used:blind:2026-10-17") == "1"
     assert kv(conn, "ai_used:analysis:2026-10-18") is None
     assert kv(conn, f"ai_used:analysis:{old_day}") is None
-    assert fake.requests == {"analysis": 0, "blind": 0}
+    assert fake.requests == {"analysis": 0, "blind": 0, "pdf": 0}
 
 
 def test_queue_ignores_enrollment(conn):
@@ -289,5 +289,5 @@ def test_usage_is_recorded_when_the_run_exits_through_an_unexpected_error(conn, 
     fake = FakeProvider({"v1": analysis("a")}, lambda s, o: 1)
     with pytest.raises(RuntimeError):
         process_pending(conn, fake, clock=clock)
-    assert fake.requests == {"analysis": 0, "blind": 0}   # ya se pasó a kv
+    assert fake.requests == {"analysis": 0, "blind": 0, "pdf": 0}   # ya se pasó a kv
     assert used_today(conn, "analysis", NOW) == 1

@@ -88,3 +88,17 @@ def test_rewritten_options_forget_the_typed_check(conn):
     normalize_existing(conn)
     flags = dict(conn.execute("SELECT id, typed_safe FROM question").fetchall())
     assert flags == {1: None, 2: 1}
+
+
+def test_retired_question_keeps_its_key(conn, caplog):
+    """Una retirada (p. ej. de un archivo que el campus reemplazó, con la clave en NULL) conserva
+    su clave: no le gana el lugar a la nueva del mismo enunciado ni ensucia el log."""
+    add_question(conn, 1, "¿Cuánto vale x**2?", ["1", "2", "3", "4"])
+    conn.execute("UPDATE question SET retired=1, dedupe_key=NULL WHERE id=1")
+    add_question(conn, 2, "¿Cuánto vale x²?", ["1", "2", "3", "4"])
+    with caplog.at_level(logging.WARNING):
+        result = normalize_existing(conn)
+    rows = {r["id"]: r for r in conn.execute("SELECT * FROM question")}
+    assert rows[1]["dedupe_key"] is None and rows[1]["stem"] == "¿Cuánto vale x²?"
+    assert rows[2]["dedupe_key"] == dedupe_key(1, "¿Cuánto vale x²?")
+    assert result.skipped == [] and "repetido" not in caplog.text
