@@ -407,6 +407,6 @@ def test_materials_count_group_once(env):
 
 
 def test_no_raw_card_key_joins():
-    offenders = [str(p.relative_to(SRC)) for p in SRC.rglob("*.py")
+    offenders = [p.relative_to(SRC).as_posix() for p in SRC.rglob("*.py")
                  if re.search(r"'q:'\s*\|\|", p.read_text("utf-8"))]
     assert offenders == ["study/srs.py"]

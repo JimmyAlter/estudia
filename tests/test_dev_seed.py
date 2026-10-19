@@ -145,8 +145,9 @@ def test_la_app_sembrada_muestra_un_grupo_de_variantes(seeded):
     quiz = build_quiz(conn, 101, topic_id=1, now=now)
     shown = [item for item in quiz if item.card_key == "v:13"]
     assert len(shown) == 1 and shown[0].question_id in (14, 15)
-    # En la práctica de toda la materia también aparece (y una sola vez).
-    assert [i.question_id for i in build_quiz(conn, 101, now=now) if i.card_key == "v:13"] in ([14], [15])
+    # En la práctica de toda la materia también aparece (y una sola vez). Con size=50 entran todas,
+    # así el resultado no depende de la hora: la semilla arma el plan relativo al momento actual.
+    assert [i.question_id for i in build_quiz(conn, 101, size=50, now=now) if i.card_key == "v:13"] in ([14], [15])
 
 
 def test_el_primer_paso_arranca_sin_materias(dev_seed, monkeypatch, tmp_path):

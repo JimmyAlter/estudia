@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from estudia.db import connect
@@ -240,7 +242,8 @@ def test_rw_uri_handles_unc_and_windows_paths():
 
 
 def test_connect_without_create_works_with_odd_characters(tmp_path):
-    folder = tmp_path / "con espacio #1 ?x%"
+    # "?" no es válido en nombres de Windows; en el resto es el caso que más rompe una URI.
+    folder = tmp_path / ("con espacio #1 x%" if os.name == "nt" else "con espacio #1 ?x%")
     folder.mkdir()
     connect(folder / "a.db").close()
     connect(folder / "a.db", create=False).close()

@@ -281,7 +281,8 @@ describe("Práctica v2", () => {
     await screen.findByText(/pendiente de y = 2x/);
     await user.keyboard("2");
     await user.keyboard("s");
-    await screen.findByText(/En y = mx \+ b/);
+    // Plazo amplio: en el runner de Windows el primer render puede pasar el segundo por defecto.
+    await screen.findByText(/En y = mx \+ b/, {}, { timeout: 5000 });
 
     await user.keyboard("{Enter}");
     expect(screen.queryByText("Segunda pregunta")).not.toBeInTheDocument();
