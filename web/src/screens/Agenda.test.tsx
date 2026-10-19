@@ -1,6 +1,6 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import Agenda from "./Agenda";
 import type { AgendaWeek, ExamHealth, ExamInfo } from "../api";
 import { mockApi } from "../test-utils";
@@ -416,7 +416,10 @@ describe("Agenda", () => {
   });
 
   it("sin botón, el simulacro corto se sugiere en una frase", async () => {
-    // Martes 20/10/2026 al mediodía en Buenos Aires: nunca es hoy ni mañana en este test.
+    // El reloj queda fijo el miércoles 14/10/2026, así el martes 20 nunca es hoy ni mañana.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.UTC(2026, 9, 14, 15));
+    onTestFinished(() => vi.useRealTimers());
     const tuesday = Date.UTC(2026, 9, 20, 15) / 1000;
     const retake: ExamHealth = {
       ...WEEK.health[0], exam_id: 7, exam: "Recuperatorio del primer parcial", verdict: "llegás",
