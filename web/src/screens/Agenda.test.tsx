@@ -419,7 +419,9 @@ describe("Agenda", () => {
     // El reloj queda fijo el miércoles 14/10/2026, así el martes 20 nunca es hoy ni mañana.
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.UTC(2026, 9, 14, 15));
-    onTestFinished(() => vi.useRealTimers());
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
     const tuesday = Date.UTC(2026, 9, 20, 15) / 1000;
     const retake: ExamHealth = {
       ...WEEK.health[0], exam_id: 7, exam: "Recuperatorio del primer parcial", verdict: "llegás",
