@@ -1,9 +1,12 @@
 """Repaso por pregunta: FSRS (librería `fsrs`, MIT) más reaprendizaje sucesivo.
 
-Cada pregunta vista tiene una fila en `review_state` (`card_key = 'q:<id>'`). La fila se
-deriva siempre de la historia de `answer` y de los exámenes de su tema (fecha y si es
-recuperatorio), nada más: se reconstruye reproduciendo las respuestas de la pregunta en orden
-con los exámenes de hoy.
+Cada tarjeta vista tiene una fila en `review_state`. Una pregunta sin grupo es su propia tarjeta
+(`card_key = 'q:<id>'`); las variantes numéricas de una original comparten una sola
+(`'v:<id de la original>'`, ver `card_ref`). La fila se deriva siempre de la historia de `answer`
+y de los exámenes del tema (fecha y si es recuperatorio), nada más: se reconstruye reproduciendo
+en orden las respuestas de la pregunta (o de todos los miembros del grupo) con los exámenes de hoy.
+Toda consulta que une `question` con `review_state` usa `CARD_KEY_SQL`, y la que cuenta tarjetas,
+`HEAD`: nadie más arma la clave a mano.
 `sync_review_state` rehace las tarjetas con respuestas nuevas (marca en `kv`) y las de los temas
 cuyos exámenes cambiaron desde la última vez (otra marca en `kv`), así que reproducir toda la
 historia y registrar respuesta por respuesta dan lo mismo, y repetirlo no cambia nada.
@@ -27,6 +30,7 @@ siguiente al 1.er acierto y 2 días después del 2.º, proponga lo que proponga 
 """
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from fsrs import Card, Rating, Scheduler, State
@@ -58,8 +62,49 @@ EXAMS_KEY = "review_state_exam_dates"
 _SCHEDULERS: dict[float, Scheduler] = {}
 
 
+# Clave de la tarjeta de cada fila de `question` (alias `q`), para unir con `review_state`.
+CARD_KEY_SQL = "(CASE WHEN q.variant_group IS NULL THEN 'q:' || q.id ELSE 'v:' || q.variant_group END)"
+# Una fila por tarjeta: las preguntas sin grupo y la original (cabeza) de cada grupo.
+HEAD = "(q.variant_group IS NULL OR q.variant_group = q.id)"
+
+
 def card_key(question_id: int) -> str:
+    """Clave de una pregunta sin grupo. Para cualquier pregunta, `card_ref(...).key`."""
     return f"q:{question_id}"
+
+
+def group_card_key(group_id: int) -> str:
+    return f"v:{group_id}"
+
+
+@dataclass
+class CardRef:
+    """La tarjeta de una pregunta: su clave, la original (o ella misma), los miembros y el tema."""
+
+    key: str
+    head_id: int
+    member_ids: list[int]
+    topic_id: int
+
+    @property
+    def grouped(self) -> bool:
+        """True si es la tarjeta de un grupo de variantes (`v:`); False si es una pregunta suelta."""
+        return self.key == group_card_key(self.head_id)
+
+
+def card_ref(conn: sqlite3.Connection, question_id: int) -> CardRef | None:
+    """Sin grupo: `(q:<id>, id, [id], tema)`. En un grupo: `(v:<g>, g, miembros en orden, tema de la
+    original)`. None si la pregunta no existe."""
+    q = conn.execute("SELECT id, topic_id, variant_group FROM question WHERE id = ?", (question_id,)).fetchone()
+    if q is None:
+        return None
+    group = q["variant_group"]
+    if group is None:
+        return CardRef(card_key(q["id"]), q["id"], [q["id"]], q["topic_id"])
+    members = [r[0] for r in conn.execute(
+        "SELECT id FROM question WHERE variant_group = ? ORDER BY id", (group,))]
+    head = conn.execute("SELECT topic_id FROM question WHERE id = ?", (group,)).fetchone()
+    return CardRef(group_card_key(group), group, members, head["topic_id"] if head else q["topic_id"])
 
 
 def scheduler(desired_retention: float = RETENTION_FAR) -> Scheduler:
@@ -184,12 +229,13 @@ def _pulled_due(due: int, stability: float, last_review: int, exam_dates: list[i
 
 # --- Reconstrucción de una tarjeta -------------------------------------------------------------
 
-def _replay(question_id: int, answers: list[sqlite3.Row], schedule: list[tuple[int, bool]]) -> dict | None:
-    """Estado de la tarjeta después de las respuestas dadas (ya ordenadas, sin pretest), con los
-    exámenes de su tema como pares (fecha, es_recuperatorio)."""
+def _replay(key: str, card_id: int, answers: list[sqlite3.Row],
+            schedule: list[tuple[int, bool]]) -> dict | None:
+    """Estado de la tarjeta `key` después de las respuestas dadas (ya ordenadas, sin pretest), con los
+    exámenes de su tema como pares (fecha, es_recuperatorio). `card_id` es el id de la original."""
     if not answers:
         return None
-    card = Card(card_id=question_id)
+    card = Card(card_id=card_id)
     state = STATE_REVIEW
     relearn_days = 0
     relearn_last: date | None = None
@@ -219,7 +265,7 @@ def _replay(question_id: int, answers: list[sqlite3.Row], schedule: list[tuple[i
                 due = day_start(relearn_last + timedelta(days=relearn_days))
     due = _pulled_due(due, card.stability, answers[-1]["at"], sorted({d for d, _ in schedule}))
     return {
-        "card_key": card_key(question_id),
+        "card_key": key,
         "stability": card.stability,
         "difficulty": card.difficulty,
         "state": state,
@@ -232,20 +278,28 @@ def _replay(question_id: int, answers: list[sqlite3.Row], schedule: list[tuple[i
 
 def rebuild_card(conn: sqlite3.Connection, question_id: int,
                  schedule_by_topic: dict[int, list[tuple[int, bool]]] | None = None) -> None:
-    """Rehace la fila de `review_state` de la pregunta desde su historia (sin commit)."""
-    q = conn.execute("SELECT topic_id FROM question WHERE id = ?", (question_id,)).fetchone()
-    if q is None:
+    """Rehace la tarjeta de la pregunta desde su historia (sin commit).
+
+    En un grupo reproduce las respuestas de todos los miembros, en orden, y borra las filas `q:` que
+    hubieran quedado de cuando un miembro no tenía grupo: su historia ya está en la del grupo.
+    """
+    ref = card_ref(conn, question_id)
+    if ref is None:
         return
     if schedule_by_topic is None:
         schedule_by_topic = exam_schedule_by_topic(conn)
+    marks = ",".join("?" * len(ref.member_ids))
     answers = conn.execute(
         "SELECT correct, confidence, mode, explain_match, at FROM answer "
-        "WHERE question_id = ? AND COALESCE(mode, '') != 'pretest' ORDER BY at, id",
-        (question_id,),
+        f"WHERE question_id IN ({marks}) AND COALESCE(mode, '') != 'pretest' ORDER BY at, id",
+        ref.member_ids,
     ).fetchall()
-    row = _replay(question_id, answers, schedule_by_topic.get(q["topic_id"], []))
+    if ref.grouped:
+        conn.executemany("DELETE FROM review_state WHERE card_key = ?",
+                         [(card_key(m),) for m in ref.member_ids])
+    row = _replay(ref.key, ref.head_id, answers, schedule_by_topic.get(ref.topic_id, []))
     if row is None:
-        conn.execute("DELETE FROM review_state WHERE card_key = ?", (card_key(question_id),))
+        conn.execute("DELETE FROM review_state WHERE card_key = ?", (ref.key,))
         return
     conn.execute(
         "INSERT OR REPLACE INTO review_state(card_key, stability, difficulty, state, due, "
@@ -278,8 +332,10 @@ def _set_kv(conn: sqlite3.Connection, key: str, value: str) -> None:
 def sync_review_state(conn: sqlite3.Connection) -> int:
     """Deja `review_state` al día (sin commit). Devuelve las tarjetas rehechas.
 
-    Rehace las preguntas con respuestas nuevas y las de los temas cuyos exámenes se cargaron,
+    Rehace las tarjetas con respuestas nuevas y las de los temas cuyos exámenes se cargaron,
     movieron, cambiaron de tipo (recuperatorio o no) o borraron desde la última vez: un adelanto por un examen que ya no está se deshace.
+    También las de los grupos con una fila `q:` vieja de un miembro (una original contestada que
+    después recibió variantes): el grupo hereda esa historia. Cada grupo se rehace una sola vez.
     Si no cambió nada, solo lee: no abre una escritura.
     """
     row = conn.execute("SELECT value FROM kv WHERE key = ?", (WATERMARK_KEY,)).fetchone()
@@ -289,33 +345,44 @@ def sync_review_state(conn: sqlite3.Connection) -> int:
     current = _marker(schedule)
     stored = _stored_exam_schedule(conn)
     changed_topics = sorted(t for t in set(current) | set(stored) if current.get(t) != stored.get(t))
-    if top <= done and not changed_topics:
-        return 0
-
-    qids = {
+    # Grupos con una fila `q:` de un miembro: la original ya tenía tarjeta cuando recibió variantes.
+    heads = {
         r[0]
         for r in conn.execute(
-            "SELECT DISTINCT question_id FROM answer WHERE id > ? AND COALESCE(mode, '') != 'pretest'",
+            "SELECT DISTINCT q.variant_group FROM question q JOIN review_state rs "
+            "ON rs.card_key = 'q:' || q.id WHERE q.variant_group IS NOT NULL"
+        )
+    }
+    if top <= done and not changed_topics and not heads:
+        return 0
+
+    # Cada id se pasa a su tarjeta (la original del grupo), así un grupo se rehace una vez.
+    heads |= {
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT COALESCE(q.variant_group, a.question_id) FROM answer a "
+            "LEFT JOIN question q ON q.id = a.question_id "
+            "WHERE a.id > ? AND COALESCE(a.mode, '') != 'pretest'",
             (done,),
         )
     }
     if changed_topics:
         marks = ",".join("?" * len(changed_topics))
-        qids |= {
+        heads |= {
             r[0]
             for r in conn.execute(
-                f"SELECT DISTINCT a.question_id FROM answer a JOIN question q ON q.id = a.question_id "
+                f"SELECT DISTINCT COALESCE(q.variant_group, q.id) FROM answer a JOIN question q ON q.id = a.question_id "
                 f"WHERE q.topic_id IN ({marks}) AND COALESCE(a.mode, '') != 'pretest'",
                 changed_topics,
             )
         }
-    for qid in sorted(qids):
-        rebuild_card(conn, qid, schedule)
+    for head in sorted(heads):
+        rebuild_card(conn, head, schedule)
     if top > done:
         _set_kv(conn, WATERMARK_KEY, str(top))
     if changed_topics:
         _set_kv(conn, EXAMS_KEY, json.dumps({str(t): items for t, items in sorted(current.items())}))
-    return len(qids)
+    return len(heads)
 
 
 def _is_ms(value) -> bool:

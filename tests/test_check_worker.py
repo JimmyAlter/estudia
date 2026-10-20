@@ -48,3 +48,12 @@ def test_startup_is_quiet_when_the_worker_works(caplog):
     with caplog.at_level(logging.WARNING, logger="estudia.__main__"):
         app_main.warn_if_worker_broken()
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_check_worker_runs_variants_mode(monkeypatch):
+    from estudia import __main__ as app_main
+    from estudia.generation import verify
+
+    assert app_main._worker_works() is True
+    monkeypatch.setattr(verify, "compute_variant_values", lambda payload: None)
+    assert app_main._worker_works() is False

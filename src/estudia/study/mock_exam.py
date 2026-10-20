@@ -11,8 +11,9 @@ from estudia.study.exams import ENROLLMENT, RETAKE, exam_topics
 from estudia.study.planner import retake_topics
 from estudia.study.practice import (
     MCQ, REGULAR, TYPED, AnswerFeedback, NotTypeable, QuizItem, _insert_answer, grade_typed_answer,
-    typed_safe_ids,
+    one_per_card, typed_safe_ids,
 )
+from estudia.study.srs import CARD_KEY_SQL
 
 MIN_QUESTIONS = 5
 RETAKE_MOCK_QUESTIONS = 6   # simulacro corto (el que se sugiere a los 3 días de cargar un recuperatorio)
@@ -89,14 +90,16 @@ def _recently_practiced(conn: sqlite3.Connection, now: int) -> set[int]:
 
 
 _PICK_COLUMNS = ("q.id, q.stem, q.options_json, q.topic_id, q.check_expr, q.correct_index, q.typed_safe, "
-                 "t.name AS topic")
+                 f"t.name AS topic, {CARD_KEY_SQL} AS card_key, COALESCE(q.variant_group, q.id) AS head_id")
 
 
 def _pick(conn: sqlite3.Connection, topic_ids: list[int], count: int, seed: int, now: int):
     """Reparte entre los temas en rueda, en orden al azar.
 
-    En cada tema van primero las que no se practicaron en la última semana y, entre esas, las
-    que no salieron en un simulacro anterior.
+    De cada grupo de variantes va un solo miembro (`practice.one_per_card`): primero uno nunca
+    contestado, así que un grupo con una variante sin ver cuenta como no visto. En cada tema van
+    primero las que no se practicaron en la última semana y, entre esas, las que no salieron en
+    un simulacro anterior (mirando la variante elegida). `MIN_QUESTIONS` cuenta tarjetas.
     """
     if not topic_ids:
         return []
@@ -107,6 +110,7 @@ def _pick(conn: sqlite3.Connection, topic_ids: list[int], count: int, seed: int,
         f"WHERE q.topic_id IN ({marks}) AND q.verified = 1 AND q.retired = 0 AND {REGULAR} ORDER BY q.id",
         topic_ids,
     ).fetchall()
+    rows = one_per_card(conn, rows, random.Random(seed))
     seen = _seen_in_mocks(conn)
     recent = _recently_practiced(conn, now)
     rng = random.Random(seed)
@@ -144,20 +148,23 @@ def _pick_typed(conn: sqlite3.Connection, picked: list, seed: int) -> list[int]:
     return [qid for qid in able if qid in chosen]
 
 
-def _style_pool(conn: sqlite3.Connection, exam_id: int, kind: str, topics: list[int]) -> list:
+def _style_pool(conn: sqlite3.Connection, exam_id: int, kind: str, topics: list[int],
+                rng: random.Random) -> list:
     """Las preguntas que pueden ir en un lugar de ese tipo (el mismo criterio que `style_gaps`):
     las de estilo de este examen de ese tipo y de un tema de `T` y, en opción múltiple, también
-    las del campus de `T`."""
+    las del campus de `T`, con un solo miembro por grupo de variantes (`one_per_card`, con `rng`):
+    `style_gaps` también cuenta tarjetas."""
     in_topics, topic_params = own_topic_filter(topics)
     where = f"(q.origin IS NOT NULL AND q.style_exam_id = ? AND q.style_kind = ?{in_topics})"
     params: list = [exam_id, kind, *topic_params]
     if kind == "opcion_multiple" and topics:
         where = f"({where} OR ({REGULAR} AND q.topic_id IN ({','.join('?' * len(topics))})))"
         params.extend(topics)
-    return conn.execute(
+    rows = conn.execute(
         f"SELECT {_PICK_COLUMNS} FROM question q JOIN topic t ON t.id = q.topic_id "
         f"WHERE q.verified = 1 AND q.retired = 0 AND {where} ORDER BY q.id", params,
     ).fetchall()
+    return one_per_card(conn, rows, rng)
 
 
 def _pick_style(conn: sqlite3.Connection, exam_id: int, style: ExamStyle, seed: int, now: int):
@@ -174,10 +181,14 @@ def _pick_style(conn: sqlite3.Connection, exam_id: int, style: ExamStyle, seed: 
     seen = _seen_in_mocks(conn)
     recent = _recently_practiced(conn, now)
     rng = random.Random(seed)
+    variant_rng = random.Random(seed)   # aparte: sin grupos, el orden al azar es el de siempre
     picked: list = []
     points: list[float] = []
     for group in style.groups:
-        pool = _style_pool(conn, exam_id, group.kind, topics)
+        # Una tarjeta llena un solo lugar, también entre grupos del mismo tipo.
+        taken = {q["card_key"] for q in picked}
+        pool = [q for q in _style_pool(conn, exam_id, group.kind, topics, variant_rng)
+                if q["card_key"] not in taken]
         rng.shuffle(pool)
         pool.sort(key=lambda r: (r["id"] in recent, r["id"] in seen))   # estable: conserva el azar
         if len(pool) < group.count:   # no debería pasar: es el mismo criterio que `style_gaps`
@@ -249,7 +260,7 @@ def start_mock(
     items = [
         QuizItem(q["id"], q["stem"], json.loads(q["options_json"]), q["topic"],
                  format=TYPED if q["id"] in typed_ids else MCQ,
-                 points=points[i] if points is not None else None)
+                 points=points[i] if points is not None else None, card_key=q["card_key"])
         for i, q in enumerate(picked)
     ]
     return MockStart(cur.lastrowid, items, seconds, max_grade, predicted_grade, style=style)

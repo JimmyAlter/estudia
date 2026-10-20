@@ -2,7 +2,8 @@
 
 Uso:
     uv run python scripts/dev_seed.py --port 8780            # app lista, con examen
-    uv run python scripts/dev_seed.py --step facultad        # arranca en el onboarding
+    uv run python scripts/dev_seed.py --step facultad        # instalación nueva: el primer paso
+    uv run python scripts/dev_seed.py --step ia              # el asistente de la clave de Gemini
     uv run python scripts/dev_seed.py --step vencida         # la sesión del campus venció
     uv run python scripts/dev_seed.py --no-exam              # sin exámenes próximos
 
@@ -47,9 +48,15 @@ van plegados en "Cambiar el formato o cargar parciales".
 
 La carpeta de datos (parciales y apuntes) también es temporal: nada se escribe en la de verdad.
 
-Con la app lista, el curso tiene 12 preguntas verificadas y una clase pendiente ("Ya hay 12
+Con la app lista, el curso tiene 13 preguntas verificadas y una clase pendiente ("Ya hay 13
 preguntas…"), y el procesamiento quedó frenado por el tope del día (`ai_stop_reason = "budget"`).
 La pantalla de cada cosa está en el informe de la Tarea 19 (`.superpowers/sdd/2026-10-18-etapa3a/`).
+
+Para la etapa 3c: `--step facultad` es una instalación nueva de verdad (sin materias ni nada
+sembrado), así "Probar con una materia de ejemplo" arma la demo. `--step ia` muestra el asistente
+de la clave. Con la app lista, "Funciones lineales y pendiente" tiene un grupo de 3 variantes
+(f(x) = ax + b en x = c, con valores escritos a mano) contestado una vez: la práctica trae otro
+miembro del grupo, con otros números.
 """
 from __future__ import annotations
 
@@ -134,6 +141,9 @@ class QuotaProvider:
         self.requests: dict[str, int] = {}
         self.exhausted_until: dict[str, float] = {}
         self.url_denied_videos: set[str] = set()
+
+    def check_key(self):
+        return None  # cualquier clave sirve: el asistente de la clave termina bien
 
     def analyze_video(self, youtube_id, title):
         raise AIQuotaError("cuota agotada (simulado)")
@@ -302,6 +312,7 @@ def seed(db_path: Path, *, with_exam: bool) -> None:
     # Después del plan y los simulacros, para que ninguno use sus preguntas (la oferta pide cero respuestas).
     seed_pretest(db_path, now)
     seed_documents(db_path, now)
+    seed_variants(db_path, now)
 
 
 def _style(groups, minutes, topic_ids, *, formula_sheet=False, unmatched=()):
@@ -445,6 +456,37 @@ def seed_pretest(db_path: Path, now: int) -> None:
     conn.close()
 
 
+# Un grupo de variantes (la pregunta lineal de `tests/variant_fixtures.py`): f(x) = ax + b en x = c.
+# Clave a·c + b; distractores a·(c + b), a + b y a·c. La 13 es la original del grupo.
+VARIANT_GROUP = [
+    # (id, a, b, c)
+    (13, 2, 3, 4),
+    (14, 5, 2, 3),
+    (15, 4, 1, 6),
+]
+
+
+def seed_variants(db_path: Path, now: int) -> None:
+    """Un grupo de 3 variantes en "Funciones lineales y pendiente", con la original contestada una
+    vez (bien, hace 3 días): la práctica trae otro miembro del grupo."""
+    conn = connect(db_path)
+    for qid, a, b, c in VARIANT_GROUP:
+        key = a * c + b
+        options = [str(key), str(a * (c + b)), str(a + b), str(a * c)]
+        conn.execute(
+            "INSERT INTO question(id, material_id, topic_id, stem, options_json, correct_index,"
+            " explanation, common_error, source_seconds, check_expr, verified, dedupe_key,"
+            " variant_group, variant_values_json) VALUES (?, 1, 1, ?, ?, 0, ?, ?, 60, ?, 1, ?, 13, ?)",
+            (qid, f"Si f(x) = {a}x + {b}, ¿cuánto vale f({c})?", json.dumps(options),
+             f"f({c}) = {a}·{c} + {b} = {key}.", f"Olvidarse de sumar {b} a {a}·{c}.", str(key),
+             f"q{qid}", json.dumps({"a": a, "b": b, "c": c})),
+        )
+    conn.execute("INSERT INTO answer(question_id, chosen_index, correct, at, confidence, mode, explain_prompted)"
+                 " VALUES (13, 0, 1, ?, 2, 'mcq', 0)", (now - 3 * DAY,))
+    conn.commit()
+    conn.close()
+
+
 def seed_agenda(db_path: Path, now: int) -> None:
     """Horarios, entregas, exámenes manuales, disponibilidad, plan y un simulacro terminado."""
     conn = connect(db_path)
@@ -498,6 +540,11 @@ def seed_agenda(db_path: Path, now: int) -> None:
     conn.close()
 
 
+def no_update_check():
+    """El aviso de versión nueva no sale a GitHub: sin red, la app sigue sin aviso."""
+    raise OSError("dev_seed no sale a internet")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8780)
@@ -510,7 +557,11 @@ def main() -> None:
     # Parciales y apuntes van a la carpeta temporal, nunca a la de datos de verdad.
     os.environ[DATA_DIR_ENV] = str(folder)
     db_path = folder / "estudia.db"
-    seed(db_path, with_exam=not args.no_exam)
+    if args.step == "facultad":
+        # Instalación nueva de verdad: sin materias, así la materia de ejemplo se puede probar.
+        connect(db_path).close()
+    else:
+        seed(db_path, with_exam=not args.no_exam)
 
     conn = connect(db_path)
     if args.step != "facultad":
@@ -518,7 +569,7 @@ def main() -> None:
     if args.step in ("ia", "listo", "vencida"):
         # Ya contestó la pregunta de edad (adulto), así que Ajustes muestra la sección "Edad".
         conn.execute("INSERT OR REPLACE INTO kv VALUES ('age_gate', 'adult')")
-    if args.step in ("facultad", "login"):
+    if args.step == "login":
         # Instalación nueva: todavía no sincronizó nunca.
         conn.execute("DELETE FROM kv WHERE key='last_sync_at'")
     conn.commit()
@@ -540,6 +591,7 @@ def main() -> None:
         moodle_client_factory=OfflineMoodle,
         ai_provider_factory=lambda key: QuotaProvider(),
         open_browser=lambda url: print(f"(se abriría el navegador en {url})"),
+        update_http_factory=no_update_check,
         port=args.port,
     )
     print(f"Estudia de prueba en http://{HOST}:{args.port}/  (base: {db_path})")

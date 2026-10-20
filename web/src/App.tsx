@@ -3,6 +3,7 @@ import { RotateCw, Settings as SettingsIcon } from "lucide-react";
 import { ApiError, api, type AppState, type QuizParams, type SessionInfo, type VersionInfo } from "./api";
 import { timeAgo } from "./format";
 import Agenda from "./screens/Agenda";
+import DemoHome from "./screens/DemoHome";
 import Home, { type Screen } from "./screens/Home";
 import Materials from "./screens/Materials";
 import Mock from "./screens/Mock";
@@ -26,6 +27,9 @@ const NAV: { screen: Screen; label: string }[] = [
 ];
 /** Pantallas que no están en la navegación pero tienen dirección propia. */
 const OTHER_SCREENS: Screen[] = ["ajustes", "simulacro", "arrancar", "como-vengo"];
+/** En la materia de ejemplo solo se estudia: lo demás lee las materias reales. */
+const DEMO_NAV: Screen[] = ["inicio", "practica"];
+const DEMO_SCREENS: Screen[] = [...DEMO_NAV, "simulacro"];
 
 function screenFromHash(): Screen {
   const name = window.location.hash.replace(/^#\/?/, "");
@@ -45,6 +49,8 @@ export default function App() {
   const timer = useRef<number | undefined>(undefined);
   const refreshRef = useRef<() => Promise<void>>(async () => {});
   const [focusRequest, setFocusRequest] = useState(0);
+  /** Desde la materia de ejemplo se tocó "Conectar mi campus": se muestra el primer inicio. */
+  const [connecting, setConnecting] = useState(false);
 
   // Lee el estado y agenda la próxima lectura pase lo que pase: si el servidor
   // no responde, se sigue intentando y la app se recupera sola cuando vuelve.
@@ -124,6 +130,19 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [focusRequest]);
 
+  // La materia de ejemplo quedó abierta: derecho a la primera pregunta, sin pasar por el inicio.
+  const onDemo = useCallback(() => {
+    refreshRef.current();
+    startPractice({});
+  }, [startPractice]);
+
+  // Entrar o salir del primer inicio desde la materia de ejemplo: el foco va al título nuevo.
+  const showConnecting = useCallback((on: boolean) => {
+    setConnecting(on);
+    setFocusRequest((n) => n + 1);
+    window.scrollTo(0, 0);
+  }, []);
+
   const onSessionExpired = useCallback(() => {
     setSessionExpired(true);
     refreshRef.current();
@@ -137,29 +156,46 @@ export default function App() {
     ) : null;
   }
 
+  // La materia de ejemplo se muestra aunque el primer inicio no esté hecho.
+  const demo = state.demo && !connecting;
   // Sin sesión pero con datos de antes: se sigue estudiando y se ofrece volver a entrar.
   const hasData = state.last_sync_at !== null;
-  if (state.step === "facultad" || state.step === "edad" || state.step === "ia" || (state.step === "login" && !hasData)) {
-    return <Onboarding state={state} onChange={refresh} />;
+  if (
+    !demo &&
+    (state.step === "facultad" || state.step === "edad" || state.step === "ia" || (state.step === "login" && !hasData))
+  ) {
+    return (
+      <Onboarding
+        state={state}
+        onChange={refresh}
+        onDemo={onDemo}
+        onBackToDemo={state.demo ? () => showConnecting(false) : undefined}
+      />
+    );
   }
-  const expired = sessionExpired || state.step === "login";
+  const expired = !demo && (sessionExpired || state.step === "login");
+  // En la materia de ejemplo, una dirección que no es de estudio (#/agenda) muestra el inicio.
+  const shown: Screen = demo && !DEMO_SCREENS.includes(screen) ? "inicio" : screen;
+  const nav = demo ? NAV.filter((item) => DEMO_NAV.includes(item.screen)) : NAV;
 
   return (
     <div className="mx-auto max-w-5xl px-6 pb-24 md:px-10">
+      {demo && <DemoBanner onConnect={() => showConnecting(true)} />}
       <header className="flex flex-wrap items-baseline gap-x-5 gap-y-3 py-7 sm:flex-nowrap sm:gap-x-10">
         <span className="font-serif text-lg tracking-tight">Estudia</span>
-        <nav className="flex gap-5 max-sm:order-last max-sm:w-full sm:gap-6" aria-label="Secciones">
-          {NAV.map((item) => (
+        {/* Sin la fila de la derecha (la materia de ejemplo), Inicio y Práctica entran al lado del nombre. */}
+        <nav className={`flex gap-5 sm:gap-6 ${demo ? "" : "max-sm:order-last max-sm:w-full"}`} aria-label="Secciones">
+          {nav.map((item) => (
             <a
               key={item.screen}
               href={`#/${item.screen}`}
-              aria-current={screen === item.screen ? "page" : undefined}
+              aria-current={shown === item.screen ? "page" : undefined}
               onClick={(e) => {
                 e.preventDefault();
                 navigate(item.screen);
               }}
               className={
-                screen === item.screen
+                shown === item.screen
                   ? "font-medium text-ink"
                   : "text-muted transition-colors duration-150 hover:text-ink"
               }
@@ -168,34 +204,41 @@ export default function App() {
             </a>
           ))}
         </nav>
-        <div className="ml-auto flex items-baseline gap-4 sm:gap-5">
-          {!expired && <SyncStatus state={state} onChange={refresh} />}
-          <a
-            href="#/ajustes"
-            aria-current={screen === "ajustes" ? "page" : undefined}
-            onClick={(e) => {
-              e.preventDefault();
-              navigate("ajustes");
-            }}
-            title="Ajustes"
-            className={`press flex items-center gap-1.5 text-sm ${
-              screen === "ajustes" ? "font-medium text-ink" : "text-muted transition-colors duration-150 hover:text-ink"
-            }`}
-          >
-            <SettingsIcon size={16} strokeWidth={1.75} aria-hidden className="relative top-[3px] sm:hidden" />
-            <span className="max-sm:sr-only">Ajustes</span>
-          </a>
-        </div>
+        {!demo && (
+          <div className="ml-auto flex items-baseline gap-4 sm:gap-5">
+            {!expired && <SyncStatus state={state} onChange={refresh} />}
+            <a
+              href="#/ajustes"
+              aria-current={screen === "ajustes" ? "page" : undefined}
+              onClick={(e) => {
+                e.preventDefault();
+                navigate("ajustes");
+              }}
+              title="Ajustes"
+              className={`press flex items-center gap-1.5 text-sm ${
+                screen === "ajustes" ? "font-medium text-ink" : "text-muted transition-colors duration-150 hover:text-ink"
+              }`}
+            >
+              <SettingsIcon size={16} strokeWidth={1.75} aria-hidden className="relative top-[3px] sm:hidden" />
+              <span className="max-sm:sr-only">Ajustes</span>
+            </a>
+          </div>
+        )}
       </header>
 
-      <div className="space-y-2">
-        {expired && <ExpiredSession onDone={refresh} />}
-        {screen === "inicio" && state.age == null && <AgeNotice onDone={refresh} />}
-        <StatusNotice state={state} offline={offline} />
-      </div>
+      {!demo && (
+        <div className="space-y-2">
+          {expired && <ExpiredSession onDone={refresh} />}
+          {screen === "inicio" && state.age == null && <AgeNotice onDone={refresh} />}
+          <StatusNotice state={state} offline={offline} />
+        </div>
+      )}
 
       <main className="pt-10">
-        {screen === "inicio" && (
+        {shown === "inicio" && demo && (
+          <DemoHome onPractice={() => startPractice({})} onShortMock={startShortMock} />
+        )}
+        {shown === "inicio" && !demo && (
           <Home
             refreshKey={refreshKey}
             aiStopReason={state.ai_stop_reason}
@@ -207,27 +250,46 @@ export default function App() {
             onSessionExpired={onSessionExpired}
           />
         )}
-        {screen === "agenda" && <Agenda key={refreshKey} onPractice={startPractice} onShortMock={startShortMock} />}
-        {screen === "practica" && (
-          <Practice params={practice.params} session={practice.session} onExit={() => navigate("inicio")} />
+        {shown === "agenda" && <Agenda key={refreshKey} onPractice={startPractice} onShortMock={startShortMock} />}
+        {shown === "practica" && (
+          <Practice
+            params={practice.params}
+            session={practice.session}
+            onExit={() => navigate("inicio")}
+            demo={demo}
+          />
         )}
-        {screen === "materiales" && (
+        {shown === "materiales" && (
           <Materials key={refreshKey} aiStopReason={state.ai_stop_reason} age={state.age} onPractice={startPractice} />
         )}
-        {screen === "simulacro" && (
+        {shown === "simulacro" && (
           <Mock
             key={mockStart ? `corto-${mockStart.examId}` : "comun"}
             start={mockStart}
             onPractice={startPractice}
             onExit={() => navigate("inicio")}
+            demo={demo}
           />
         )}
-        {screen === "ajustes" && <Settings onChange={refresh} />}
-        {screen === "arrancar" && <Pretest onNavigate={navigate} />}
-        {screen === "como-vengo" && <Progress />}
+        {shown === "ajustes" && <Settings onChange={refresh} />}
+        {shown === "arrancar" && <Pretest onNavigate={navigate} />}
+        {shown === "como-vengo" && <Progress />}
       </main>
 
       <Footer />
+    </div>
+  );
+}
+
+/** Una línea arriba de todo, sin fondo: se está en la materia de ejemplo y se puede pasar al campus. */
+function DemoBanner({ onConnect }: { onConnect: () => void }) {
+  return (
+    // Una sola línea, también a 360 px: a lo angosto baja a text-xs en vez de partirse.
+    <div className="flex items-baseline justify-between gap-3 border-b border-line py-3 text-sm whitespace-nowrap text-muted max-sm:text-xs">
+      <p>Estás en la materia de ejemplo</p>
+      <Button variant="quiet" onClick={onConnect}>
+        Conectar mi campus
+      </Button>
     </div>
   );
 }

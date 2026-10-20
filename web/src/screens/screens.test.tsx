@@ -166,7 +166,7 @@ describe("Onboarding", () => {
       ai_stop_reason: null,
       syncing: false,
       last_sync_at: null,
-      last_sync_error: null,
+      last_sync_error: null, demo: false,
     };
     render(<Onboarding state={state} onChange={() => {}} />);
     await waitFor(() =>
@@ -177,7 +177,7 @@ describe("Onboarding", () => {
     expect(screen.getByText("Qué ve Google")).toBeInTheDocument();
     expect(screen.getByText(/Google recibe el video de cada clase/)).toBeInTheDocument();
     expect(screen.getByText(/ni tus datos personales/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /clave/i })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Abrí Google AI Studio" })).toHaveAttribute(
       "href",
       "https://aistudio.google.com/apikey",
     );
@@ -187,7 +187,7 @@ describe("Onboarding", () => {
 describe("Onboarding: puerta de edad", () => {
   const base: AppState = {
     step: "edad", age: null, site_id: "utn-frba", ai_stop_reason: null, syncing: false,
-    last_sync_at: null, last_sync_error: null,
+    last_sync_at: null, last_sync_error: null, demo: false,
   };
 
   it("pregunta la edad antes de la clave, en el mismo paso 3 de 3", () => {
@@ -222,40 +222,52 @@ describe("Onboarding: puerta de edad", () => {
 });
 
 describe("Onboarding: clave vacía", () => {
-  it("\"Guardar clave\" avisa si falta la clave y no la manda", async () => {
+  it("\"Guardar clave\" espera a que haya una clave: vacío no se puede tocar ni manda nada", async () => {
     const fetchMock = mockApi({});
     const state: AppState = {
       step: "ia", site_id: "utn-frba", ai_stop_reason: null, syncing: false,
-      last_sync_at: null, last_sync_error: null,
+      last_sync_at: null, last_sync_error: null, demo: false,
     };
     render(<Onboarding state={state} onChange={() => {}} />);
     const save = screen.getByRole("button", { name: "Guardar clave" });
-    expect(save).toBeEnabled();
+    expect(save).toBeDisabled();
     await userEvent.click(save);
-    const message = screen.getByRole("alert");
-    expect(message).toHaveTextContent("Pegá la clave primero.");
-    const input = screen.getByLabelText("Clave de Gemini");
-    expect(input).toHaveAttribute("aria-invalid", "true");
-    expect(input).toHaveAttribute("aria-describedby", message.id);
-    expect(input).toHaveFocus();
-    // El mensaje va justo debajo del campo, antes del botón.
-    expect(input.nextElementSibling).toBe(message);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Pegá la clave primero.")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalledWith("/api/ai", expect.anything());
   });
-});
 
-describe("Onboarding: el aviso de la clave", () => {
-  it("se borra cuando se escribe en el campo", async () => {
-    mockApi({ "POST /api/ai": () => jsonResponse(400, { detail: "la clave fue rechazada" }) });
+  it("lo que responde Google va justo debajo del campo", async () => {
+    mockApi({ "POST /api/ai": () => jsonResponse(400, { detail: "Google no aceptó esa clave. Creá otra en Google AI Studio y pegala acá." }) });
     const state: AppState = {
       step: "ia", site_id: "utn-frba", ai_stop_reason: null, syncing: false,
-      last_sync_at: null, last_sync_error: null,
+      last_sync_at: null, last_sync_error: null, demo: false,
     };
     render(<Onboarding state={state} onChange={() => {}} />);
     const input = screen.getByLabelText("Clave de Gemini");
     await userEvent.type(input, "clave-mala");
     await userEvent.click(screen.getByRole("button", { name: "Guardar clave" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Google rechazó esa clave");
+    const message = await screen.findByRole("alert");
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input).toHaveAttribute("aria-describedby", message.id);
+    expect(input).toHaveFocus();
+    // El mensaje va justo debajo del campo, antes del botón.
+    expect(input.nextElementSibling).toBe(message);
+  });
+});
+
+describe("Onboarding: el aviso de la clave", () => {
+  it("se borra cuando se escribe en el campo", async () => {
+    mockApi({ "POST /api/ai": () => jsonResponse(400, { detail: "Google no aceptó esa clave. Creá otra en Google AI Studio y pegala acá." }) });
+    const state: AppState = {
+      step: "ia", site_id: "utn-frba", ai_stop_reason: null, syncing: false,
+      last_sync_at: null, last_sync_error: null, demo: false,
+    };
+    render(<Onboarding state={state} onChange={() => {}} />);
+    const input = screen.getByLabelText("Clave de Gemini");
+    await userEvent.type(input, "clave-mala");
+    await userEvent.click(screen.getByRole("button", { name: "Guardar clave" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Google no aceptó esa clave");
 
     await userEvent.type(input, "x");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -438,7 +450,7 @@ describe("Materials: tope de YouTube y sin IA", () => {
 describe("Onboarding: pegar el enlace del campus", () => {
   const loginState: AppState = {
     step: "login", site_id: "utn-frba", ai_stop_reason: null, syncing: false,
-    last_sync_at: null, last_sync_error: null,
+    last_sync_at: null, last_sync_error: null, demo: false,
   };
   const PASTED = "moodlemobile://token=c2VjcmV0bw==";
 

@@ -1,29 +1,43 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { ApiError, api, type AppState, type Site } from "../api";
 import { Button, Label } from "../ui";
 import { AgeStep } from "./Age";
+import KeyWizard from "./KeyWizard";
 
-const AI_STUDIO_URL = "https://aistudio.google.com/apikey";
 const POLL_MS = 2000;
 
 interface Props {
   state: AppState;
   /** Algo cambió en el servidor: hay que volver a leer el estado. */
   onChange: () => void;
+  /** La materia de ejemplo quedó abierta: la app la muestra. Sin esto no se ofrece. */
+  onDemo?: () => void;
+  /** Se llegó desde la materia de ejemplo ("Conectar mi campus"): se puede volver a ella. */
+  onBackToDemo?: () => void;
 }
 
 const STEP_NUMBER = { facultad: 1, login: 2, edad: 3, ia: 3, listo: 3 } as const;
 
-export default function Onboarding({ state, onChange }: Props) {
+export default function Onboarding({ state, onChange, onDemo, onBackToDemo }: Props) {
   return (
     <main className="mx-auto max-w-[30rem] px-6 pt-[14vh] pb-16">
-      <div className="mb-14 font-serif text-xl tracking-tight">Estudia</div>
+      <div className="mb-14 flex items-baseline justify-between gap-4">
+        <div className="font-serif text-xl tracking-tight">Estudia</div>
+        {onBackToDemo && (
+          <Button variant="quiet" className="text-sm" onClick={onBackToDemo}>
+            Volver al ejemplo
+          </Button>
+        )}
+      </div>
       <Label className="mb-3">Paso {STEP_NUMBER[state.step]} de 3</Label>
-      {state.step === "facultad" && <ChooseSite onDone={onChange} />}
+      {state.step === "facultad" && (
+        // Desde la materia de ejemplo no se la vuelve a ofrecer: ya está abierta.
+        <ChooseSite onDone={onChange} onDemo={onBackToDemo ? undefined : onDemo} />
+      )}
       {state.step === "login" && <CampusLogin onDone={onChange} />}
       {state.step === "edad" && <AgeStep onDone={onChange} heading={<Heading>¿Tenés 18 años o más?</Heading>} />}
       {(state.step === "ia" || state.step === "listo") && (
-        <ConnectAI rejected={state.ai_stop_reason === "auth"} onDone={onChange} />
+        <KeyWizard rejected={state.ai_stop_reason === "auth"} onDone={onChange} />
       )}
     </main>
   );
@@ -42,7 +56,7 @@ function ErrorLine({ message }: { message: string | null }) {
   );
 }
 
-function ChooseSite({ onDone }: { onDone: () => void }) {
+function ChooseSite({ onDone, onDemo }: { onDone: () => void; onDemo?: () => void }) {
   const [sites, setSites] = useState<Site[] | null>(null);
   const [siteId, setSiteId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -75,39 +89,72 @@ function ChooseSite({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <form onSubmit={submit}>
-      <Heading>¿En qué facultad estudiás?</Heading>
-      <p className="mb-8 text-muted">Estudia se conecta con el campus virtual de tu facultad.</p>
-      <label htmlFor="site" className="mb-2 block text-sm font-medium">
-        Facultad
-      </label>
-      <select
-        id="site"
-        value={siteId}
-        onChange={(e) => setSiteId(e.target.value)}
-        disabled={!sites}
-        className="mb-6 w-full cursor-pointer rounded-md border border-field bg-canvas px-3 py-2.5"
-      >
-        <option value="" disabled>
-          {sites ? "Elegí tu facultad" : "Cargando…"}
-        </option>
-        {universities.map((university) => (
-          <optgroup key={university} label={university}>
-            {sites!
-              .filter((s) => s.university === university)
-              .map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-          </optgroup>
-        ))}
-      </select>
-      <Button type="submit" disabled={!siteId || busy}>
-        Seguir
+    <>
+      <form onSubmit={submit}>
+        <Heading>¿En qué facultad estudiás?</Heading>
+        <p className="mb-8 text-muted">Estudia se conecta con el campus virtual de tu facultad.</p>
+        <label htmlFor="site" className="mb-2 block text-sm font-medium">
+          Facultad
+        </label>
+        <select
+          id="site"
+          value={siteId}
+          onChange={(e) => setSiteId(e.target.value)}
+          disabled={!sites}
+          className="mb-6 w-full cursor-pointer rounded-md border border-field bg-canvas px-3 py-2.5"
+        >
+          <option value="" disabled>
+            {sites ? "Elegí tu facultad" : "Cargando…"}
+          </option>
+          {universities.map((university) => (
+            <optgroup key={university} label={university}>
+              {sites!
+                .filter((s) => s.university === university)
+                .map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+            </optgroup>
+          ))}
+        </select>
+        <Button type="submit" disabled={!siteId || busy}>
+          Seguir
+        </Button>
+        <ErrorLine message={error} />
+      </form>
+      {onDemo && <TryDemo onDemo={onDemo} />}
+    </>
+  );
+}
+
+/** Probar sin campus ni clave: abre la materia de ejemplo y va derecho a la primera pregunta. */
+function TryDemo({ onDemo }: { onDemo: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function start() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.startDemo();
+      onDemo();
+    } catch {
+      setError("No se pudo abrir la materia de ejemplo. Probá de nuevo.");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-12 border-t border-line pt-6">
+      <Button variant="quiet" onClick={start} disabled={busy}>
+        Probar con una materia de ejemplo
       </Button>
+      <p className="mt-2 text-sm text-muted">
+        Sin campus, sin clave y sin internet. Lo que contestes queda aparte de tus materias.
+      </p>
       <ErrorLine message={error} />
-    </form>
+    </div>
   );
 }
 
@@ -229,98 +276,6 @@ export function PasteCallback({
           {fieldError}
         </p>
       )}
-    </form>
-  );
-}
-
-function ConnectAI({ rejected, onDone }: { rejected: boolean; onDone: () => void }) {
-  const [key, setKey] = useState("");
-  const [busy, setBusy] = useState(false);
-  /** Problema con lo que está en el campo (va debajo del campo). */
-  const [fieldError, setFieldError] = useState<string | null>(null);
-  /** Problema que no es de la clave (Google no respondió). */
-  const [error, setError] = useState<string | null>(null);
-  const input = useRef<HTMLInputElement>(null);
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setError(null);
-    if (!key.trim()) {
-      setFieldError("Pegá la clave primero.");
-      input.current?.focus();
-      return;
-    }
-    setBusy(true);
-    setFieldError(null);
-    try {
-      await api.setAiKey(key);
-      onDone();
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 400) {
-        setFieldError("Google rechazó esa clave. Revisá que esté completa.");
-        input.current?.focus();
-      } else {
-        setError("No se pudo verificar la clave ahora. Probá en un rato.");
-      }
-      setBusy(false);
-    }
-  }
-
-  return (
-    <form onSubmit={submit}>
-      <Heading>Conectá tu IA</Heading>
-      <p className="mb-8 text-muted">
-        {rejected
-          ? "Google rechazó la clave guardada. Pegá una nueva para seguir procesando tus clases."
-          : "Estudia usa Gemini, de Google, para armar resúmenes y preguntas con tus clases. La clave es gratis."}
-      </p>
-      <ol className="mb-8 space-y-2">
-        <li>
-          1.{" "}
-          <a
-            href={AI_STUDIO_URL}
-            target="_blank"
-            rel="noreferrer"
-            className="underline decoration-line underline-offset-4 hover:decoration-ink"
-          >
-            Creá una clave en Google AI Studio
-          </a>
-        </li>
-        <li>2. Copiala y pegala acá.</li>
-      </ol>
-      <label htmlFor="ai-key" className="mb-2 block text-sm font-medium">
-        Clave de Gemini
-      </label>
-      <input
-        id="ai-key"
-        type="password"
-        autoComplete="off"
-        spellCheck={false}
-        ref={input}
-        value={key}
-        onChange={(e) => {
-          setKey(e.target.value);
-          // El aviso era sobre lo que había antes: al corregir, se va.
-          setFieldError(null);
-        }}
-        aria-invalid={fieldError ? true : undefined}
-        aria-describedby={fieldError ? "ai-key-error" : undefined}
-        className="mb-2 w-full rounded-md border border-field bg-canvas px-3 py-2.5 font-mono text-sm aria-invalid:border-bad"
-      />
-      {fieldError && (
-        <p id="ai-key-error" role="alert" className="mb-2 text-sm text-bad">
-          {fieldError}
-        </p>
-      )}
-      <div className="mb-6 text-sm text-muted">
-        <Label className="mb-1">Qué ve Google</Label>
-        <p>Google recibe el video de cada clase y las preguntas que Estudia arma. No recibe tus respuestas ni tus datos personales.</p>
-        <p>En el plan gratuito, personas de Google pueden leer lo que se envía y usarlo para mejorar sus productos.</p>
-      </div>
-      <Button type="submit" disabled={busy}>
-        {busy ? "Verificando…" : "Guardar clave"}
-      </Button>
-      <ErrorLine message={error} />
     </form>
   );
 }

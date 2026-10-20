@@ -33,11 +33,13 @@ interface Props {
   onExit: () => void;
   /** Desde el botón del simulacro corto ("Hoy: simulacro corto"): ese examen y, con `short`, 6 preguntas. */
   start?: { examId: number; short: boolean } | null;
+  /** Materia de ejemplo: sin historia propia, adivinar la nota no dice nada. */
+  demo?: boolean;
 }
 
 type Answers = Record<number, MockAnswer>;
 
-export default function Mock({ onPractice, onExit, start }: Props) {
+export default function Mock({ onPractice, onExit, start, demo = false }: Props) {
   const [exams, setExams] = useState<ExamInfo[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [examId, setExamId] = useState<number | null>(null);
@@ -96,6 +98,7 @@ export default function Mock({ onPractice, onExit, start }: Props) {
       exams={exams}
       exam={exam}
       short={short}
+      demo={demo}
       onChoose={setExamId}
       onStarted={(a) => {
         setAnswers({});
@@ -112,6 +115,7 @@ function Setup({
   exams,
   exam,
   short,
+  demo,
   onChoose,
   onStarted,
   onExit,
@@ -119,6 +123,7 @@ function Setup({
   exams: ExamInfo[];
   exam: ExamInfo | null;
   short: boolean;
+  demo: boolean;
   onChoose: (id: number) => void;
   onStarted: (attempt: MockStart) => void;
   onExit: () => void;
@@ -261,32 +266,37 @@ function Setup({
       <p className="mt-1 text-sm text-muted">Podés ir y volver entre las preguntas. Cuando se termina el tiempo, se entrega solo.</p>
 
       <form
-        className="mt-10"
+        // Sin la nota, los botones quedan a la distancia de siempre del texto.
+        className={demo ? undefined : "mt-10"}
         onSubmit={(e) => {
           e.preventDefault();
           start(Boolean(runStyle));
         }}
       >
-        <label htmlFor={`${id}-pred`} className="mb-1.5 block font-medium">
-          ¿Cuánto creés que te sacás?
-        </label>
-        <p id={`${id}-pred-help`} className="mb-2 text-sm text-muted">
-          De 0 a {grade(runScale)}. Si no sabés, dejalo vacío.
-        </p>
-        <input
-          id={`${id}-pred`}
-          type="text"
-          inputMode="decimal"
-          autoComplete="off"
-          value={prediction}
-          onChange={(e) => {
-            setPrediction(e.target.value);
-            setError(null);
-          }}
-          aria-invalid={error ? true : undefined}
-          aria-describedby={`${id}-pred-help`}
-          className={`w-28 tabular-nums ${FIELD}`}
-        />
+        {!demo && (
+          <>
+            <label htmlFor={`${id}-pred`} className="mb-1.5 block font-medium">
+              ¿Cuánto creés que te sacás?
+            </label>
+            <p id={`${id}-pred-help`} className="mb-2 text-sm text-muted">
+              De 0 a {grade(runScale)}. Si no sabés, dejalo vacío.
+            </p>
+            <input
+              id={`${id}-pred`}
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              value={prediction}
+              onChange={(e) => {
+                setPrediction(e.target.value);
+                setError(null);
+              }}
+              aria-invalid={error ? true : undefined}
+              aria-describedby={`${id}-pred-help`}
+              className={`w-28 tabular-nums ${FIELD}`}
+            />
+          </>
+        )}
         {error && (
           <p role="alert" className="mt-2 text-sm text-bad">
             {error}

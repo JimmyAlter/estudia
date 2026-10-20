@@ -670,3 +670,39 @@ def test_document_feedback_without_site_has_no_url(conn):
     _add_doc_q(conn, 1, 2, 14)
     fb = record_answer(conn, 1, 1, NOW)
     assert fb.source_label == "Apunte 3, pág. 14" and fb.source_url is None
+
+
+# --- Tarea 7: retirar una variante retira su grupo -------------------------------------------
+
+
+def add_group(conn, head, members):
+    for qid in (head, *members):
+        add_q(conn, qid)
+        conn.execute("UPDATE question SET variant_group=? WHERE id=?", (head, qid))
+    conn.commit()
+
+
+def retired_by_id(conn):
+    return {r[0]: r[1] for r in conn.execute("SELECT id, retired FROM question ORDER BY id")}
+
+
+def test_retire_one_variant_retires_group(conn):
+    add_group(conn, 1, (2, 3))
+    add_group(conn, 4, (5,))
+    add_q(conn, 6)
+    add_q(conn, 7)
+    retire_question(conn, 3)
+    assert retired_by_id(conn) == {1: 1, 2: 1, 3: 1, 4: 0, 5: 0, 6: 0, 7: 0}
+    retire_question(conn, 6)   # sin grupo: solo ella (los NULL no forman un grupo)
+    assert retired_by_id(conn) == {1: 1, 2: 1, 3: 1, 4: 0, 5: 0, 6: 1, 7: 0}
+
+
+def test_unretire_restores_group(conn):
+    from estudia.study.practice import unretire_question
+
+    add_group(conn, 1, (2, 3))
+    add_q(conn, 4)
+    retire_question(conn, 2)
+    retire_question(conn, 4)
+    unretire_question(conn, 1)
+    assert retired_by_id(conn) == {1: 0, 2: 0, 3: 0, 4: 1}

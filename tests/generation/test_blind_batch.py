@@ -359,3 +359,70 @@ def test_paid_batches_groups_by_model_in_queue_order(conn):
         add_material(conn, mid, analysis_json=blob, analysis_model=model)
     order = [1, 2, 3, 4, 5, 6, 7, 8]
     assert paid_batches(conn, order) == [[1, 3, 5, 6], [7], [2, 8], [4]]
+
+
+# --- Las opciones van mezcladas: el lugar de la correcta no da pistas (revisión final 3c) ------
+
+from estudia.generation import pipeline  # noqa: E402
+
+
+class _Reverse:
+    """Un sorteo que da vuelta cada lista: el cambio de orden es seguro y fácil de seguir."""
+
+    def shuffle(self, items):
+        items.reverse()
+
+
+def _by_text(answers):
+    """Contesta por el texto de la opción, no por su lugar."""
+    return lambda stem, options: options.index(answers[stem])
+
+
+def test_blind_options_are_shuffled_and_answers_mapped_back():
+    questions = [q("a", correct=1), q("b", correct=3), q("c", correct=0), q("d", correct=2)]
+    # El modelo acierta a, b y c por el texto; erra d (elige "1", la de lugar 0 en la original).
+    prov = FakeProvider({}, _by_text({"a": "2", "b": "4", "c": "1", "d": "1"}))
+    assert pipeline.blind_matches(prov, questions, (), rng=_Reverse()) == [True, True, True, False]
+    items, _ = prov.blind_batches[0]
+    assert [options for _, options in items] == [["4", "3", "2", "1"]] * 4
+
+
+def test_blind_answer_by_original_position_fails_after_the_shuffle():
+    # Un modelo que contesta el lugar de la correcta en la original ya no acierta por posición.
+    questions = [q("a", correct=1)]
+    prov = FakeProvider({}, lambda stem, options: 1)
+    assert pipeline.blind_matches(prov, questions, (), rng=_Reverse()) == [False]
+
+
+def test_blind_out_of_range_or_odd_answers_never_match():
+    questions = [q("a", correct=0)] * 4
+    answers = iter([4, -1, True, "0"])
+    prov = FakeProvider({}, lambda stem, options: next(answers))
+    assert pipeline.blind_matches(prov, questions, (), rng=_Reverse()) == [False] * 4
+
+
+@pytest.mark.real_blind_shuffle
+def test_default_blind_shuffle_is_reproducible_per_request():
+    questions = [q(f"pregunta {i}", correct=i % 4) for i in range(8)]
+    sent = []
+    for _ in range(2):
+        prov = FakeProvider({}, lambda stem, options: None)
+        pipeline.blind_matches(prov, questions, ())
+        sent.append(prov.blind_batches[0][0])
+    assert sent[0] == sent[1]
+    assert any(options != ["1", "2", "3", "4"] for _, options in sent[0])
+    assert all(sorted(options) == ["1", "2", "3", "4"] for _, options in sent[0])
+
+
+@pytest.mark.real_blind_shuffle
+def test_process_pending_maps_shuffled_answers_back(conn):
+    # De punta a punta con el sorteo de verdad: acierta por el texto, guarda las dos.
+    add_material(conn, 1)
+    prov = FakeProvider({"v1": analysis([q("pregunta 1a", correct=1), q("pregunta 1b", correct=2)])},
+                        _by_text({"pregunta 1a": "2", "pregunta 1b": "3"}))
+    process_pending(conn, prov)
+    assert statuses(conn) == {1: "done"}
+    assert conn.execute("SELECT COUNT(*) FROM question").fetchone()[0] == 2
+    items, _ = prov.blind_batches[0]
+    assert [options for _, options in items] != [["1", "2", "3", "4"]] * 2
+

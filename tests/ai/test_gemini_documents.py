@@ -19,8 +19,14 @@ from estudia.generation.prompts import ANALYSIS_PROMPT, DOCUMENT_PROMPT
 
 from test_gemini import FakeFiles, _provider
 
-# sha256 de ANALYSIS_PROMPT al empezar la Tarea 5 (etapa 3b): el prompt de video no cambia.
-VIDEO_PROMPT_SHA256 = "5fc8b4ffeb86bdf89173278ddb548012787e9f189b641f70ad5a7cb738eec373"
+# sha256 de ANALYSIS_PROMPT. Cambió a propósito en la Tarea 5 de la etapa 3c, que le suma al
+# final `_VARIANT_RULE` (antes: 5fc8b4ff…, fijado en la etapa 3b), y otra vez en la segunda ronda
+# de arreglos de las variantes, que cambia el texto de esa regla: solo aritmética verificable,
+# cada dato una vez y sin pasos intermedios (antes: c8283c50…), y en la revisión final, que
+# avisa qué textos de la plantilla se muestran en las variantes (antes: c3b1d784…, y
+# después f50233a9…). Si este test falla, alguien
+# cambió el prompt de video: que sea a propósito y con el hash nuevo acá.
+VIDEO_PROMPT_SHA256 = "8395b936f354671695f738fbc818b2cb96eb699462c5b87d203cb484c7ae96e7"
 
 PDF_BYTES = b"%PDF-1.4 apunte de prueba"
 

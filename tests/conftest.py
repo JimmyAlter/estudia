@@ -45,6 +45,28 @@ class MemoryKeyring(KeyringBackend):
             raise PasswordDeleteError("no existe") from None
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "real_blind_shuffle: la pasada a ciegas mezcla las opciones de verdad")
+
+
+class _InOrder:
+    def shuffle(self, items):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def blind_options_in_order(request, monkeypatch):
+    """La pasada a ciegas mezcla las opciones de cada pregunta (`pipeline._blind_rng`). Los dobles
+    de prueba contestan por lugar ("la 1"), así que fuera de los tests marcados con
+    `real_blind_shuffle` las opciones van en su orden; esos tests prueban la mezcla y la vuelta."""
+    if request.node.get_closest_marker("real_blind_shuffle") is None:
+        from estudia.generation import pipeline
+
+        monkeypatch.setattr(pipeline, "_blind_rng", lambda items: _InOrder())
+    yield
+
+
 @pytest.fixture(autouse=True)
 def memory_keyring():
     previous = keyring.get_keyring()

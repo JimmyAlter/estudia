@@ -26,6 +26,9 @@ Gratis, de código abierto y corre en tu PC. Hecho por un estudiante del ingreso
 - **También con apuntes en PDF.** Los PDF y las diapositivas del campus se leen como las clases en video, y cada pregunta te dice de qué apunte y de qué página sale.
 - **Simulacro con el formato de tu cátedra.** Cargás tus parciales viejos (PDF o foto) y Estudia copia la cantidad de ejercicios, el tiempo y la escala. Tus parciales quedan en tu compu.
 - **Para cada momento de la cursada.** Inscripciones con aviso antes del cierre, recuperatorio que repasa solo lo que no tenés firme, y final con un plan de 6 semanas. Te lo dice sin retar.
+- **Probala antes de conectar nada.** Una materia de ejemplo, con preguntas escritas para Estudia, te deja practicar sin campus y sin clave de Gemini. No se mezcla con tus materias reales.
+- **Sacar la clave de Gemini, paso a paso.** Un asistente te lleva a Google AI Studio, te dice qué tocar y verifica la clave apenas la pegás.
+- **Las cuentas cambian de números.** Una pregunta con cuentas puede volver con otros valores, así practicás el método y no te acordás el resultado. Cada variante se verifica con SymPy antes de mostrarse; si hay alguna duda, se descarta.
 - **Practicar como pide la ciencia del aprendizaje.** Te pregunta qué tan seguro estabas (una respuesta adivinada no cuenta como sabida), a veces te pide pensar antes de ver las opciones o escribir el resultado, y antes del parcial mezcla temas para que practiques reconocer qué método va.
 
 ## Cómo se ve
@@ -110,6 +113,15 @@ Estudia se conecta a campus Moodle que tengan activo el servicio para celulares,
 
 ## Instalación
 
+### Facultades que funcionan
+
+Revisá esto antes de bajar el instalador.
+
+| Facultad | Estado |
+|---|---|
+| UTN · Facultad Regional Buenos Aires (FRBA) | **Funciona** |
+| Todas las demás | Todavía no. Anotate en la lista de espera con un issue de [**"Mi facultad no funciona"**](https://github.com/JimmyAlter/estudia/issues/new?template=facultad-no-funciona.yml). |
+
 **Necesitás:**
 
 - una cuenta en el campus de **UTN-FRBA** (las demás facultades llegan en la etapa 5);
@@ -121,7 +133,19 @@ Estudia se conecta a campus Moodle que tengan activo el servicio para celulares,
 2. Abrilo con doble clic y seguí los pasos. No pide permisos de administrador: se instala solo para tu usuario.
 3. Al terminar se abre Estudia. Después la encontrás en el menú Inicio.
 
-**Si aparece "Windows protegió su PC":** es el filtro SmartScreen. Tocá **Más información** y después **Ejecutar de todas formas**. Sale porque el instalador no está firmado con un certificado de pago, no porque haya algo raro: el código es abierto, lo podés revisar en este repo, y el instalador lo arma GitHub a partir de ese código. Es probable que el aviso aparezca durante las primeras semanas de cada versión, hasta que Windows la vea en más computadoras.
+#### Si Windows dice "Windows protegió su PC"
+
+Es el filtro SmartScreen de Windows. Para seguir:
+
+1. En ese cartel, tocá **Más información**.
+2. Abajo aparece el botón **Ejecutar de todas formas**. Tocalo.
+3. La instalación sigue como siempre.
+
+Aparece porque el instalador no está firmado con un certificado de pago, no porque se haya encontrado algo malo. El código de Estudia es abierto y lo podés revisar en este mismo repositorio, y este instalador lo arma GitHub a partir de ese código. Es probable que el aviso siga apareciendo durante las primeras semanas de cada versión, hasta que Windows la vea en más computadoras.
+
+Cada versión publica el SHA-256 del instalador en sus notas, para que puedas comprobarlo.
+
+#### Actualizar y desinstalar
 
 - **Actualizar:** bajá el instalador nuevo y abrilo. Tus materias y tu progreso se mantienen. Cuando hay una versión nueva, Estudia te avisa.
 - **Desinstalar:** desde Configuración → Aplicaciones → Estudia. Te pregunta si querés borrar también tus datos de estudio; si decís que no, quedan por si la volvés a instalar.
@@ -186,7 +210,7 @@ uv run python -m estudia
 
 ### Primeros pasos
 
-Estudia se abre en tu navegador, en una página de tu propia PC (`127.0.0.1`). Elegís tu facultad, iniciás sesión en el campus y pegás tu clave de Gemini. Después procesa las clases de a una y te avisa cuando hay preguntas.
+Estudia se abre en tu navegador, en una página de tu propia PC (`127.0.0.1`). Elegís tu facultad, iniciás sesión en el campus y pegás tu clave de Gemini (un asistente te guía para sacarla). Después procesa las clases de a una y te avisa cuando hay preguntas.
 
 **Sobre el inicio de sesión:** al terminar el login, el campus te manda de vuelta con un enlace que empieza con `moodlemobile://`.
 
@@ -197,7 +221,9 @@ Estudia se abre en tu navegador, en una página de tu propia PC (`127.0.0.1`). E
 
 ### ¿Querés verla sin campus?
 
-Desde el código, con datos de ejemplo y sin tocar internet ni tus datos:
+En la primera pantalla tocá **Probar con una materia de ejemplo**: abre una materia de matemática con un parcial de ejemplo y vas derecho a la primera pregunta, sin campus, sin clave y sin internet. Cuando conectás tu campus, la materia de ejemplo deja de hacer falta.
+
+Desde el código también podés abrir una versión con tres materias de ejemplo, sin tocar internet ni tus datos:
 
 ```bash
 uv run python scripts/dev_seed.py --port 8780
@@ -241,7 +267,7 @@ Hoy el único login probado de punta a punta es `"browser"`. Las entradas nuevas
 - [x] **Etapa 2:** agenda con horarios, entregas y exámenes (también cargados a mano), plan de estudio con "¿Llegás?", simulacro con el reloj y la escala del examen real, repaso espaciado por pregunta, confianza y respuestas escritas, exportar a calendario (`.ics`) y a Anki, y recordatorios en la PC.
 - [x] **Etapa 3a:** cola por fecha de examen y cuota de Gemini mejor aprovechada, 3 preguntas para arrancar, recuerdo libre, "Explicá por qué", "Cómo vengo", mazo de la semana y calendario del campus en el celular, inscripciones, recuperatorio y final.
 - [x] **Etapa 3b:** PDF y diapositivas del campus (con la cita "Apunte 3, pág. 14"), y simulacro con el formato de tu cátedra a partir de tus parciales viejos.
-- [ ] **Etapa 3c:** probar con una materia de ejemplo sin campus ni clave, asistente para la clave de Gemini y variantes numéricas de las preguntas.
+- [x] **Etapa 3c:** probar con una materia de ejemplo sin campus ni clave, asistente para la clave de Gemini y variantes numéricas de las preguntas, verificadas con SymPy. La corrección a partir de una foto de tu desarrollo queda para más adelante, cuando haya datos de la beta.
 - [ ] **Etapa 4:** Claude y ChatGPT además de Gemini, videos subidos a Moodle y PDFs.
 - [ ] **Etapa 5:** catálogo completo (todas las facultades de la tabla), login con usuario y contraseña y con Office 365, y materias sin cuentas con respuestas verificadas contra una cita del material.
 - [x] **Etapa 6:** instalador para Windows, enlace de vuelta del login registrado solo y actualizaciones por GitHub Releases.

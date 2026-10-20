@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Practice from "./Practice";
@@ -191,7 +191,7 @@ describe("Práctica v2", () => {
     await userEvent.click(screen.getByRole("button", { name: /^1/ }));
     await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
 
-    const headline = await screen.findByText("Estabas seguro y era otra. Fijate bien por qué.");
+    const headline = await screen.findByText("Estabas seguro y era otra. Mirá por qué.");
     const common = screen.getByText(/Tomar la ordenada al origen/);
     const explanation = screen.getByText(/En y = mx \+ b/);
     const minute = screen.getByRole("link", { name: /minuto 06:52/ });
@@ -201,10 +201,50 @@ describe("Práctica v2", () => {
     expect(before(explanation, minute)).toBe(true);
 
     // Reaprendizaje visible, con la explicación de una línea la primera vez.
-    expect(screen.getByText("Vuelve al final de la sesión · 0 de 3 días")).toBeInTheDocument();
+    const footer = screen.getByText(
+      (_, el) => el?.tagName === "P" && el.textContent === "Vuelve al final de la sesión · 0 de 3 días",
+    );
+    // En el celular el separador se oculta y el progreso baja a su propia línea.
+    expect(within(footer).getByText("·", { exact: false })).toHaveClass("hidden", "sm:inline");
+    expect(within(footer).getByText("0 de 3 días")).toHaveClass("block", "sm:inline");
     expect(screen.getByText("La sabés cuando la acertás en tres días distintos.")).toBeInTheDocument();
-    // Vuelve al final: la ronda crece.
-    expect(screen.getByText(/pregunta 1 de 2/)).toBeInTheDocument();
+    // Vuelve al final, pero la cuenta cambia recién al seguir: no se mueve mientras se lee.
+    expect(screen.getByText(/pregunta 1 de 1/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Siguiente" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Siguiente" }));
+    expect(await screen.findByText(/pregunta 2 de 2/)).toBeInTheDocument();
+  });
+
+  it("escrita y con alarma: primero por qué es la correcta, después el error común", async () => {
+    mockApi({
+      "POST /api/quiz": [item({ format: "typed" })],
+      "GET /api/materials": [],
+      "POST /api/answer": feedback({ correct: false, chosen_index: null, typed_ok: false, feedback_style: "alarm" }),
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    await userEvent.type(screen.getByLabelText("Tu respuesta"), "5");
+    await userEvent.click(screen.getByRole("button", { name: "Corregir" }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    // "Escribiste 5: no es correcta" ya dice que era otra.
+    const headline = await screen.findByText("Estabas seguro. Mirá por qué.");
+    expect(screen.queryByText(/y era otra/)).not.toBeInTheDocument();
+    const explanation = screen.getByText(/En y = mx \+ b/);
+    const common = screen.getByText(/Tomar la ordenada al origen/);
+    const before = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    expect(before(headline, explanation)).toBe(true);
+    expect(before(explanation, common)).toBe(true);
+    expect(common.parentElement).toHaveClass("mt-4");
+  });
+
+  it("en pantallas chicas la cuenta va en su renglón, sin el punto suelto", async () => {
+    mockApi({ "POST /api/quiz": [item()], "GET /api/materials": [] });
+    render(<Practice params={{}} onExit={() => {}} />);
+    const number = await screen.findByText("pregunta 1 de 1");
+    expect(number).toHaveClass("block", "sm:inline");
+    const separator = number.previousElementSibling!;
+    expect(separator).toHaveTextContent("·");
+    expect(separator).toHaveClass("hidden", "sm:inline");
   });
 
   it("acierto seguro dice Correcto con la explicación colapsada; dudando, abierta", async () => {
@@ -239,9 +279,12 @@ describe("Práctica v2", () => {
     });
     render(<Practice params={{}} onExit={() => {}} />);
     await screen.findByText(/pendiente de y = 2x/);
+    // Con relojes falsos, el efecto que escucha el teclado puede no haber corrido todavía.
+    await act(async () => {});
     await user.keyboard("2");
     await user.keyboard("s");
-    await screen.findByText(/En y = mx \+ b/);
+    // Plazo amplio: en el runner de Windows el primer render puede pasar el segundo por defecto.
+    await screen.findByText(/En y = mx \+ b/, {}, { timeout: 5000 });
 
     await user.keyboard("{Enter}");
     expect(screen.queryByText("Segunda pregunta")).not.toBeInTheDocument();
@@ -480,5 +523,95 @@ describe("Práctica: cita de un apunte", () => {
 
     expect(await screen.findByText("Clase 2, diap. 5")).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /Clase 2/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("Práctica: variantes numéricas", () => {
+  const variant = item({
+    question_id: 11,
+    stem: "¿Cuál es la pendiente de y = 5x + 1?",
+    options: ["1", "5", "6", "0"],
+    card_key: "v:1",
+  });
+  const original = item({ card_key: "v:1" });
+  // Primero falla y pide otra variante; después acierta.
+  const answers = () => {
+    let n = 0;
+    return () =>
+      n++ === 0
+        ? feedback({ correct: false, requeue: true, requeue_item: variant })
+        : feedback({ correct: true, correct_index: 1 });
+  };
+
+  it("una pregunta que vuelve al final usa otra variante", async () => {
+    const fetchMock = mockApi({
+      "POST /api/quiz": [original],
+      "GET /api/materials": [],
+      "POST /api/answer": answers(),
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    await userEvent.click(screen.getByRole("button", { name: /^3/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    await screen.findByText(/En y = mx \+ b/);
+    await userEvent.click(screen.getByRole("button", { name: /Siguiente|Ver resultado/ }));
+    expect(await screen.findByText(/pendiente de y = 5x/)).toBeInTheDocument();
+
+    // Se responde con el id y las opciones de la variante, nunca con los de la original.
+    await userEvent.click(screen.getByRole("button", { name: /^5/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    await waitFor(() => expect(answerBodies(fetchMock)).toHaveLength(2));
+    const body = answerBodies(fetchMock)[1];
+    expect(body.question_id).toBe(11);
+    expect([...body.shown_order].sort()).toEqual([0, 1, 2, 3]);
+    expect(body.shown_order[body.chosen_index]).toBe(1);
+  });
+
+  it("una variante que vuelve no se cuenta dos veces en el resumen", async () => {
+    mockApi({
+      "POST /api/quiz": [original],
+      "GET /api/materials": [],
+      "POST /api/answer": answers(),
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    await userEvent.click(screen.getByRole("button", { name: /^3/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    await screen.findByText(/En y = mx \+ b/);
+    await userEvent.click(screen.getByRole("button", { name: /Siguiente|Ver resultado/ }));
+    await screen.findByText(/pendiente de y = 5x/);
+    await userEvent.click(screen.getByRole("button", { name: /^5/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    await screen.findByText(/En y = mx \+ b/);
+    await userEvent.click(screen.getByRole("button", { name: /Siguiente|Ver resultado/ }));
+    // Una tarjeta, fallada la primera vez: 0 de 1, no 1 de 2.
+    expect(await screen.findByText(/0 de 1 bien/)).toBeInTheDocument();
+  });
+  it("reportar una variante saca toda su tarjeta: la que volvía ya no aparece ni cuenta", async () => {
+    const other = item({ question_id: 2, stem: "¿Cuánto vale f(0) si f(x) = x + 4?", options: ["0", "4", "1", "5"] });
+    const fetchMock = mockApi({
+      "POST /api/quiz": [original, other],
+      "GET /api/materials": [],
+      "POST /api/answer": answers(),
+      "POST /api/question/1/retire": { ok: true },
+    });
+    render(<Practice params={{}} onExit={() => {}} />);
+    await screen.findByText(/pendiente de y = 2x/);
+    // Falla: la variante 11 queda en la cola para el final.
+    await userEvent.click(screen.getByRole("button", { name: /^3/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    await screen.findByText(/En y = mx \+ b/);
+    await userEvent.click(screen.getByRole("button", { name: "Reportar un error" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url === "/api/question/1/retire")).toBe(true));
+
+    // Sigue la otra tarjeta; después, el resultado sin la variante y sin la reportada.
+    await screen.findByText(/f\(0\) si f\(x\) = x \+ 4/);
+    await userEvent.click(screen.getByRole("button", { name: /^4/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    await screen.findByText(/En y = mx \+ b/);
+    await userEvent.click(screen.getByRole("button", { name: /Siguiente|Ver resultado/ }));
+    expect(await screen.findByText(/1 de 1 bien/)).toBeInTheDocument();
+    expect(screen.queryByText(/pendiente de y = 5x/)).not.toBeInTheDocument();
+    expect(answerBodies(fetchMock).map((b) => b.question_id)).toEqual([1, 2]);
   });
 });

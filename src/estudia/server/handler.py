@@ -20,7 +20,8 @@ from estudia.config import data_dir, data_path
 from estudia.launcher import headless
 from estudia.moodle.calendar_feed import feed_secret_name
 from estudia.secrets import delete_secret
-from estudia.server.app import GEMINI_KEY, HOST, moodle_private_name, moodle_token_name
+from estudia.moodle.names import moodle_private_name, moodle_token_name
+from estudia.server.app import GEMINI_KEY, HOST
 from estudia.streams import redirect_missing_streams
 
 DESKTOP_FILE = "estudia-handler.desktop"

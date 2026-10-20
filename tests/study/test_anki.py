@@ -229,3 +229,23 @@ def test_anki_untitled_document_falls_back_to_apunte(conn, tmp_path):
     conn.commit()
     col = open_collection(build_apkg(conn, None), tmp_path)
     assert col.execute("SELECT flds FROM notes").fetchone()[0].split("\x1f")[5] == "Apunte"
+
+
+def test_anki_exports_one_note_per_group(conn, tmp_path):
+    """Un grupo de variantes es una sola nota, con los valores de la original; también en el mazo de la semana."""
+    add_q(conn, 1, stem="Original")
+    for qid in (2, 3, 4):
+        add_q(conn, qid, stem=f"Variante {qid}")
+    conn.execute("UPDATE question SET variant_group = 1 WHERE id IN (1, 2, 3, 4)")
+    conn.execute("INSERT INTO review_state(card_key, due) VALUES ('v:1', ?)", (NOW + DAY,))
+    conn.commit()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    full = open_collection(build_apkg(conn, None), tmp_path / "a")
+    assert [r[0].split("\x1f")[0] for r in full.execute("SELECT flds FROM notes")] == ["Original"]
+    assert weekly_question_ids(conn, NOW) == {1}
+    add_exam(conn, NOW + 3 * DAY, [1])   # el tema del examen también trae el grupo una vez
+    weekly = weekly_question_ids(conn, NOW)
+    assert weekly == {1}
+    col = open_collection(build_apkg(conn, None, weekly), tmp_path / "b")
+    assert col.execute("SELECT count(*) FROM notes").fetchone()[0] == 1

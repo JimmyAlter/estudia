@@ -445,7 +445,7 @@ wheels = [
 
 [[package]]
 name = "estudia"
-version = "0.4.0"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -484,7 +484,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi" },
-    { name = "fsrs", specifier = ">=6.3.2" },
+    { name = "fsrs", specifier = "==6.3.2" },
     { name = "genanki", specifier = ">=0.13.1" },
     { name = "google-genai" },
     { name = "httpx" },

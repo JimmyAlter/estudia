@@ -21,6 +21,7 @@ from estudia.ai.base import ExerciseKind, ExtractedStyle
 from estudia.generation.pipeline import slugify
 from estudia.study.exams import ENROLLMENT, exam_topics
 from estudia.study.recall import normalize_words, same_word
+from estudia.study.srs import HEAD
 
 EXERCISE_KINDS = ("opcion_multiple", "verdadero_falso", "desarrollo")
 STYLE_MAX_QUESTIONS = 30
@@ -402,8 +403,8 @@ def style_gaps(conn: sqlite3.Connection, exam_id: int) -> dict[str, int]:
     campus = 0
     if topics:
         campus = conn.execute(
-            f"SELECT COUNT(*) FROM question WHERE topic_id IN ({','.join('?' * len(topics))})"
-            " AND origin IS NULL AND verified = 1 AND retired = 0", topics).fetchone()[0]
+            f"SELECT COUNT(*) FROM question q WHERE q.topic_id IN ({','.join('?' * len(topics))})"
+            f" AND q.origin IS NULL AND q.verified = 1 AND q.retired = 0 AND {HEAD}", topics).fetchone()[0]
     gaps = {}
     for group in style.groups:
         available = own.get(group.kind, 0) + (campus if group.kind == "opcion_multiple" else 0)

@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App, { POLL_IDLE_MS, POLL_OFFLINE_MS } from "./App";
 import type { AppState } from "./api";
 import { jsonResponse, mockApi } from "./test-utils";
@@ -11,7 +11,7 @@ const READY: AppState = {
   ai_stop_reason: null,
   syncing: false,
   last_sync_at: 1_790_000_000,
-  last_sync_error: null,
+  last_sync_error: null, demo: false,
 };
 
 const HOME = {
@@ -241,3 +241,143 @@ describe("App: navegación", () => {
   });
 });
 
+
+describe("App: materia de ejemplo", () => {
+  const FIRST: AppState = { ...READY, step: "facultad", site_id: null, last_sync_at: null, demo: false };
+  const DEMO: AppState = { ...FIRST, demo: true };
+  const NOW = Math.floor(Date.now() / 1000);
+  const ITEM = {
+    question_id: 1, stem: "¿Cuál es la pendiente de y = 3x + 2?", options: ["1", "2", "3", "0"],
+    topic: "Funciones lineales", format: "mcq", phase: "focus", relearning: null,
+  };
+  const FEEDBACK = {
+    correct: true, correct_index: 2, chosen_index: 2, explanation: "En y = mx + b la pendiente es m.",
+    common_error: null, source_seconds: null, youtube_id: null, typed_ok: null, requeue: false,
+    next_label: "Vuelve en 3 días", relearn_progress: null, feedback_style: "short", answer_id: 5,
+  };
+  const EXAM = {
+    id: 1, course_id: 1, course: "Matemática de ejemplo", name: "Parcial de ejemplo", at: NOW + 7 * 86400,
+    closes_at: null, source: "manual", kind: "parcial", topic_ids: [1, 2], max_grade: 10, time_limit_s: null,
+    attempts: null, editable: true, result: null, result_skipped: false,
+  };
+  beforeEach(() => {
+    vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  const STUDY_ROUTES = [
+    /^\/api\/state$/,
+    /^\/api\/version$/,
+    /^\/api\/demo$/,
+    /^\/api\/quiz$/,
+    /^\/api\/answer$/,
+    /^\/api\/progress$/,
+    /^\/api\/exams$/,
+    /^\/api\/exams\/\d+\/topics$/,
+    /^\/api\/mock\//,
+  ];
+
+  function demoApi(initial: AppState) {
+    let state = initial;
+    return mockApi({
+      "GET /api/state": () => state,
+      "GET /api/catalog": [{ id: "utn-frba", name: "Facultad Regional Buenos Aires", university: "UTN" }],
+      "POST /api/demo": () => {
+        state = { ...state, demo: true };
+        return { ok: true };
+      },
+      "POST /api/quiz": [ITEM],
+      "POST /api/answer": FEEDBACK,
+      "GET /api/progress": { calibration: { total: 1, missing: 9, levels: [] }, predictions: [], gap: null },
+      "GET /api/exams": [EXAM],
+      "POST /api/mock/start": { attempt_id: 3, items: [ITEM], seconds: 90, max_grade: 10, predicted_grade: null },
+    });
+  }
+
+  it("al probar la materia de ejemplo aparece la primera pregunta", async () => {
+    const fetchMock = demoApi(FIRST);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Probar con una materia de ejemplo" }));
+    expect(await screen.findByText("¿Cuál es la pendiente de y = 3x + 2?")).toBeInTheDocument();
+    expect(screen.getByText("Estás en la materia de ejemplo")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/practica");
+    expect(fetchMock.mock.calls.some(([url]) => url === "/api/home")).toBe(false);
+  });
+
+  it("en la materia de ejemplo se ve la franja y solo Inicio y Práctica", async () => {
+    demoApi(DEMO);
+    render(<App />);
+    expect(await screen.findByRole("heading", { level: 1, name: "Matemática de ejemplo" })).toBeInTheDocument();
+    expect(screen.getByText("Estás en la materia de ejemplo")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Conectar mi campus" })).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Secciones" });
+    expect([...nav.querySelectorAll("a")].map((a) => a.textContent)).toEqual(["Inicio", "Práctica"]);
+    for (const name of ["Agenda", "Materiales", "Ajustes"]) expect(screen.queryByText(name)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Actualizar/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/¿Tenés 18 años o más\?/)).not.toBeInTheDocument();
+  });
+
+  it("en la materia de ejemplo una dirección que no es de estudio muestra el inicio", async () => {
+    window.location.hash = "#/agenda";
+    const fetchMock = demoApi(DEMO);
+    render(<App />);
+    expect(await screen.findByRole("heading", { level: 1, name: "Matemática de ejemplo" })).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/agenda"))).toBe(false);
+  });
+
+  it("en la materia de ejemplo Cómo vengo no se abre: muestra el inicio", async () => {
+    window.location.hash = "#/como-vengo";
+    const fetchMock = demoApi(DEMO);
+    render(<App />);
+    expect(await screen.findByRole("heading", { level: 1, name: "Matemática de ejemplo" })).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/progress"))).toBe(false);
+  });
+
+  it("en el simulacro de la materia de ejemplo no se pide la nota que creés", async () => {
+    demoApi(DEMO);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Hacer un simulacro corto" }));
+    expect(await screen.findByText("Simulacro corto")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Empezar" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("¿Cuánto creés que te sacás?")).not.toBeInTheDocument();
+  });
+
+  it('"Conectar mi campus" lleva al paso de la facultad y se puede volver', async () => {
+    demoApi(DEMO);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Conectar mi campus" }));
+    expect(screen.getByRole("heading", { name: "¿En qué facultad estudiás?" })).toBeInTheDocument();
+    // Ya está en la materia de ejemplo: no se la vuelve a ofrecer.
+    expect(screen.queryByRole("button", { name: "Probar con una materia de ejemplo" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Volver al ejemplo" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "Matemática de ejemplo" })).toBeInTheDocument();
+  });
+
+  it("en la materia de ejemplo solo se piden rutas de estudio", async () => {
+    const fetchMock = demoApi(DEMO);
+    render(<App />);
+
+    // Práctica con una respuesta.
+    await userEvent.click(await screen.findByRole("button", { name: "Practicar" }));
+    await screen.findByText("¿Cuál es la pendiente de y = 3x + 2?");
+    await userEvent.click(screen.getByRole("button", { name: /^3/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Seguro/ }));
+    expect(await screen.findByText(/En y = mx \+ b/)).toBeInTheDocument();
+
+    // Cómo vengo no está en la demo.
+    await userEvent.click(screen.getByRole("link", { name: "Inicio" }));
+    await screen.findByRole("button", { name: "Hacer un simulacro corto" });
+    expect(screen.queryByRole("link", { name: "Cómo vengo" })).not.toBeInTheDocument();
+
+    // Un simulacro corto empezado.
+    await userEvent.click(screen.getByRole("link", { name: "Inicio" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Hacer un simulacro corto" }));
+    expect(await screen.findByText("Simulacro corto")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Empezar" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url === "/api/mock/start")).toBe(true));
+    expect(await screen.findByText("¿Cuál es la pendiente de y = 3x + 2?")).toBeInTheDocument();
+
+    const urls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(urls.filter((url) => !STUDY_ROUTES.some((route) => route.test(url)))).toEqual([]);
+  });
+});

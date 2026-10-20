@@ -9,6 +9,8 @@ from fakes import FakeProvider
 from test_app import BASE, PORT, SITE_ID, FakeMoodle
 from test_retry import ScriptedProvider, analysis
 
+OTHER_KEY = "AIza" + "o" * 35
+
 
 class Spy(FakeProvider):
     """Anota cada llamada que saldría hacia el proveedor."""
@@ -70,21 +72,21 @@ def material_status(env):
 
 def test_api_ai_rejects_with_minor_age(env):
     set_age(env, "minor")
-    r = env["client"].post("/api/ai", json={"provider": "gemini", "key": "otra"})
+    r = env["client"].post("/api/ai", json={"provider": "gemini", "key": OTHER_KEY})
     assert r.status_code == 403
     assert "18" in r.json()["detail"]
     assert env["spy"].calls == [] and env["factory_calls"] == []
 
 
 def test_api_ai_rejects_until_age_is_answered(env):
-    r = env["client"].post("/api/ai", json={"provider": "gemini", "key": "otra"})
+    r = env["client"].post("/api/ai", json={"provider": "gemini", "key": OTHER_KEY})
     assert r.status_code == 403
     assert env["spy"].calls == [] and env["factory_calls"] == []
 
 
 def test_api_ai_works_for_adult(env):
     set_age(env, "adult")
-    assert env["client"].post("/api/ai", json={"provider": "gemini", "key": "otra"}).status_code == 200
+    assert env["client"].post("/api/ai", json={"provider": "gemini", "key": OTHER_KEY}).status_code == 200
     assert env["spy"].calls[0] == "check_key"
 
 
@@ -226,7 +228,7 @@ def test_api_ai_race_to_minor_returns_403(env, monkeypatch):
     from estudia.server import app as app_module
     set_age(env, "minor")  # lo que ve `jobs.provider`...
     monkeypatch.setattr(app_module, "ai_age", lambda conn: "adult")  # ...y lo que vio la ruta
-    r = env["client"].post("/api/ai", json={"provider": "gemini", "key": "otra"})
+    r = env["client"].post("/api/ai", json={"provider": "gemini", "key": OTHER_KEY})
     assert r.status_code == 403
     assert env["spy"].calls == []
 

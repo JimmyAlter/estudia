@@ -14,6 +14,8 @@ from estudia import config
 
 FUNCTIONS = ("analysis", "blind", "pdf", "photo")
 BLIND_BATCH_MAX = 4
+# Preguntas por pedido a ciegas: las originales van todas; las variantes, solo hasta este tope.
+BLIND_ITEMS_MAX = 60
 QUOTA_TZ = ZoneInfo("America/Los_Angeles")
 
 

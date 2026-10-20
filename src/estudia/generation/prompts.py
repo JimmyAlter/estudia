@@ -84,6 +84,36 @@ el material, no sobre detalles del archivo (formato, orden de las páginas).
 ignorá los números impresos en las hojas.
 """ + _CHECK_EXPR_RULE
 
+# Plantilla de variantes numéricas (etapa 3c): va al final del prompt de video y del de
+# documentos, no del de estilo. Las llaves van dobles porque los prompts pasan por
+# str.format: el modelo lee {a}, {b} y {respuesta}.
+_VARIANT_RULE = """\
+- "variant": completalo solo en preguntas con "check_expr" cuyos números se \
+puedan cambiar sin cambiar el razonamiento; en las demás, null. Es una plantilla \
+de la misma pregunta:
+  - "params": de 1 a 3 parámetros, cada uno con "name" (una letra minúscula), \
+"low" y "high" (enteros positivos, con como mucho 20 valores entre los dos, \
+contando los dos).
+  - "original": los valores de los parámetros en esta pregunta, en el mismo orden. \
+Distintos entre sí, ninguno 0 ni 1, y ninguno 2 si alguna cuenta tiene una potencia.
+  - "stem", "explanation" y "common_error": los mismos textos de la pregunta, \
+con cada número que cambia escrito como {{a}}, {{b}}, etc. En "stem" cada \
+parámetro aparece una sola vez. En "explanation" y "common_error" solo podés usar \
+los parámetros y {{respuesta}}: nada de resultados intermedios.
+  - En las variantes la app escribe sola una línea con los valores y la respuesta. \
+La explicación de la plantilla se agrega a esa línea solo si es prosa sin \
+números ni marcadores (tampoco el de la respuesta). El error común se muestra \
+en las variantes con la misma regla.
+  - "answer_expr": la cuenta de la respuesta con las letras de los parámetros. \
+Solo números, +, -, *, / y paréntesis, con "*" siempre explícito, y ** solo con \
+un exponente fijo de 1 a 4. Nada de raíces ni otras funciones. Con los valores \
+de "original" tiene que dar exactamente "check_expr".
+  - "distractor_exprs": 3 cuentas con las mismas reglas, una por cada error \
+típico, en el mismo orden en que aparecen los distractores en "options".
+"""
+ANALYSIS_PROMPT += _VARIANT_RULE
+DOCUMENT_PROMPT += _VARIANT_RULE
+
 BLIND_BATCH_PROMPT = """\
 Resolvé estas {n} preguntas de opción múltiple. Cada una tiene una sola opción \
 correcta. Devolvé solo un JSON con esta forma, sin explicación:

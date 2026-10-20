@@ -586,3 +586,44 @@ def test_mock_review_carries_source_label(conn, monkeypatch):
     for review in (r.review, mock_result(conn, s.attempt_id).review):
         assert {(f.source_label, f.source_page, f.source_url) for f in review} == {
             ("Apunte 3, pág. 14", 14, "https://campus.example.edu/mod/resource/view.php?id=55")}
+
+
+# --- Variantes ---------------------------------------------------------------------------------
+
+def make_group(conn, head, members):
+    conn.execute(f"UPDATE question SET variant_group = ? WHERE id IN ({','.join('?' * (1 + len(members)))})",
+                 (head, head, *members))
+    conn.commit()
+
+
+def test_mock_prefers_unseen_variant(conn):
+    from estudia.study.practice import record_answer
+    add_exam(conn)
+    fill(conn, 8)                     # 1..8, en los temas 1, 2 y 3
+    make_group(conn, 1, [4])          # 1 y 4 son del tema 1
+    record_answer(conn, 1, 1, NOW - 2 * 86400)   # A practicada hace 2 días
+    for seed in range(8):
+        start = start_mock(conn, 1, NOW + seed)
+        ids = {i.question_id for i in start.items}
+        assert 4 in ids and 1 not in ids   # sin entregar: el intento no cuenta como visto
+
+
+def test_mock_never_two_members_of_a_group(conn):
+    add_exam(conn)
+    fill(conn, 9)
+    make_group(conn, 1, [4, 7])       # tema 1
+    make_group(conn, 2, [5])          # tema 2
+    for seed in range(6):
+        items = start_mock(conn, 1, NOW + seed).items
+        assert len(items) == len({i.card_key for i in items}) == 6
+        assert {i.card_key for i in items} >= {"v:1", "v:2"}
+
+
+def test_mock_counts_cards_for_the_minimum(conn):
+    add_exam(conn)
+    fill(conn, 6)
+    make_group(conn, 1, [4])          # 6 filas, 5 tarjetas: alcanza
+    assert len(start_mock(conn, 1, NOW).items) == 5
+    make_group(conn, 2, [5])          # 4 tarjetas: no alcanza
+    with pytest.raises(NotEnoughQuestions):
+        start_mock(conn, 1, NOW)

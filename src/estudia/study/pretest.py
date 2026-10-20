@@ -8,12 +8,14 @@ import sqlite3
 from dataclasses import dataclass
 
 from estudia.study.practice import MCQ, AnswerFeedback, QuizItem, _insert_answer
+from estudia.study.srs import HEAD
 
 PRETEST_SIZE = 3
 PRETEST_WINDOW_DAYS = 7
 CLOSED_KEY = "pretest_closed"   # lista JSON de ids de material ya cerrados ("Ahora no" o terminado)
 
-_AVAILABLE = "q.verified = 1 AND q.retired = 0"
+# Una tarjeta por grupo de variantes: el pretest cuenta y muestra solo la original.
+_AVAILABLE = f"q.verified = 1 AND q.retired = 0 AND {HEAD}"
 
 
 @dataclass

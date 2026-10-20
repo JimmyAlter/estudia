@@ -1,6 +1,7 @@
 """Conexión SQLite y esquema."""
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PurePath
+from urllib.parse import quote
 
 from estudia.config import data_dir
 
@@ -132,12 +133,17 @@ ADDED_COLUMNS = (
     # question_ids_json) y 1 si se armó con el estilo. NULL en los de siempre.
     ("mock_attempt", "points_json", "TEXT"),
     ("mock_attempt", "style", "INTEGER"),
+    # Variantes numéricas (etapa 3c): id de la original del grupo (la original lo tiene con su propio
+    # id); NULL = sin grupo. Y los valores de los parámetros ({"a": 3, …}), también en la original.
+    ("question", "variant_group", "INTEGER"),
+    ("question", "variant_values_json", "TEXT"),
 )
 
 # Índices sobre columnas de ADDED_COLUMNS: corren después de agregarlas. Un índice único
 # de SQLite admite muchos NULL, así que los materiales de antes (sin archivo) no chocan.
 ADDED_INDEXES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS material_file_key ON material(file_key)",
+    "CREATE INDEX IF NOT EXISTS question_variant_group ON question(variant_group)",
 )
 
 
@@ -210,24 +216,47 @@ def _drop_legacy_feed_status(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def connect(path: Path | None = None, *, check_same_thread: bool = True) -> sqlite3.Connection:
+def rw_uri(path: PurePath) -> str:
+    """URI de SQLite que abre `path` solo si ya existe. Autoridad vacía explícita (`file://`), así
+    una ruta UNC (`//servidor/carpeta`) o con letra de unidad (`C:/...`) llega entera a SQLite;
+    `?`, `#` y `%` en las carpetas van escapados."""
+    posix = path.as_posix()
+    if not posix.startswith("/"):
+        posix = "/" + posix   # C:/x -> /C:/x
+    return f"file://{quote(posix, safe='/:')}?mode=rw"
+
+
+def connect(path: Path | None = None, *, check_same_thread: bool = True,
+            create: bool = True) -> sqlite3.Connection:
     """Abre la base (por defecto en la carpeta de datos) y aplica el esquema.
 
     `check_same_thread=False` es para conexiones que abre y cierra un hilo distinto
     del que las usa (el servidor): cada pedido tiene la suya, nunca se comparten.
+
+    Con `create=False` la base tiene que existir (`mode=rw`): si no está, `sqlite3.OperationalError`
+    y no se crea ningún archivo. La usa la demo, que puede borrarse mientras un pedido la abre.
     """
     if path is None:
         path = data_dir() / "estudia.db"
-    conn = sqlite3.connect(path, check_same_thread=check_same_thread)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    _migrate_allow_download(conn, path)
-    _drop_legacy_feed_status(conn)
-    # La primera vez reproduce la historia de respuestas en review_state; después no hace nada.
-    from estudia.study.srs import sync_review_state
+    if create:
+        conn = sqlite3.connect(path, check_same_thread=check_same_thread)
+    else:
+        conn = sqlite3.connect(rw_uri(Path(path).resolve()), uri=True,
+                               check_same_thread=check_same_thread)
+    # Si algo falla (una base rota), la conexión se cierra: en Windows un archivo abierto no se borra.
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        _migrate_allow_download(conn, path)
+        _drop_legacy_feed_status(conn)
+        # La primera vez reproduce la historia de respuestas en review_state; después no hace nada.
+        from estudia.study.srs import sync_review_state
 
-    sync_review_state(conn)
-    conn.commit()
+        sync_review_state(conn)
+        conn.commit()
+    except BaseException:
+        conn.close()
+        raise
     return conn

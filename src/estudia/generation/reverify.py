@@ -5,6 +5,9 @@ Las preguntas guardadas con el lector viejo de la pasada a ciegas (una lista de
 repite la pasada con el lector estricto, un pedido por material y con otro modelo
 que el que hizo el análisis. Cada material terminado queda anotado en kv
 ("reverified:<id>"): si se corta por cuota, la próxima corrida sigue donde quedó.
+
+De un grupo de variantes se manda solo la cabeza (la original): si falla, se retira el
+grupo entero, porque pone en duda la plantilla de la que salieron todas.
 """
 from __future__ import annotations
 
@@ -24,6 +27,9 @@ REVERIFIED_PREFIX = "reverified:"
 
 @dataclass
 class ReverifyResult:
+    """`kept` cuenta las preguntas mandadas a ciegas que pasaron (originales o sueltas);
+    `retired` cuenta filas retiradas, con las variantes del grupo de cada cabeza que falló."""
+
     materials_checked: int = 0
     kept: int = 0
     retired: int = 0
@@ -55,7 +61,8 @@ def reverify_all(conn: sqlite3.Connection, provider: AIProvider) -> ReverifyResu
         for done, material in enumerate(materials):
             rows = conn.execute(
                 "SELECT id, stem, options_json, correct_index FROM question"
-                " WHERE material_id=? AND retired=0 ORDER BY id",
+                " WHERE material_id=? AND retired=0"
+                " AND (variant_group IS NULL OR variant_group = id) ORDER BY id",
                 (material["id"],),
             ).fetchall()
             questions = [
@@ -79,12 +86,17 @@ def reverify_all(conn: sqlite3.Connection, provider: AIProvider) -> ReverifyResu
                 result.materials_left += len(materials) - done
                 break
             failed = [q.id for q, ok in zip(questions, matches) if not ok]
-            conn.executemany("UPDATE question SET retired=1 WHERE id=?", [(i,) for i in failed])
+            retired_rows = 0
+            for question_id in failed:
+                retired_rows += conn.execute(
+                    "UPDATE question SET retired=1 WHERE retired=0 AND (id=? OR (variant_group IS NOT NULL"
+                    " AND variant_group = (SELECT variant_group FROM question WHERE id=?)))",
+                    (question_id, question_id)).rowcount
             conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, '1')",
                          (f"{REVERIFIED_PREFIX}{material['id']}",))
             conn.commit()
             result.materials_checked += 1
-            result.retired += len(failed)
+            result.retired += retired_rows   # con las variantes de cada cabeza que falló
             result.kept += len(questions) - len(failed)
     finally:
         save_exhausted(conn, provider)
