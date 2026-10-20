@@ -279,6 +279,8 @@ describe("Práctica v2", () => {
     });
     render(<Practice params={{}} onExit={() => {}} />);
     await screen.findByText(/pendiente de y = 2x/);
+    // Con relojes falsos, el efecto que escucha el teclado puede no haber corrido todavía.
+    await act(async () => {});
     await user.keyboard("2");
     await user.keyboard("s");
     // Plazo amplio: en el runner de Windows el primer render puede pasar el segundo por defecto.
